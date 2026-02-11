@@ -1,0 +1,31 @@
+[package]
+name = "kyz-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "CLI interface for kyz - a cross-platform secrets manager"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kyz"
+path = "src/main.rs"
+
+[dependencies]
+kyz-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+env_logger.workspace = true
+log.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+keyring.workspace = true

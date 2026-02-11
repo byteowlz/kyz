@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/byteowlz/rust-workspace/schemas/config.schema.json",
+  "title": "rust-workspace configuration",
+  "description": "Configuration schema for rust-workspace",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "description": "JSON Schema reference for editor support",
+      "type": "string"
+    },
+    "logging": {
+      "description": "Logging configuration.",
+      "default": {
+        "level": "info"
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/LoggingConfig"
+        }
+      ]
+    },
+    "paths": {
+      "description": "Custom paths for data and state directories.",
+      "default": {},
+      "allOf": [
+        {
+          "$ref": "#/definitions/PathsConfig"
+        }
+      ]
+    },
+    "profile": {
+      "description": "Active configuration profile.",
+      "default": "default",
+      "type": "string"
+    },
+    "runtime": {
+      "description": "Runtime behavior configuration.",
+      "default": {
+        "fail_fast": true,
+        "timeout": 60
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/RuntimeConfig"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "LogLevel": {
+      "description": "Log level enumeration for schema validation.",
+      "type": "string",
+      "enum": [
+        "error",
+        "warn",
+        "info",
+        "debug",
+        "trace"
+      ]
+    },
+    "LoggingConfig": {
+      "description": "Logging configuration",
+      "type": "object",
+      "properties": {
+        "file": {
+          "description": "Optional path for log file output. Supports ~ and environment variables.",
+          "type": "string"
+        },
+        "level": {
+          "description": "Log level (error, warn, info, debug, trace).",
+          "default": "info",
+          "allOf": [
+            {
+              "$ref": "#/definitions/LogLevel"
+            }
+          ]
+        }
+      }
+    },
+    "PathsConfig": {
+      "description": "Custom paths for data and state directories",
+      "type": "object",
+      "properties": {
+        "data_dir": {
+          "description": "Directory for persistent data. Supports ~ and environment variables.",
+          "type": "string"
+        },
+        "state_dir": {
+          "description": "Directory for state files. Supports ~ and environment variables.",
+          "type": "string"
+        }
+      }
+    },
+    "RuntimeConfig": {
+      "description": "Runtime behavior configuration",
+      "type": "object",
+      "properties": {
+        "fail_fast": {
+          "description": "Stop on first error.",
+          "default": true,
+          "type": "boolean"
+        },
+        "parallelism": {
+          "description": "Worker pool size. Defaults to logical CPU count when unset.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 1.0
+        },
+        "timeout": {
+          "description": "Timeout in seconds for long-running operations (default: 60).",
+          "default": 60,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1.0
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,139 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kyz-core",
+    "crates/kyz-cli",
+    "crates/kyz-tui",
+    "crates/kyz-mcp",
+    "crates/kyz-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/byteowlz/kyz"
+readme = "README.md"
+keywords = ["cli", "secrets", "keyring"]
+categories = ["command-line-utilities"]
+
+[workspace.dependencies]
+# Shared across workspace
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.9"
+log = "0.4"
+env_logger = "0.11"
+config = { version = "0.15", features = ["toml"] }
+dirs = "6.0"
+shellexpand = "3.1"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
+rpassword = "7.4"
+
+# Secrets
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+
+# API/HTTP
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# MCP
+rmcp = { version = "0.14", features = ["server", "transport-io"] }
+
+# Schema generation
+schemars = "1.2"
+
+# Internal crates
+kyz-core = { path = "crates/kyz-core" }
+
+# ============================================
+# MAXIMUM PRESET - rust-magic-linter
+# ============================================
+# Everything at deny level - maximum strictness
+# https://github.com/vicnaum/rust-magic-linter
+
+[workspace.lints.rust]
+# Safety - forbid means even #![allow(...)] can't override
+unsafe_code = "forbid"
+non_ascii_idents = "forbid"
+
+# Quality enforcement
+warnings = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+
+# Documentation enforcement
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+missing_copy_implementations = "deny"
+unfulfilled_lint_expectations = "deny"
+
+[workspace.lints.rustdoc]
+all = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+# === ALL LINT GROUPS AT DENY ===
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
+# === THE GUARDRAILS ===
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# === ASYNC SAFETY ===
+await_holding_lock = "deny"
+large_futures = "deny"
+
+# === PROCESS/MEMORY SAFETY ===
+exit = "deny"
+mem_forget = "deny"
+
+# === PERFORMANCE ===
+large_stack_arrays = "deny"
+large_types_passed_by_value = "deny"
+
+# === MINIMAL RELAXATIONS ===
+# Only the absolutely necessary ones
+multiple_crate_versions = "allow"   # Unavoidable with transitive deps
+
+# Cast lints - too many false positives even for strict projects
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+
+# Nursery lints that have too many false positives
+cognitive_complexity = "allow"      # Use clippy.toml threshold instead
+
+# CLI/TUI/API templates need stdout/stderr output
+print_stdout = "allow"              # CLIs/TUIs/APIs need to print to stdout
+print_stderr = "allow"              # CLIs/TUIs/APIs need to print to stderr
+
+# CLI option structs inherently have many boolean flags
+struct_excessive_bools = "allow"    # CLI flag structs have many bools

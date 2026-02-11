@@ -1,0 +1,15 @@
+"$schema" = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/rust-workspace/rust-workspace.config.schema.json"
+
+# Configuration for rust-workspace.
+# Copy this file to $XDG_CONFIG_HOME/rust-workspace/config.toml and adjust as needed.
+
+profile = "default"
+
+[logging]
+level = "info"
+
+[runtime]
+timeout = 60
+fail_fast = true
+
+[paths]

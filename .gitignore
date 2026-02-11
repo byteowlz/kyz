@@ -1,0 +1,43 @@
+/target
+.env 
+.DS_Store
+.vscode/
+
+# ---- ignr (detected: linux,rust) @ 2026-02-11 ----
+
+# === linux ===
+# Linux
+*~
+# temporary files which can be created if a process still has a handle open of a deleted file
+.fuse_hidden*
+# KDE directory preferences
+.directory
+# Linux trash folder which might appear on any partition or disk
+.Trash-*
+# .nfs files are created when an open file is removed but is still being accessed
+.nfs*
+
+# === rust ===
+# Rust
+# Generated files
+/target/
+**/*.rs.bk
+# Cargo.lock for libraries (uncomment if this is a library)
+# Cargo.lock
+# Debug files
+*.pdb
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+# Coverage
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.html
+# Benchmarks
+criterion/
+# IDE/Editor specific (Rust)
+.cargo/
+!.cargo/config.toml

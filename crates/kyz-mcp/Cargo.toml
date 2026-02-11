@@ -1,0 +1,28 @@
+[package]
+name = "kyz-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "MCP server for kyz - a cross-platform secrets manager"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kyz-mcp"
+path = "src/main.rs"
+
+[dependencies]
+kyz-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

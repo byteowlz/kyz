@@ -2,18 +2,6 @@
 
 ## Open
 
-### [trx-092h.1.9] Remote build + fix all compiler errors (P1, task)
-
-### [trx-092h.1.5] CLI commands: set, get, delete, list, export, import (P1, task)
-
-### [trx-092h.1.4] Implement OS keyring backend via keyring crate (P1, task)
-
-### [trx-092h.1.3] Implement secret store abstraction trait (get/set/delete/list) (P1, task)
-
-### [trx-092h.1.2] Add keyring crate with platform feature flags (apple-native, windows-native, sync-secret-service) (P1, task)
-
-### [trx-092h.1.1] Adapt scaffold: APP_NAME=kyz, update config/schema/paths (P1, task)
-
 ### [trx-092h.1] Phase 1: Local secrets CLI (P1, epic)
 Basic secret CRUD using OS keyring (gnome-keyring, macOS Keychain, Windows Credential Manager) via keyring crate
 
@@ -34,10 +22,6 @@ Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption f
 
 ### [trx-092h.1.8] MCP server: expose get/set/list tools for agent access (P2, task)
 
-### [trx-092h.1.7] Secure password prompt for interactive set (rpassword) (P2, task)
-
-### [trx-092h.1.6] Namespace/service support: kyz get --service lnkdn li_at (P2, task)
-
 ### [trx-092h.3] Phase 3: Serverless P2P sync (P2, epic)
 Device pairing and encrypted sync via iroh (QUIC-based P2P). No server, no cloud. Automatic conflict resolution with CRDT or LWW.
 
@@ -56,3 +40,13 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ### [trx-092h.3.1] Research iroh vs libp2p for Rust P2P networking (P3, task)
 
+## Closed
+
+- [trx-092h.1.9] Remote build + fix all compiler errors (closed 2026-02-11)
+- [trx-092h.1.7] Secure password prompt for interactive set (rpassword) (closed 2026-02-11)
+- [trx-092h.1.6] Namespace/service support: kyz get --service lnkdn li_at (closed 2026-02-11)
+- [trx-092h.1.5] CLI commands: set, get, delete, list, export, import (closed 2026-02-11)
+- [trx-092h.1.4] Implement OS keyring backend via keyring crate (closed 2026-02-11)
+- [trx-092h.1.3] Implement secret store abstraction trait (get/set/delete/list) (closed 2026-02-11)
+- [trx-092h.1.2] Add keyring crate with platform feature flags (apple-native, windows-native, sync-secret-service) (closed 2026-02-11)
+- [trx-092h.1.1] Adapt scaffold: APP_NAME=kyz, update config/schema/paths (closed 2026-02-11)

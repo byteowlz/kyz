@@ -1,0 +1,28 @@
+[package]
+name = "kyz-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "TUI interface for kyz - a cross-platform secrets manager"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kyz-tui"
+path = "src/main.rs"
+
+[dependencies]
+kyz-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+env_logger.workspace = true
+log.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+tokio.workspace = true
