@@ -25,3 +25,5 @@ dirs.workspace = true
 shellexpand.workspace = true
 schemars.workspace = true
 keyring.workspace = true
+age.workspace = true
+secrecy.workspace = true

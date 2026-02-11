@@ -8,6 +8,8 @@ Basic secret CRUD using OS keyring (gnome-keyring, macOS Keychain, Windows Crede
 ### [trx-092h] Cross-platform secrets manager CLI with P2P sync (P1, epic)
 Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption for portable vaults, iroh/libp2p for serverless P2P sync between devices.
 
+### [trx-092h.1.15] kyz grant/revoke for provisioning workspace vaults (P2, task)
+
 ### [trx-092h.2.5] Backend selection: --backend keyring|vault in config (P2, task)
 
 ### [trx-092h.2.4] CLI: kyz vault create/unlock/lock, vault import/export (P2, task)
@@ -42,6 +44,10 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ## Closed
 
+- [trx-092h.1.14] Workspace vault support (per-directory .kyz/vault.json) (closed 2026-02-11)
+- [trx-092h.1.13] Vault unlock/lock/status commands with session file (closed 2026-02-11)
+- [trx-092h.1.12] File-based vault backend (age-encrypted JSON) (closed 2026-02-11)
+- [trx-092h.1.11] Multi-field SecretEntry data model (closed 2026-02-11)
 - [trx-092h.1.9] Remote build + fix all compiler errors (closed 2026-02-11)
 - [trx-092h.1.7] Secure password prompt for interactive set (rpassword) (closed 2026-02-11)
 - [trx-092h.1.6] Namespace/service support: kyz get --service lnkdn li_at (closed 2026-02-11)

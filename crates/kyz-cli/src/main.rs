@@ -12,11 +12,16 @@ use env_logger::fmt::WriteStyle;
 use log::{LevelFilter, debug, info};
 
 use kyz_core::paths::write_default_config;
-use kyz_core::store::DEFAULT_SERVICE;
-use kyz_core::{AppConfig, AppPaths, KeyringStore, SecretStore, default_cache_dir};
+use kyz_core::store::{DEFAULT_SERVICE, DEFAULT_SESSION_TIMEOUT_SECS};
+use kyz_core::{
+    AppConfig, AppPaths, SecretEntry, SecretStore, VaultStore, default_cache_dir,
+};
 
 /// Application name from Cargo.toml package name.
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// Fields that should use hidden input when prompting interactively.
+const SENSITIVE_FIELDS: &[&str] = &["password", "token", "secret", "key", "api_key", "value"];
 
 fn main() -> anyhow::Result<()> {
     try_main()
@@ -36,6 +41,7 @@ fn try_main() -> Result<()> {
         Command::List(cmd) => handle_list(&ctx, cmd),
         Command::Export(cmd) => handle_export(&ctx, cmd),
         Command::Import(cmd) => handle_import(&ctx, cmd),
+        Command::Vault { command } => handle_vault(&ctx, command),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
         Command::Completions { shell } => {
@@ -67,6 +73,9 @@ pub struct CommonOpts {
     /// Override the config file path.
     #[arg(long, value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
+    /// Explicit vault file path (overrides auto-discovery).
+    #[arg(long, value_name = "PATH", global = true)]
+    pub vault: Option<PathBuf>,
     /// Reduce output to only errors.
     #[arg(short, long, action = clap::ArgAction::SetTrue, global = true)]
     pub quiet: bool,
@@ -139,6 +148,12 @@ enum Command {
     Export(ExportCommand),
     /// Import secrets from a JSON file or stdin.
     Import(ImportCommand),
+    /// Manage the encrypted vault.
+    Vault {
+        /// Vault subcommand.
+        #[command(subcommand)]
+        command: VaultCommand,
+    },
     /// Create config directories and default files.
     Init(InitCommand),
     /// Inspect and manage configuration.
@@ -155,29 +170,63 @@ enum Command {
     },
 }
 
+// -- Vault commands -----------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+enum VaultCommand {
+    /// Create a new encrypted vault.
+    Create(VaultCreateCommand),
+    /// Unlock the vault (starts a timed session).
+    Unlock(VaultUnlockCommand),
+    /// Lock the vault (ends the session).
+    Lock,
+    /// Show vault status.
+    Status,
+}
+
+#[derive(Debug, Clone, Args)]
+struct VaultCreateCommand {
+    /// Overwrite existing vault.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct VaultUnlockCommand {
+    /// Session timeout in seconds (default: 1800 = 30 minutes).
+    #[arg(long, default_value_t = DEFAULT_SESSION_TIMEOUT_SECS)]
+    timeout: u64,
+}
+
 // -- Secret commands ----------------------------------------------------------
 
 #[derive(Debug, Clone, Args)]
 struct SetCommand {
-    /// Name of the secret to store.
+    /// Name of the secret entry.
     #[arg(value_name = "KEY")]
     key: String,
-    /// Secret value (omit to be prompted or pipe via stdin).
+    /// Secret value (for single-value entries; omit to prompt or use --field).
     #[arg(value_name = "VALUE")]
     value: Option<String>,
     /// Service namespace for the secret.
     #[arg(long, default_value = DEFAULT_SERVICE)]
     service: String,
+    /// Set a named field (repeatable, format: name=value).
+    #[arg(long = "field", short = 'f', value_name = "NAME=VALUE")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
 struct GetCommand {
-    /// Name of the secret to retrieve.
+    /// Name of the secret entry.
     #[arg(value_name = "KEY")]
     key: String,
     /// Service namespace for the secret.
     #[arg(long, default_value = DEFAULT_SERVICE)]
     service: String,
+    /// Retrieve a specific field only (prints raw value).
+    #[arg(long = "field", short = 'f', value_name = "NAME")]
+    field: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -192,16 +241,16 @@ struct DeleteCommand {
 
 #[derive(Debug, Clone, Args)]
 struct ListCommand {
-    /// Service namespace to list secrets from.
+    /// Service namespace to list secrets from (omit to list all services).
     #[arg(long, default_value = DEFAULT_SERVICE)]
     service: String,
 }
 
 #[derive(Debug, Clone, Args)]
 struct ExportCommand {
-    /// Service namespace to export secrets from.
-    #[arg(long, default_value = DEFAULT_SERVICE)]
-    service: String,
+    /// Service namespace to export (omit to export all).
+    #[arg(long)]
+    service: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -209,9 +258,9 @@ struct ImportCommand {
     /// Path to a JSON file (omit to read from stdin).
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
-    /// Service namespace to import secrets into.
-    #[arg(long, default_value = DEFAULT_SERVICE)]
-    service: String,
+    /// Service namespace to import into (overrides the service in the file).
+    #[arg(long)]
+    service: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Args)]
@@ -319,15 +368,161 @@ impl RuntimeContext {
         }
         self.paths.ensure_directories()
     }
+
+    /// Resolve the vault store from CLI options.
+    fn vault_store(&self) -> Result<VaultStore> {
+        let store = VaultStore::resolve(self.common.vault.as_deref())
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(store)
+    }
+
+    /// Get a `dyn SecretStore` based on the resolved vault.
+    fn secret_store(&self) -> Result<Box<dyn SecretStore>> {
+        let store = self.vault_store()?;
+        Ok(Box::new(store))
+    }
+}
+
+// -- Vault command handlers ---------------------------------------------------
+
+fn handle_vault(ctx: &RuntimeContext, command: VaultCommand) -> Result<()> {
+    match command {
+        VaultCommand::Create(cmd) => handle_vault_create(ctx, cmd),
+        VaultCommand::Unlock(cmd) => handle_vault_unlock(ctx, cmd),
+        VaultCommand::Lock => handle_vault_lock(ctx),
+        VaultCommand::Status => handle_vault_status(ctx),
+    }
+}
+
+fn handle_vault_create(ctx: &RuntimeContext, cmd: VaultCreateCommand) -> Result<()> {
+    let store = ctx.vault_store()?;
+
+    let passphrase = prompt_new_passphrase()?;
+
+    if ctx.common.dry_run {
+        info!(
+            "dry-run: would create vault at {}",
+            store.vault_path().display()
+        );
+        return Ok(());
+    }
+
+    store
+        .init(&passphrase, cmd.force)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    if !ctx.common.quiet {
+        println!("Created vault at {}", store.vault_path().display());
+    }
+    Ok(())
+}
+
+fn handle_vault_unlock(ctx: &RuntimeContext, cmd: VaultUnlockCommand) -> Result<()> {
+    let store = ctx.vault_store()?;
+
+    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+
+    let session_path = store
+        .unlock(&passphrase, cmd.timeout)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    if !ctx.common.quiet {
+        println!("Vault unlocked (session: {})", session_path.display());
+        println!(
+            "Session expires in {} minutes",
+            cmd.timeout / 60
+        );
+    }
+    Ok(())
+}
+
+fn handle_vault_lock(ctx: &RuntimeContext) -> Result<()> {
+    let store = ctx.vault_store()?;
+    store.lock().map_err(|e| anyhow!("{e}"))?;
+
+    if !ctx.common.quiet {
+        println!("Vault locked");
+    }
+    Ok(())
+}
+
+fn handle_vault_status(ctx: &RuntimeContext) -> Result<()> {
+    let store = ctx.vault_store()?;
+    let status = store.status().map_err(|e| anyhow!("{e}"))?;
+
+    if ctx.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).context("serializing status")?
+        );
+    } else if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&status).context("serializing status")?
+        );
+    } else {
+        println!("vault:    {}", status.vault_path.display());
+        println!("exists:   {}", status.exists);
+        println!("unlocked: {}", status.unlocked);
+        if let Some(remaining) = status.remaining_secs {
+            let mins = remaining / 60;
+            let secs = remaining % 60;
+            println!("expires:  {mins}m {secs}s remaining");
+        }
+    }
+    Ok(())
 }
 
 // -- Secret command handlers --------------------------------------------------
 
-/// Read a secret value from the user.
+/// Parse --field arguments into a `BTreeMap`.
+fn parse_fields(raw: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut fields = BTreeMap::new();
+    for f in raw {
+        let (name, value) = f
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid field format '{f}', expected NAME=VALUE"))?;
+        if name.is_empty() {
+            return Err(anyhow!("field name must not be empty"));
+        }
+        fields.insert(name.to_string(), value.to_string());
+    }
+    Ok(fields)
+}
+
+/// Prompt for a passphrase (hidden input).
+fn prompt_passphrase(prompt: &str) -> Result<String> {
+    if !io::stdin().is_terminal() {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf).context("reading passphrase from stdin")?;
+        return Ok(buf.trim_end_matches('\n').to_string());
+    }
+    rpassword::prompt_password(prompt).context("reading passphrase")
+}
+
+/// Prompt for a new passphrase with confirmation.
 ///
-/// If an explicit value is supplied on the command line it is used directly.
-/// Otherwise, if stdin is a TTY we prompt for a hidden password; if stdin is
-/// piped we read the entire stream.
+/// When stdin is not a terminal (piped), reads a single passphrase without
+/// confirmation (useful for scripting and agent use).
+fn prompt_new_passphrase() -> Result<String> {
+    let p1 = prompt_passphrase("New vault passphrase: ")?;
+    if p1.is_empty() {
+        return Err(anyhow!("passphrase must not be empty"));
+    }
+
+    // Skip confirmation when piped (non-interactive / agent use)
+    if !io::stdin().is_terminal() {
+        return Ok(p1);
+    }
+
+    let p2 = prompt_passphrase("Confirm passphrase: ")?;
+    if p1 != p2 {
+        return Err(anyhow!("passphrases do not match"));
+    }
+    Ok(p1)
+}
+
+/// Read a secret value: explicit arg > --field flags > stdin pipe > interactive prompt.
 fn read_secret_value(explicit: Option<&str>) -> Result<String> {
     if let Some(v) = explicit {
         return Ok(v.to_string());
@@ -353,39 +548,76 @@ fn read_secret_value(explicit: Option<&str>) -> Result<String> {
     }
 }
 
+/// Determine if a field name holds sensitive data.
+fn is_sensitive_field(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SENSITIVE_FIELDS.iter().any(|s| lower.contains(s))
+}
+
 fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
-    let value = read_secret_value(cmd.value.as_deref())?;
+    let store = ctx.secret_store()?;
+
+    // Build fields from --field args or fallback to positional value
+    let fields = if !cmd.fields.is_empty() {
+        parse_fields(&cmd.fields)?
+    } else {
+        let value = read_secret_value(cmd.value.as_deref())?;
+        let mut m = BTreeMap::new();
+        m.insert("value".to_string(), value);
+        m
+    };
+
+    let entry = SecretEntry::new(&cmd.service, &cmd.key, fields);
 
     if ctx.common.dry_run {
         info!(
-            "dry-run: would store secret '{}' in service '{}'",
-            cmd.key, cmd.service
+            "dry-run: would store secret '{}' in service '{}' with fields: {:?}",
+            cmd.key,
+            cmd.service,
+            entry.fields.keys().collect::<Vec<_>>()
         );
         return Ok(());
     }
 
-    let store = KeyringStore::new();
     store
-        .set(&cmd.service, &cmd.key, &value)
+        .set(&cmd.service, &cmd.key, &entry)
         .map_err(|e| anyhow!("{e}"))?;
 
     if !ctx.common.quiet {
-        println!("Stored secret '{}' in service '{}'", cmd.key, cmd.service);
+        let field_names: Vec<&str> = entry.fields.keys().map(String::as_str).collect();
+        println!(
+            "Stored '{}' in service '{}' (fields: {})",
+            cmd.key,
+            cmd.service,
+            field_names.join(", ")
+        );
     }
     Ok(())
 }
 
 fn handle_get(ctx: &RuntimeContext, cmd: GetCommand) -> Result<()> {
-    let store = KeyringStore::new();
-    let value = store
+    let store = ctx.secret_store()?;
+    let entry = store
         .get(&cmd.service, &cmd.key)
         .map_err(|e| anyhow!("{e}"))?;
 
+    // If a specific field was requested, print just that value
+    if let Some(ref field_name) = cmd.field {
+        let value = entry
+            .field(field_name)
+            .ok_or_else(|| anyhow!("field '{field_name}' not found in entry '{}'", cmd.key))?;
+        println!("{value}");
+        return Ok(());
+    }
+
+    // Otherwise print the full entry
     if ctx.common.json {
         let obj = serde_json::json!({
-            "service": cmd.service,
-            "key": cmd.key,
-            "value": value,
+            "service": entry.service,
+            "key": entry.key,
+            "fields": entry.fields,
+            "created_at": entry.created_at,
+            "updated_at": entry.updated_at,
         });
         println!(
             "{}",
@@ -393,16 +625,30 @@ fn handle_get(ctx: &RuntimeContext, cmd: GetCommand) -> Result<()> {
         );
     } else if ctx.common.yaml {
         let obj = serde_json::json!({
-            "service": cmd.service,
-            "key": cmd.key,
-            "value": value,
+            "service": entry.service,
+            "key": entry.key,
+            "fields": entry.fields,
+            "created_at": entry.created_at,
+            "updated_at": entry.updated_at,
         });
         println!(
             "{}",
             serde_yaml::to_string(&obj).context("serializing to YAML")?
         );
+    } else if entry.fields.len() == 1 && entry.fields.contains_key("value") {
+        // Single-value entry: just print the value
+        if let Some(v) = entry.value() {
+            println!("{v}");
+        }
     } else {
-        println!("{value}");
+        // Multi-field: print each field
+        for (name, value) in &entry.fields {
+            if is_sensitive_field(name) {
+                println!("{name}: ****");
+            } else {
+                println!("{name}: {value}");
+            }
+        }
     }
     Ok(())
 }
@@ -416,7 +662,7 @@ fn handle_delete(ctx: &RuntimeContext, cmd: DeleteCommand) -> Result<()> {
         return Ok(());
     }
 
-    let store = KeyringStore::new();
+    let store = ctx.secret_store()?;
     store
         .delete(&cmd.service, &cmd.key)
         .map_err(|e| anyhow!("{e}"))?;
@@ -431,24 +677,22 @@ fn handle_delete(ctx: &RuntimeContext, cmd: DeleteCommand) -> Result<()> {
 }
 
 fn handle_list(ctx: &RuntimeContext, cmd: ListCommand) -> Result<()> {
-    let store = KeyringStore::new();
+    let store = ctx.secret_store()?;
     let entries = store.list(&cmd.service).map_err(|e| anyhow!("{e}"))?;
 
     if ctx.common.json {
-        let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
         let obj = serde_json::json!({
             "service": cmd.service,
-            "keys": keys,
+            "entries": entries,
         });
         println!(
             "{}",
             serde_json::to_string_pretty(&obj).context("serializing to JSON")?
         );
     } else if ctx.common.yaml {
-        let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
         let obj = serde_json::json!({
             "service": cmd.service,
-            "keys": keys,
+            "entries": entries,
         });
         println!(
             "{}",
@@ -458,27 +702,41 @@ fn handle_list(ctx: &RuntimeContext, cmd: ListCommand) -> Result<()> {
         println!("No secrets found in service '{}'", cmd.service);
     } else {
         for entry in &entries {
-            println!("{}", entry.key);
+            if entry.field_names.is_empty() {
+                println!("{}", entry.key);
+            } else {
+                println!(
+                    "{}  [{}]",
+                    entry.key,
+                    entry.field_names.join(", ")
+                );
+            }
         }
     }
     Ok(())
 }
 
 fn handle_export(ctx: &RuntimeContext, cmd: ExportCommand) -> Result<()> {
-    let store = KeyringStore::new();
-    let entries = store.list(&cmd.service).map_err(|e| anyhow!("{e}"))?;
+    let store = ctx.secret_store()?;
 
-    let mut secrets = BTreeMap::new();
-    for entry in &entries {
-        let value = store
-            .get(&cmd.service, &entry.key)
-            .map_err(|e| anyhow!("{e}"))?;
-        secrets.insert(entry.key.clone(), value);
+    let services = if let Some(ref svc) = cmd.service {
+        vec![svc.clone()]
+    } else {
+        store.list_services().map_err(|e| anyhow!("{e}"))?
+    };
+
+    let mut all_entries = Vec::new();
+    for svc in &services {
+        let summaries = store.list(svc).map_err(|e| anyhow!("{e}"))?;
+        for summary in &summaries {
+            let entry = store.get(svc, &summary.key).map_err(|e| anyhow!("{e}"))?;
+            all_entries.push(entry);
+        }
     }
 
     let export = serde_json::json!({
-        "service": cmd.service,
-        "secrets": secrets,
+        "version": 1,
+        "entries": all_entries,
     });
 
     if ctx.common.yaml {
@@ -487,7 +745,6 @@ fn handle_export(ctx: &RuntimeContext, cmd: ExportCommand) -> Result<()> {
             serde_yaml::to_string(&export).context("serializing to YAML")?
         );
     } else {
-        // Default to JSON for export (always structured)
         println!(
             "{}",
             serde_json::to_string_pretty(&export).context("serializing to JSON")?
@@ -513,38 +770,63 @@ fn handle_import(ctx: &RuntimeContext, cmd: ImportCommand) -> Result<()> {
     let data: serde_json::Value =
         serde_json::from_str(&json_str).context("parsing import JSON")?;
 
-    let secrets = data
-        .get("secrets")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| anyhow!("expected a \"secrets\" object in the import JSON"))?;
+    // Support both new multi-field format and legacy flat format
+    let entries: Vec<SecretEntry> = if let Some(entries_arr) = data.get("entries").and_then(|v| v.as_array()) {
+        // New format: {"entries": [SecretEntry, ...]}
+        entries_arr
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("parsing entries")?
+    } else if let Some(secrets) = data.get("secrets").and_then(|v| v.as_object()) {
+        // Legacy format: {"service": "x", "secrets": {"key": "value"}}
+        let service = data
+            .get("service")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_SERVICE);
+        secrets
+            .iter()
+            .map(|(k, v)| {
+                let val = v.as_str().unwrap_or_default();
+                SecretEntry::single(
+                    cmd.service.as_deref().unwrap_or(service),
+                    k,
+                    val,
+                )
+            })
+            .collect()
+    } else {
+        return Err(anyhow!(
+            "expected \"entries\" array or \"secrets\" object in import JSON"
+        ));
+    };
 
     if ctx.common.dry_run {
         info!(
-            "dry-run: would import {} secrets into service '{}'",
-            secrets.len(),
-            cmd.service
+            "dry-run: would import {} entries",
+            entries.len()
         );
         return Ok(());
     }
 
-    let store = KeyringStore::new();
+    let store = ctx.secret_store()?;
     let mut count = 0usize;
 
-    for (key, value) in secrets {
-        let val_str = value.as_str().ok_or_else(|| {
-            anyhow!("secret value for key '{key}' must be a JSON string")
-        })?;
+    for entry in &entries {
+        let svc = cmd
+            .service
+            .as_deref()
+            .unwrap_or(&entry.service);
         store
-            .set(&cmd.service, key, val_str)
+            .set(svc, &entry.key, entry)
             .map_err(|e| anyhow!("{e}"))?;
         count += 1;
     }
 
     if !ctx.common.quiet {
         println!(
-            "Imported {count} secret{} into service '{}'",
-            if count == 1 { "" } else { "s" },
-            cmd.service
+            "Imported {count} entr{}",
+            if count == 1 { "y" } else { "ies" }
         );
     }
     Ok(())
