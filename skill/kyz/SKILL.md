@@ -142,8 +142,10 @@ fi
 ## Important Notes
 
 - **Session timeout**: Unlocked vaults auto-lock after 30 minutes (configurable with `--timeout`)
-- **Session file location**: `/run/user/<UID>/kyz/session-<hash>` (tmpfs, cleared on reboot)
-- **Permissions**: Vault file created with 0600, session directory with 0700
+- **Session file location**: 
+  - Preferred: `/run/user/<UID>/kyz/session-<hash>` (tmpfs, cleared on reboot)
+  - Fallback: `/tmp/kyz-<username>/session-<hash>` (0700 perms, user-scoped)
+- **Permissions**: Vault file 0600, session directory 0700, session file 0600
 - **Non-interactive**: Agents must pipe passphrase via stdin; no confirmation prompt when piped
 - **Sensitive fields**: Fields named `password`, `token`, `secret`, `key`, `api_key` are masked in plain output
 
