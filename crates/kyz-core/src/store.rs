@@ -363,8 +363,12 @@ impl VaultSession {
             return Ok(PathBuf::from(dir).join("kyz"));
         }
 
-        // Fallback: temp dir with user-specific name
-        let tmp = std::env::temp_dir().join("kyz-session");
+        // Fallback: user-specific temp directory
+        // Use $USER to scope the directory per-user, preventing cross-user access
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("kyz-{username}"));
         Ok(tmp)
     }
 
