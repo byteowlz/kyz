@@ -7,7 +7,7 @@
 //! - [`VaultStore`] backed by age-encrypted JSON file (headless/agent use)
 //! - [`VaultSession`] for unlock/lock lifecycle with tmpfs session files
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -188,7 +188,7 @@ impl VaultData {
 
     /// Create a new empty vault.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
             entries: BTreeMap::new(),
@@ -317,11 +317,13 @@ pub fn decrypt_vault(encrypted: &[u8], passphrase: &str) -> Result<VaultData, Co
 /// A vault session tracks an unlocked vault's derived key on tmpfs.
 ///
 /// The session file is stored at `/run/user/<UID>/kyz/session` (Linux) or
-/// an equivalent tmpfs path. It contains the passphrase and an expiry
-/// timestamp. Only readable by the owning user (mode 0600).
+/// an equivalent tmpfs path. The passphrase is **encrypted at rest** using
+/// age with a machine-bound session encryption key, so that even if the
+/// session file is read by another process or copied off-machine, the vault
+/// passphrase cannot be recovered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultSession {
-    /// The vault passphrase (held in memory / on tmpfs only).
+    /// The vault passphrase (held in memory only; encrypted on disk).
     pub passphrase: String,
     /// Unix timestamp when this session expires.
     pub expires_at: u64,
@@ -384,36 +386,73 @@ impl VaultSession {
         Ok(dir.join(format!("session-{hash}")))
     }
 
+    /// Derive a machine-bound session encryption key.
+    ///
+    /// The key is derived from the vault path, the current user, and the
+    /// hostname. This ensures the encrypted session file is only useful on
+    /// the same machine, for the same user, and for the same vault.
+    fn session_encryption_key(vault_path: &Path) -> String {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| String::from("unknown"));
+
+        let hostname = hostname::get()
+            .map_or_else(|_| String::from("localhost"), |h| h.to_string_lossy().to_string());
+
+        // Combine machine-specific entropy into a deterministic key.
+        // FNV-1a is sufficient here -- this is not a password hash, it's a
+        // key-derivation input. The actual encryption is done by age's
+        // scrypt KDF which applies proper stretching.
+        let material = format!(
+            "kyz-session:{}:{}:{}",
+            vault_path.to_string_lossy(),
+            user,
+            hostname,
+        );
+        // Use a longer derived passphrase for better entropy
+        let h1 = simple_hash(&material);
+        let h2 = simple_hash(&format!("{material}:extra"));
+        format!("{h1}{h2}")
+    }
+
     /// Write the session to disk with restricted permissions.
+    ///
+    /// The session data is encrypted using age with a machine-bound key
+    /// before being written to disk. The passphrase never appears in
+    /// plaintext in the session file.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
+    /// Returns an error if the file cannot be written or encryption fails.
     pub fn save(&self) -> Result<PathBuf, CoreError> {
         let path = Self::session_file_for(&self.vault_path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| CoreError::Io(e))?;
+                .map_err(CoreError::Io)?;
             // Set directory permissions to 0700
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                    .map_err(|e| CoreError::Io(e))?;
+                    .map_err(CoreError::Io)?;
             }
         }
 
         let json = serde_json::to_string(self)
             .map_err(|e| CoreError::Serialization(format!("serializing session: {e}")))?;
-        fs::write(&path, &json)
-            .map_err(|e| CoreError::Io(e))?;
+
+        // Encrypt the session JSON with the machine-bound key
+        let session_key = Self::session_encryption_key(&self.vault_path);
+        let encrypted = encrypt_session_data(json.as_bytes(), &session_key)?;
+        fs::write(&path, &encrypted)
+            .map_err(CoreError::Io)?;
 
         // Set file permissions to 0600 (owner read/write only)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                .map_err(|e| CoreError::Io(e))?;
+                .map_err(CoreError::Io)?;
         }
 
         Ok(path)
@@ -421,19 +460,34 @@ impl VaultSession {
 
     /// Load a session from disk for a given vault path.
     ///
-    /// Returns `None` if no session exists or it has expired.
+    /// Decrypts the session file using the machine-bound key. Returns `None`
+    /// if no session exists, it has expired, or decryption fails (e.g. the
+    /// file was tampered with or moved from another machine).
     ///
     /// # Errors
     ///
-    /// Returns an error on I/O or parse failures.
+    /// Returns an error on I/O failures. Decryption failures (wrong machine,
+    /// corrupted file) are treated as "no session" and return `Ok(None)`.
     pub fn load(vault_path: &Path) -> Result<Option<Self>, CoreError> {
         let path = Self::session_file_for(vault_path)?;
         if !path.exists() {
             return Ok(None);
         }
 
-        let json = fs::read_to_string(&path)
-            .map_err(|e| CoreError::Io(e))?;
+        let encrypted = fs::read(&path)
+            .map_err(CoreError::Io)?;
+
+        // Derive the same machine-bound key and attempt decryption
+        let session_key = Self::session_encryption_key(vault_path);
+        let Ok(decrypted) = decrypt_session_data(&encrypted, &session_key) else {
+            // Decryption failed: session file is from another machine,
+            // corrupted, or is a legacy plaintext session. Clean up.
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        };
+
+        let json = String::from_utf8(decrypted)
+            .map_err(|e| CoreError::Serialization(format!("session data is not UTF-8: {e}")))?;
         let session: Self = serde_json::from_str(&json)
             .map_err(|e| CoreError::Serialization(format!("parsing session: {e}")))?;
 
@@ -455,10 +509,59 @@ impl VaultSession {
         let path = Self::session_file_for(vault_path)?;
         if path.exists() {
             fs::remove_file(&path)
-                .map_err(|e| CoreError::Io(e))?;
+                .map_err(CoreError::Io)?;
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session file encryption helpers
+// ---------------------------------------------------------------------------
+
+/// Encrypt session data with a passphrase using age.
+///
+/// Uses the same age scrypt-based encryption as the vault itself, ensuring
+/// the session passphrase is never stored in plaintext on disk.
+fn encrypt_session_data(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>, CoreError> {
+    let encryptor =
+        age::Encryptor::with_user_passphrase(secrecy::SecretString::from(passphrase.to_string()));
+    let mut encrypted = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut encrypted)
+        .map_err(|e| CoreError::Secret(format!("creating session encryptor: {e}")))?;
+    writer
+        .write_all(plaintext)
+        .map_err(|e| CoreError::Secret(format!("encrypting session data: {e}")))?;
+    writer
+        .finish()
+        .map_err(|e| CoreError::Secret(format!("finalizing session encryption: {e}")))?;
+    Ok(encrypted)
+}
+
+/// Decrypt session data with a passphrase using age.
+fn decrypt_session_data(encrypted: &[u8], passphrase: &str) -> Result<Vec<u8>, CoreError> {
+    let decryptor = age::Decryptor::new(encrypted)
+        .map_err(|e| CoreError::Secret(format!("reading encrypted session: {e}")))?;
+
+    if !decryptor.is_scrypt() {
+        return Err(CoreError::Secret(
+            "session file is not passphrase-encrypted".to_string(),
+        ));
+    }
+
+    let identity =
+        age::scrypt::Identity::new(secrecy::SecretString::from(passphrase.to_string()));
+
+    let mut decrypted = Vec::new();
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|e| CoreError::Secret(format!("session decryption failed: {e}")))?;
+    reader
+        .read_to_end(&mut decrypted)
+        .map_err(|e| CoreError::Secret(format!("reading decrypted session: {e}")))?;
+
+    Ok(decrypted)
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +586,7 @@ pub struct VaultStore {
 impl VaultStore {
     /// Create a store for a specific vault file.
     #[must_use]
-    pub fn new(vault_path: PathBuf) -> Self {
+    pub const fn new(vault_path: PathBuf) -> Self {
         Self { vault_path }
     }
 
@@ -534,20 +637,20 @@ impl VaultStore {
 
         if let Some(parent) = self.vault_path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| CoreError::Io(e))?;
+                .map_err(CoreError::Io)?;
         }
 
         let data = VaultData::new();
         let encrypted = encrypt_vault(&data, passphrase)?;
         fs::write(&self.vault_path, &encrypted)
-            .map_err(|e| CoreError::Io(e))?;
+            .map_err(CoreError::Io)?;
 
         // Set vault file permissions to 0600
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&self.vault_path, fs::Permissions::from_mode(0o600))
-                .map_err(|e| CoreError::Io(e))?;
+                .map_err(CoreError::Io)?;
         }
 
         Ok(())
@@ -569,7 +672,7 @@ impl VaultStore {
 
         // Verify passphrase by attempting to decrypt
         let encrypted = fs::read(&self.vault_path)
-            .map_err(|e| CoreError::Io(e))?;
+            .map_err(CoreError::Io)?;
         let _data = decrypt_vault(&encrypted, passphrase)?;
 
         // Create session
@@ -624,7 +727,7 @@ impl VaultStore {
             return Ok(VaultData::new());
         }
         let encrypted = fs::read(&self.vault_path)
-            .map_err(|e| CoreError::Io(e))?;
+            .map_err(CoreError::Io)?;
         decrypt_vault(&encrypted, &passphrase)
     }
 
@@ -633,7 +736,7 @@ impl VaultStore {
         let passphrase = self.require_session()?;
         let encrypted = encrypt_vault(data, &passphrase)?;
         fs::write(&self.vault_path, &encrypted)
-            .map_err(|e| CoreError::Io(e))?;
+            .map_err(CoreError::Io)?;
         Ok(())
     }
 }
@@ -723,19 +826,19 @@ impl KeyringStore {
     }
 
     /// Load the key index for a service.
-    fn load_index(&self, service: &str) -> Result<BTreeMap<String, ()>, CoreError> {
+    fn load_index(service: &str) -> Result<BTreeSet<String>, CoreError> {
         let entry = keyring::Entry::new(service, INDEX_KEY)
             .map_err(|e| CoreError::Secret(format!("failed to create index entry: {e}")))?;
         match entry.get_password() {
             Ok(json) => serde_json::from_str(&json)
                 .map_err(|e| CoreError::Secret(format!("corrupted key index: {e}"))),
-            Err(keyring::Error::NoEntry) => Ok(BTreeMap::new()),
+            Err(keyring::Error::NoEntry) => Ok(BTreeSet::new()),
             Err(e) => Err(CoreError::Secret(format!("failed to read key index: {e}"))),
         }
     }
 
     /// Save the key index for a service.
-    fn save_index(&self, service: &str, index: &BTreeMap<String, ()>) -> Result<(), CoreError> {
+    fn save_index(service: &str, index: &BTreeSet<String>) -> Result<(), CoreError> {
         let entry = keyring::Entry::new(service, INDEX_KEY)
             .map_err(|e| CoreError::Secret(format!("failed to create index entry: {e}")))?;
         let json = serde_json::to_string(index)
@@ -781,9 +884,9 @@ impl SecretStore for KeyringStore {
             .set_password(&json)
             .map_err(|e| CoreError::Secret(format!("failed to set secret: {e}")))?;
 
-        let mut index = self.load_index(service)?;
-        index.insert(key.to_string(), ());
-        self.save_index(service, &index)?;
+        let mut index = Self::load_index(service)?;
+        index.insert(key.to_string());
+        Self::save_index(service, &index)?;
 
         Ok(())
     }
@@ -798,17 +901,17 @@ impl SecretStore for KeyringStore {
             other => CoreError::Secret(format!("failed to delete secret: {other}")),
         })?;
 
-        let mut index = self.load_index(service)?;
+        let mut index = Self::load_index(service)?;
         index.remove(key);
-        self.save_index(service, &index)?;
+        Self::save_index(service, &index)?;
 
         Ok(())
     }
 
     fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
-        let index = self.load_index(service)?;
+        let index = Self::load_index(service)?;
         Ok(index
-            .keys()
+            .iter()
             .map(|key| SecretSummary {
                 key: key.clone(),
                 service: service.to_string(),

@@ -27,3 +27,4 @@ schemars.workspace = true
 keyring.workspace = true
 age.workspace = true
 secrecy.workspace = true
+hostname.workspace = true

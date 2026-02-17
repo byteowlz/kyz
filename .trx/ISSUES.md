@@ -44,6 +44,7 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ## Closed
 
+- [trx-2svx] Encrypt session file at rest - never store vault passphrase in plaintext (closed 2026-02-17)
 - [trx-092h.1.14] Workspace vault support (per-directory .kyz/vault.json) (closed 2026-02-11)
 - [trx-092h.1.13] Vault unlock/lock/status commands with session file (closed 2026-02-11)
 - [trx-092h.1.12] File-based vault backend (age-encrypted JSON) (closed 2026-02-11)
