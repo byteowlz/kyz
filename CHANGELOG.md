@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-02-17
+
+### Security
+
+- Session passphrases are now stored in the OS keyring (macOS Keychain, Linux kernel keyutils, Windows Credential Manager) instead of on disk. The session file contains only non-sensitive metadata (expiry timestamp, vault path).
+- Linux keyutils backend works headless (no D-Bus/desktop session required) -- credentials live in kernel memory, cleared on reboot.
+- Falls back to age-encrypted session file if OS keyring is unavailable.
+
+### Changed
+
+- Switched Linux keyring backend from `sync-secret-service` (D-Bus) to `linux-native` (kernel keyutils) for headless compatibility.
+- Session file format is now metadata-only JSON when keyring is available.
+- Removed `--force` alias from `--yes` flag (conflicted with vault create `--force`).
+
 ## [0.2.0] - 2026-02-17
 
 ### Security

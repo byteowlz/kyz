@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/byteowlz/kyz"
@@ -37,7 +37,7 @@ clap_complete = "4.5"
 rpassword = "7.4"
 
 # Secrets
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 age = { version = "0.11", features = [] }
 secrecy = "0.10"
 libc = "0.2"

@@ -104,7 +104,7 @@ pub struct CommonOpts {
     #[arg(long = "dry-run", global = true)]
     pub dry_run: bool,
     /// Assume "yes" for interactive prompts.
-    #[arg(short = 'y', long = "yes", alias = "force", global = true)]
+    #[arg(short = 'y', long = "yes", global = true)]
     pub assume_yes: bool,
     /// Never prompt for input; fail if confirmation would be required.
     #[arg(long = "no-input", global = true)]
