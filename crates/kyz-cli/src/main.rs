@@ -10,12 +10,11 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use env_logger::fmt::WriteStyle;
 use log::{LevelFilter, debug, info};
+use secrecy::{ExposeSecret as _, SecretString};
 
 use kyz_core::paths::write_default_config;
 use kyz_core::store::{DEFAULT_SERVICE, DEFAULT_SESSION_TIMEOUT_SECS};
-use kyz_core::{
-    AppConfig, AppPaths, SecretEntry, SecretStore, VaultStore, default_cache_dir,
-};
+use kyz_core::{AppConfig, AppPaths, SecretEntry, SecretStore, VaultStore, default_cache_dir};
 
 /// Application name from Cargo.toml package name.
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
@@ -371,8 +370,8 @@ impl RuntimeContext {
 
     /// Resolve the vault store from CLI options.
     fn vault_store(&self) -> Result<VaultStore> {
-        let store = VaultStore::resolve(self.common.vault.as_deref())
-            .map_err(|e| anyhow!("{e}"))?;
+        let store =
+            VaultStore::resolve(self.common.vault.as_deref()).map_err(|e| anyhow!("{e}"))?;
         Ok(store)
     }
 
@@ -428,10 +427,7 @@ fn handle_vault_unlock(ctx: &RuntimeContext, cmd: VaultUnlockCommand) -> Result<
 
     if !ctx.common.quiet {
         println!("Vault unlocked (session: {})", session_path.display());
-        println!(
-            "Session expires in {} minutes",
-            cmd.timeout / 60
-        );
+        println!("Session expires in {} minutes", cmd.timeout / 60);
     }
     Ok(())
 }
@@ -476,7 +472,7 @@ fn handle_vault_status(ctx: &RuntimeContext) -> Result<()> {
 // -- Secret command handlers --------------------------------------------------
 
 /// Parse --field arguments into a `BTreeMap`.
-fn parse_fields(raw: &[String]) -> Result<BTreeMap<String, String>> {
+fn parse_fields(raw: &[String]) -> Result<BTreeMap<String, SecretString>> {
     let mut fields = BTreeMap::new();
     for f in raw {
         let (name, value) = f
@@ -485,7 +481,7 @@ fn parse_fields(raw: &[String]) -> Result<BTreeMap<String, String>> {
         if name.is_empty() {
             return Err(anyhow!("field name must not be empty"));
         }
-        fields.insert(name.to_string(), value.to_string());
+        fields.insert(name.to_string(), SecretString::from(value.to_string()));
     }
     Ok(fields)
 }
@@ -494,7 +490,9 @@ fn parse_fields(raw: &[String]) -> Result<BTreeMap<String, String>> {
 fn prompt_passphrase(prompt: &str) -> Result<String> {
     if !io::stdin().is_terminal() {
         let mut buf = String::new();
-        io::stdin().read_to_string(&mut buf).context("reading passphrase from stdin")?;
+        io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading passphrase from stdin")?;
         return Ok(buf.trim_end_matches('\n').to_string());
     }
     rpassword::prompt_password(prompt).context("reading passphrase")
@@ -554,6 +552,13 @@ fn is_sensitive_field(name: &str) -> bool {
     SENSITIVE_FIELDS.iter().any(|s| lower.contains(s))
 }
 
+fn fields_to_plain(fields: &BTreeMap<String, SecretString>) -> BTreeMap<String, String> {
+    fields
+        .iter()
+        .map(|(name, value)| (name.clone(), value.expose_secret().to_string()))
+        .collect()
+}
+
 fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
     let store = ctx.secret_store()?;
 
@@ -563,7 +568,7 @@ fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
     } else {
         let value = read_secret_value(cmd.value.as_deref())?;
         let mut m = BTreeMap::new();
-        m.insert("value".to_string(), value);
+        m.insert("value".to_string(), SecretString::from(value));
         m
     };
 
@@ -615,7 +620,7 @@ fn handle_get(ctx: &RuntimeContext, cmd: GetCommand) -> Result<()> {
         let obj = serde_json::json!({
             "service": entry.service,
             "key": entry.key,
-            "fields": entry.fields,
+            "fields": fields_to_plain(&entry.fields),
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
         });
@@ -627,7 +632,7 @@ fn handle_get(ctx: &RuntimeContext, cmd: GetCommand) -> Result<()> {
         let obj = serde_json::json!({
             "service": entry.service,
             "key": entry.key,
-            "fields": entry.fields,
+            "fields": fields_to_plain(&entry.fields),
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
         });
@@ -646,7 +651,7 @@ fn handle_get(ctx: &RuntimeContext, cmd: GetCommand) -> Result<()> {
             if is_sensitive_field(name) {
                 println!("{name}: ****");
             } else {
-                println!("{name}: {value}");
+                println!("{name}: {}", value.expose_secret());
             }
         }
     }
@@ -705,11 +710,7 @@ fn handle_list(ctx: &RuntimeContext, cmd: ListCommand) -> Result<()> {
             if entry.field_names.is_empty() {
                 println!("{}", entry.key);
             } else {
-                println!(
-                    "{}  [{}]",
-                    entry.key,
-                    entry.field_names.join(", ")
-                );
+                println!("{}  [{}]", entry.key, entry.field_names.join(", "));
             }
         }
     }
@@ -767,45 +768,38 @@ fn handle_import(ctx: &RuntimeContext, cmd: ImportCommand) -> Result<()> {
         }
     };
 
-    let data: serde_json::Value =
-        serde_json::from_str(&json_str).context("parsing import JSON")?;
+    let data: serde_json::Value = serde_json::from_str(&json_str).context("parsing import JSON")?;
 
     // Support both new multi-field format and legacy flat format
-    let entries: Vec<SecretEntry> = if let Some(entries_arr) = data.get("entries").and_then(|v| v.as_array()) {
-        // New format: {"entries": [SecretEntry, ...]}
-        entries_arr
-            .iter()
-            .map(|v| serde_json::from_value(v.clone()))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("parsing entries")?
-    } else if let Some(secrets) = data.get("secrets").and_then(|v| v.as_object()) {
-        // Legacy format: {"service": "x", "secrets": {"key": "value"}}
-        let service = data
-            .get("service")
-            .and_then(|v| v.as_str())
-            .unwrap_or(DEFAULT_SERVICE);
-        secrets
-            .iter()
-            .map(|(k, v)| {
-                let val = v.as_str().unwrap_or_default();
-                SecretEntry::single(
-                    cmd.service.as_deref().unwrap_or(service),
-                    k,
-                    val,
-                )
-            })
-            .collect()
-    } else {
-        return Err(anyhow!(
-            "expected \"entries\" array or \"secrets\" object in import JSON"
-        ));
-    };
+    let entries: Vec<SecretEntry> =
+        if let Some(entries_arr) = data.get("entries").and_then(|v| v.as_array()) {
+            // New format: {"entries": [SecretEntry, ...]}
+            entries_arr
+                .iter()
+                .map(|v| serde_json::from_value(v.clone()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("parsing entries")?
+        } else if let Some(secrets) = data.get("secrets").and_then(|v| v.as_object()) {
+            // Legacy format: {"service": "x", "secrets": {"key": "value"}}
+            let service = data
+                .get("service")
+                .and_then(|v| v.as_str())
+                .unwrap_or(DEFAULT_SERVICE);
+            secrets
+                .iter()
+                .map(|(k, v)| {
+                    let val = v.as_str().unwrap_or_default();
+                    SecretEntry::single(cmd.service.as_deref().unwrap_or(service), k, val)
+                })
+                .collect()
+        } else {
+            return Err(anyhow!(
+                "expected \"entries\" array or \"secrets\" object in import JSON"
+            ));
+        };
 
     if ctx.common.dry_run {
-        info!(
-            "dry-run: would import {} entries",
-            entries.len()
-        );
+        info!("dry-run: would import {} entries", entries.len());
         return Ok(());
     }
 
@@ -813,10 +807,7 @@ fn handle_import(ctx: &RuntimeContext, cmd: ImportCommand) -> Result<()> {
     let mut count = 0usize;
 
     for entry in &entries {
-        let svc = cmd
-            .service
-            .as_deref()
-            .unwrap_or(&entry.service);
+        let svc = cmd.service.as_deref().unwrap_or(&entry.service);
         store
             .set(svc, &entry.key, entry)
             .map_err(|e| anyhow!("{e}"))?;

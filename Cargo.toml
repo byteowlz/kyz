@@ -39,7 +39,13 @@ rpassword = "7.4"
 # Secrets
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 age = { version = "0.11", features = [] }
-secrecy = "0.10"
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = "1.8"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.9"
+subtle = "2.6"
+hex = "0.4"
 libc = "0.2"
 hostname = "0.4"
 

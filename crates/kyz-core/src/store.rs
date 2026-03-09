@@ -7,14 +7,16 @@
 //! - [`VaultStore`] backed by age-encrypted JSON file (headless/agent use)
 //! - [`VaultSession`] for unlock/lock lifecycle with tmpfs session files
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use crate::error::CoreError;
 
@@ -42,14 +44,15 @@ pub const WORKSPACE_VAULT_DIR: &str = ".kyz";
 ///
 /// Each entry belongs to a service namespace and has a key (name).
 /// Fields hold the actual secret data (username, password, url, notes, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecretEntry {
     /// The key (name) of the secret.
     pub key: String,
     /// The service namespace this secret belongs to.
     pub service: String,
     /// Named fields containing the secret data.
-    pub fields: BTreeMap<String, String>,
+    #[serde(with = "secret_fields_serde")]
+    pub fields: BTreeMap<String, SecretString>,
     /// Unix timestamp when the entry was created.
     pub created_at: u64,
     /// Unix timestamp when the entry was last modified.
@@ -59,7 +62,7 @@ pub struct SecretEntry {
 impl SecretEntry {
     /// Create a new entry with the given service, key, and fields.
     #[must_use]
-    pub fn new(service: &str, key: &str, fields: BTreeMap<String, String>) -> Self {
+    pub fn new(service: &str, key: &str, fields: BTreeMap<String, SecretString>) -> Self {
         let now = now_unix();
         Self {
             key: key.to_string(),
@@ -74,14 +77,14 @@ impl SecretEntry {
     #[must_use]
     pub fn single(service: &str, key: &str, value: &str) -> Self {
         let mut fields = BTreeMap::new();
-        fields.insert("value".to_string(), value.to_string());
+        fields.insert("value".to_string(), SecretString::from(value.to_string()));
         Self::new(service, key, fields)
     }
 
     /// Get a specific field value.
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&str> {
-        self.fields.get(name).map(String::as_str)
+        self.fields.get(name).map(|v| v.expose_secret())
     }
 
     /// Get the "value" field (convenience for single-value entries).
@@ -92,8 +95,24 @@ impl SecretEntry {
 
     /// Set a field, updating the modification timestamp.
     pub fn set_field(&mut self, name: &str, value: &str) {
-        self.fields.insert(name.to_string(), value.to_string());
+        self.fields
+            .insert(name.to_string(), SecretString::from(value.to_string()));
         self.updated_at = now_unix();
+    }
+}
+
+impl fmt::Debug for SecretEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_fields: BTreeMap<&String, &str> =
+            self.fields.keys().map(|k| (k, "[REDACTED]")).collect();
+
+        f.debug_struct("SecretEntry")
+            .field("key", &self.key)
+            .field("service", &self.service)
+            .field("fields", &redacted_fields)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
     }
 }
 
@@ -188,7 +207,7 @@ impl VaultData {
 
     /// Create a new empty vault.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
             entries: BTreeMap::new(),
@@ -235,18 +254,16 @@ impl VaultData {
         let prefix = format!("{service}/");
         self.entries
             .values()
-            .filter(|e| e.service == service || Self::compound_key(&e.service, &e.key).starts_with(&prefix))
+            .filter(|e| {
+                e.service == service || Self::compound_key(&e.service, &e.key).starts_with(&prefix)
+            })
             .collect()
     }
 
     /// List all distinct service names.
     #[must_use]
     pub fn services(&self) -> Vec<String> {
-        let mut svcs: Vec<String> = self
-            .entries
-            .values()
-            .map(|e| e.service.clone())
-            .collect();
+        let mut svcs: Vec<String> = self.entries.values().map(|e| e.service.clone()).collect();
         svcs.sort();
         svcs.dedup();
         svcs
@@ -262,11 +279,11 @@ impl VaultData {
 /// # Errors
 ///
 /// Returns an error if serialization or encryption fails.
-pub fn encrypt_vault(data: &VaultData, passphrase: &str) -> Result<Vec<u8>, CoreError> {
+pub fn encrypt_vault(data: &VaultData, passphrase: &SecretString) -> Result<Vec<u8>, CoreError> {
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
 
-    let encryptor = age::Encryptor::with_user_passphrase(secrecy::SecretString::from(passphrase.to_string()));
+    let encryptor = age::Encryptor::with_user_passphrase(passphrase.clone());
     let mut encrypted = Vec::new();
     let mut writer = encryptor
         .wrap_output(&mut encrypted)
@@ -286,15 +303,17 @@ pub fn encrypt_vault(data: &VaultData, passphrase: &str) -> Result<Vec<u8>, Core
 /// # Errors
 ///
 /// Returns an error if decryption fails (wrong password) or the data is corrupt.
-pub fn decrypt_vault(encrypted: &[u8], passphrase: &str) -> Result<VaultData, CoreError> {
+pub fn decrypt_vault(encrypted: &[u8], passphrase: &SecretString) -> Result<VaultData, CoreError> {
     let decryptor = age::Decryptor::new(encrypted)
         .map_err(|e| CoreError::Secret(format!("reading encrypted vault: {e}")))?;
 
     if !decryptor.is_scrypt() {
-        return Err(CoreError::Secret("vault is not passphrase-encrypted".to_string()));
+        return Err(CoreError::Secret(
+            "vault is not passphrase-encrypted".to_string(),
+        ));
     }
 
-    let identity = age::scrypt::Identity::new(secrecy::SecretString::from(passphrase.to_string()));
+    let identity = age::scrypt::Identity::new(passphrase.clone());
 
     let mut decrypted = Vec::new();
     let mut reader = decryptor
@@ -314,50 +333,48 @@ pub fn decrypt_vault(encrypted: &[u8], passphrase: &str) -> Result<VaultData, Co
 // Session file management
 // ---------------------------------------------------------------------------
 
-/// Metadata stored in the session file (no secrets).
+/// A vault session tracks an unlocked vault's derived key on tmpfs.
 ///
-/// The session file holds only non-sensitive data: expiry time and vault path.
-/// The actual passphrase is stored in the OS keyring (macOS Keychain, Linux
-/// kernel keyutils, or Windows Credential Manager).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionMeta {
-    /// Unix timestamp when this session expires.
-    expires_at: u64,
-    /// Path to the vault file this session unlocks.
-    vault_path: PathBuf,
-}
-
-/// A vault session tracks an unlocked vault's passphrase via the OS keyring.
-///
-/// The passphrase is stored in the platform-native credential store:
-/// - **macOS**: Keychain (file-backed, works over SSH)
-/// - **Linux**: kernel keyutils (in-memory, works headless, cleared on reboot)
-/// - **Windows**: Credential Manager
-///
-/// A companion session file at `$XDG_RUNTIME_DIR/kyz/session-<hash>` holds
-/// only non-sensitive metadata (expiry timestamp, vault path).
-///
-/// If the OS keyring is unavailable, falls back to an age-encrypted session
-/// file with a machine-bound key.
-#[derive(Debug, Clone)]
+/// The session file is stored at `/run/user/<UID>/kyz/session` (Linux) or
+/// an equivalent tmpfs path. It contains the passphrase and an expiry
+/// timestamp. Only readable by the owning user (mode 0600).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VaultSession {
-    /// The vault passphrase (in memory only).
-    pub passphrase: String,
+    /// Session key derived from passphrase (held in memory / on tmpfs only).
+    #[serde(with = "secret_string_serde")]
+    pub session_key: SecretString,
+    /// Random salt used for HKDF derivation.
+    #[serde(with = "bytes_hex_serde")]
+    pub salt: Vec<u8>,
     /// Unix timestamp when this session expires.
     pub expires_at: u64,
     /// Path to the vault file this session unlocks.
     pub vault_path: PathBuf,
 }
 
-/// Keyring service name for vault session passphrases.
-const SESSION_KEYRING_SERVICE: &str = "kyz-session";
+impl fmt::Debug for VaultSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultSession")
+            .field("session_key", &"[REDACTED]")
+            .field("salt", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("vault_path", &self.vault_path)
+            .finish()
+    }
+}
 
 impl VaultSession {
     /// Create a new session.
     #[must_use]
-    pub fn new(passphrase: &str, vault_path: &Path, timeout_secs: u64) -> Self {
+    pub fn new(
+        session_key: SecretString,
+        salt: Vec<u8>,
+        vault_path: &Path,
+        timeout_secs: u64,
+    ) -> Self {
         Self {
-            passphrase: passphrase.to_string(),
+            session_key,
+            salt,
             expires_at: now_unix() + timeout_secs,
             vault_path: vault_path.to_path_buf(),
         }
@@ -407,290 +424,77 @@ impl VaultSession {
         Ok(dir.join(format!("session-{hash}")))
     }
 
-    /// Derive the keyring username for a given vault path.
-    ///
-    /// Each vault gets a unique keyring entry keyed by a hash of the vault
-    /// path, so multiple vaults can have independent sessions.
-    fn keyring_user(vault_path: &Path) -> String {
-        let hash = simple_hash(&vault_path.to_string_lossy());
-        format!("vault-{hash}")
-    }
-
-    /// Store the passphrase in the OS keyring.
-    fn keyring_store(vault_path: &Path, passphrase: &str) -> Result<(), CoreError> {
-        let user = Self::keyring_user(vault_path);
-        let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
-            .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
-        entry
-            .set_password(passphrase)
-            .map_err(|e| CoreError::Secret(format!("storing passphrase in keyring: {e}")))?;
-        Ok(())
-    }
-
-    /// Retrieve the passphrase from the OS keyring.
-    fn keyring_load(vault_path: &Path) -> Result<Option<String>, CoreError> {
-        let user = Self::keyring_user(vault_path);
-        let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
-            .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
-        match entry.get_password() {
-            Ok(pass) => Ok(Some(pass)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(CoreError::Secret(format!(
-                "reading passphrase from keyring: {e}"
-            ))),
-        }
-    }
-
-    /// Remove the passphrase from the OS keyring.
-    fn keyring_delete(vault_path: &Path) -> Result<(), CoreError> {
-        let user = Self::keyring_user(vault_path);
-        let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
-            .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(CoreError::Secret(format!(
-                "removing passphrase from keyring: {e}"
-            ))),
-        }
-    }
-
-    /// Derive a machine-bound session encryption key (fallback only).
-    ///
-    /// Used when the OS keyring is unavailable. The key is derived from the
-    /// vault path, the current user, and the hostname.
-    fn fallback_encryption_key(vault_path: &Path) -> String {
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| String::from("unknown"));
-
-        let hostname = hostname::get()
-            .map_or_else(|_| String::from("localhost"), |h| h.to_string_lossy().to_string());
-
-        let material = format!(
-            "kyz-session:{}:{}:{}",
-            vault_path.to_string_lossy(),
-            user,
-            hostname,
-        );
-        let h1 = simple_hash(&material);
-        let h2 = simple_hash(&format!("{material}:extra"));
-        format!("{h1}{h2}")
-    }
-
-    /// Write the session to disk and store the passphrase in the OS keyring.
-    ///
-    /// The passphrase is stored in the platform-native credential store. Only
-    /// non-sensitive metadata (expiry, vault path) is written to the session
-    /// file. If the keyring is unavailable, falls back to an age-encrypted
-    /// session file.
+    /// Write the session to disk with restricted permissions.
     ///
     /// # Errors
     ///
-    /// Returns an error if the session cannot be persisted.
+    /// Returns an error if the file cannot be written.
     pub fn save(&self) -> Result<PathBuf, CoreError> {
         let path = Self::session_file_for(&self.vault_path)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(CoreError::Io)?;
+            fs::create_dir_all(parent).map_err(|e| CoreError::Io(e))?;
+            // Set directory permissions to 0700
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                    .map_err(CoreError::Io)?;
+                    .map_err(|e| CoreError::Io(e))?;
             }
         }
 
-        // Try OS keyring first (passphrase never touches disk)
-        let keyring_ok = Self::keyring_store(&self.vault_path, &self.passphrase).is_ok();
+        let json = serde_json::to_string(self)
+            .map_err(|e| CoreError::Serialization(format!("serializing session: {e}")))?;
+        fs::write(&path, &json).map_err(|e| CoreError::Io(e))?;
 
-        if keyring_ok {
-            // Keyring succeeded: write only metadata to the session file
-            let meta = SessionMeta {
-                expires_at: self.expires_at,
-                vault_path: self.vault_path.clone(),
-            };
-            let json = serde_json::to_string(&meta)
-                .map_err(|e| CoreError::Serialization(format!("serializing session meta: {e}")))?;
-            fs::write(&path, json.as_bytes()).map_err(CoreError::Io)?;
-        } else {
-            // Keyring unavailable: fall back to age-encrypted session file
-            log::debug!("OS keyring unavailable, falling back to encrypted session file");
-            let full = FallbackSession {
-                passphrase: self.passphrase.clone(),
-                expires_at: self.expires_at,
-                vault_path: self.vault_path.clone(),
-            };
-            let json = serde_json::to_string(&full)
-                .map_err(|e| CoreError::Serialization(format!("serializing session: {e}")))?;
-            let key = Self::fallback_encryption_key(&self.vault_path);
-            let encrypted = encrypt_session_data(json.as_bytes(), &key)?;
-            fs::write(&path, &encrypted).map_err(CoreError::Io)?;
-        }
-
+        // Set file permissions to 0600 (owner read/write only)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                .map_err(CoreError::Io)?;
+                .map_err(|e| CoreError::Io(e))?;
         }
 
         Ok(path)
     }
 
-    /// Load a session for a given vault path.
+    /// Load a session from disk for a given vault path.
     ///
-    /// Tries the OS keyring first (passphrase there, metadata in file). If
-    /// the keyring entry is missing, attempts to decrypt the file as a
-    /// fallback encrypted session. Returns `None` if no valid session exists.
+    /// Returns `None` if no session exists or it has expired.
     ///
     /// # Errors
     ///
-    /// Returns an error on I/O failures.
+    /// Returns an error on I/O or parse failures.
     pub fn load(vault_path: &Path) -> Result<Option<Self>, CoreError> {
         let path = Self::session_file_for(vault_path)?;
         if !path.exists() {
             return Ok(None);
         }
 
-        let raw = fs::read(&path).map_err(CoreError::Io)?;
+        let json = fs::read_to_string(&path).map_err(|e| CoreError::Io(e))?;
+        let session: Self = serde_json::from_str(&json)
+            .map_err(|e| CoreError::Serialization(format!("parsing session: {e}")))?;
 
-        // Try loading as keyring-backed session (metadata-only JSON file)
-        if let Some(session) = Self::load_keyring_session(vault_path, &raw)? {
-            if session.is_expired() {
-                let _ = Self::destroy(vault_path);
-                return Ok(None);
-            }
-            return Ok(Some(session));
-        }
-
-        // Try loading as fallback encrypted session
-        if let Some(session) = Self::load_fallback_session(vault_path, &raw) {
-            if session.is_expired() {
-                let _ = Self::destroy(vault_path);
-                return Ok(None);
-            }
-            return Ok(Some(session));
-        }
-
-        // Unrecognized format, clean up
-        let _ = fs::remove_file(&path);
-        Ok(None)
-    }
-
-    /// Try to load a keyring-backed session from metadata JSON.
-    fn load_keyring_session(
-        vault_path: &Path,
-        raw: &[u8],
-    ) -> Result<Option<Self>, CoreError> {
-        // Metadata files are valid UTF-8 JSON; encrypted files are binary
-        let Ok(text) = std::str::from_utf8(raw) else {
-            return Ok(None);
-        };
-        let Ok(meta) = serde_json::from_str::<SessionMeta>(text) else {
-            return Ok(None);
-        };
-
-        // We have valid metadata; now get the passphrase from the keyring
-        let Some(passphrase) = Self::keyring_load(vault_path)? else {
-            // Keyring entry gone (reboot on Linux keyutils, manual clear, etc.)
-            // Clean up the orphaned metadata file
-            let path = Self::session_file_for(vault_path)?;
+        if session.is_expired() {
+            // Clean up expired session
             let _ = fs::remove_file(&path);
             return Ok(None);
-        };
+        }
 
-        Ok(Some(Self {
-            passphrase,
-            expires_at: meta.expires_at,
-            vault_path: meta.vault_path,
-        }))
+        Ok(Some(session))
     }
 
-    /// Try to load a fallback age-encrypted session.
-    fn load_fallback_session(vault_path: &Path, raw: &[u8]) -> Option<Self> {
-        let key = Self::fallback_encryption_key(vault_path);
-        let decrypted = decrypt_session_data(raw, &key).ok()?;
-        let json = String::from_utf8(decrypted).ok()?;
-        let fb: FallbackSession = serde_json::from_str(&json).ok()?;
-        Some(Self {
-            passphrase: fb.passphrase,
-            expires_at: fb.expires_at,
-            vault_path: fb.vault_path,
-        })
-    }
-
-    /// Remove the session (keyring entry + session file).
+    /// Remove the session file (lock).
     ///
     /// # Errors
     ///
-    /// Returns an error if cleanup fails.
+    /// Returns an error if the file cannot be removed.
     pub fn destroy(vault_path: &Path) -> Result<(), CoreError> {
-        // Remove keyring entry (ignore errors -- may not exist)
-        let _ = Self::keyring_delete(vault_path);
-
-        // Remove session file
         let path = Self::session_file_for(vault_path)?;
         if path.exists() {
-            fs::remove_file(&path).map_err(CoreError::Io)?;
+            fs::remove_file(&path).map_err(|e| CoreError::Io(e))?;
         }
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Fallback session (age-encrypted file when keyring is unavailable)
-// ---------------------------------------------------------------------------
-
-/// Full session data for the encrypted-file fallback.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FallbackSession {
-    /// The vault passphrase.
-    passphrase: String,
-    /// Unix timestamp when this session expires.
-    expires_at: u64,
-    /// Path to the vault file this session unlocks.
-    vault_path: PathBuf,
-}
-
-/// Encrypt session data with a passphrase using age.
-fn encrypt_session_data(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>, CoreError> {
-    let encryptor =
-        age::Encryptor::with_user_passphrase(secrecy::SecretString::from(passphrase.to_string()));
-    let mut encrypted = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut encrypted)
-        .map_err(|e| CoreError::Secret(format!("creating session encryptor: {e}")))?;
-    writer
-        .write_all(plaintext)
-        .map_err(|e| CoreError::Secret(format!("encrypting session data: {e}")))?;
-    writer
-        .finish()
-        .map_err(|e| CoreError::Secret(format!("finalizing session encryption: {e}")))?;
-    Ok(encrypted)
-}
-
-/// Decrypt session data with a passphrase using age.
-fn decrypt_session_data(encrypted: &[u8], passphrase: &str) -> Result<Vec<u8>, CoreError> {
-    let decryptor = age::Decryptor::new(encrypted)
-        .map_err(|e| CoreError::Secret(format!("reading encrypted session: {e}")))?;
-
-    if !decryptor.is_scrypt() {
-        return Err(CoreError::Secret(
-            "session file is not passphrase-encrypted".to_string(),
-        ));
-    }
-
-    let identity =
-        age::scrypt::Identity::new(secrecy::SecretString::from(passphrase.to_string()));
-
-    let mut decrypted = Vec::new();
-    let mut reader = decryptor
-        .decrypt(std::iter::once(&identity as &dyn age::Identity))
-        .map_err(|e| CoreError::Secret(format!("session decryption failed: {e}")))?;
-    reader
-        .read_to_end(&mut decrypted)
-        .map_err(|e| CoreError::Secret(format!("reading decrypted session: {e}")))?;
-
-    Ok(decrypted)
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +519,7 @@ pub struct VaultStore {
 impl VaultStore {
     /// Create a store for a specific vault file.
     #[must_use]
-    pub const fn new(vault_path: PathBuf) -> Self {
+    pub fn new(vault_path: PathBuf) -> Self {
         Self { vault_path }
     }
 
@@ -765,21 +569,19 @@ impl VaultStore {
         }
 
         if let Some(parent) = self.vault_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(CoreError::Io)?;
+            fs::create_dir_all(parent).map_err(|e| CoreError::Io(e))?;
         }
 
         let data = VaultData::new();
-        let encrypted = encrypt_vault(&data, passphrase)?;
-        fs::write(&self.vault_path, &encrypted)
-            .map_err(CoreError::Io)?;
+        let encrypted = encrypt_vault(&data, &SecretString::from(passphrase.to_string()))?;
+        fs::write(&self.vault_path, &encrypted).map_err(|e| CoreError::Io(e))?;
 
         // Set vault file permissions to 0600
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&self.vault_path, fs::Permissions::from_mode(0o600))
-                .map_err(CoreError::Io)?;
+                .map_err(|e| CoreError::Io(e))?;
         }
 
         Ok(())
@@ -800,12 +602,14 @@ impl VaultStore {
         }
 
         // Verify passphrase by attempting to decrypt
-        let encrypted = fs::read(&self.vault_path)
-            .map_err(CoreError::Io)?;
-        let _data = decrypt_vault(&encrypted, passphrase)?;
+        let encrypted = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
+        let passphrase = SecretString::from(passphrase.to_string());
+        let _data = decrypt_vault(&encrypted, &passphrase)?;
 
         // Create session
-        let session = VaultSession::new(passphrase, &self.vault_path, timeout_secs);
+        let salt = random_salt();
+        let session_key = derive_session_key(&passphrase, &salt)?;
+        let session = VaultSession::new(session_key, salt, &self.vault_path, timeout_secs);
         session.save()
     }
 
@@ -840,13 +644,12 @@ impl VaultStore {
         })
     }
 
-    /// Load the session passphrase, or return an error if locked.
-    fn require_session(&self) -> Result<String, CoreError> {
-        let session = VaultSession::load(&self.vault_path)?
-            .ok_or_else(|| CoreError::Secret(
-                "vault is locked. Run 'kyz unlock' first.".to_string()
-            ))?;
-        Ok(session.passphrase)
+    /// Load the session key, or return an error if locked.
+    fn require_session(&self) -> Result<SecretString, CoreError> {
+        let session = VaultSession::load(&self.vault_path)?.ok_or_else(|| {
+            CoreError::Secret("vault is locked. Run 'kyz unlock' first.".to_string())
+        })?;
+        Ok(session.session_key)
     }
 
     /// Read and decrypt the vault data.
@@ -855,8 +658,7 @@ impl VaultStore {
         if !self.vault_path.exists() {
             return Ok(VaultData::new());
         }
-        let encrypted = fs::read(&self.vault_path)
-            .map_err(CoreError::Io)?;
+        let encrypted = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
         decrypt_vault(&encrypted, &passphrase)
     }
 
@@ -864,8 +666,7 @@ impl VaultStore {
     fn write_data(&self, data: &VaultData) -> Result<(), CoreError> {
         let passphrase = self.require_session()?;
         let encrypted = encrypt_vault(data, &passphrase)?;
-        fs::write(&self.vault_path, &encrypted)
-            .map_err(CoreError::Io)?;
+        fs::write(&self.vault_path, &encrypted).map_err(|e| CoreError::Io(e))?;
         Ok(())
     }
 }
@@ -888,11 +689,9 @@ pub struct VaultStatus {
 impl SecretStore for VaultStore {
     fn get(&self, service: &str, key: &str) -> Result<SecretEntry, CoreError> {
         let data = self.read_data()?;
-        data.get(service, key)
-            .cloned()
-            .ok_or_else(|| CoreError::SecretNotFound(
-                format!("secret '{key}' not found in service '{service}'")
-            ))
+        data.get(service, key).cloned().ok_or_else(|| {
+            CoreError::SecretNotFound(format!("secret '{key}' not found in service '{service}'"))
+        })
     }
 
     fn set(&self, service: &str, key: &str, entry: &SecretEntry) -> Result<(), CoreError> {
@@ -908,9 +707,9 @@ impl SecretStore for VaultStore {
     fn delete(&self, service: &str, key: &str) -> Result<(), CoreError> {
         let mut data = self.read_data()?;
         if !data.remove(service, key) {
-            return Err(CoreError::SecretNotFound(
-                format!("secret '{key}' not found in service '{service}'")
-            ));
+            return Err(CoreError::SecretNotFound(format!(
+                "secret '{key}' not found in service '{service}'"
+            )));
         }
         self.write_data(&data)
     }
@@ -955,19 +754,19 @@ impl KeyringStore {
     }
 
     /// Load the key index for a service.
-    fn load_index(service: &str) -> Result<BTreeSet<String>, CoreError> {
+    fn load_index(&self, service: &str) -> Result<BTreeMap<String, ()>, CoreError> {
         let entry = keyring::Entry::new(service, INDEX_KEY)
             .map_err(|e| CoreError::Secret(format!("failed to create index entry: {e}")))?;
         match entry.get_password() {
             Ok(json) => serde_json::from_str(&json)
                 .map_err(|e| CoreError::Secret(format!("corrupted key index: {e}"))),
-            Err(keyring::Error::NoEntry) => Ok(BTreeSet::new()),
+            Err(keyring::Error::NoEntry) => Ok(BTreeMap::new()),
             Err(e) => Err(CoreError::Secret(format!("failed to read key index: {e}"))),
         }
     }
 
     /// Save the key index for a service.
-    fn save_index(service: &str, index: &BTreeSet<String>) -> Result<(), CoreError> {
+    fn save_index(&self, service: &str, index: &BTreeMap<String, ()>) -> Result<(), CoreError> {
         let entry = keyring::Entry::new(service, INDEX_KEY)
             .map_err(|e| CoreError::Secret(format!("failed to create index entry: {e}")))?;
         let json = serde_json::to_string(index)
@@ -989,9 +788,9 @@ impl SecretStore for KeyringStore {
         let entry = keyring::Entry::new(service, key)
             .map_err(|e| CoreError::Secret(format!("failed to create keyring entry: {e}")))?;
         let json = entry.get_password().map_err(|e| match e {
-            keyring::Error::NoEntry => {
-                CoreError::SecretNotFound(format!("secret '{key}' not found in service '{service}'"))
-            }
+            keyring::Error::NoEntry => CoreError::SecretNotFound(format!(
+                "secret '{key}' not found in service '{service}'"
+            )),
             other => CoreError::Secret(format!("keyring error: {other}")),
         })?;
 
@@ -1013,9 +812,9 @@ impl SecretStore for KeyringStore {
             .set_password(&json)
             .map_err(|e| CoreError::Secret(format!("failed to set secret: {e}")))?;
 
-        let mut index = Self::load_index(service)?;
-        index.insert(key.to_string());
-        Self::save_index(service, &index)?;
+        let mut index = self.load_index(service)?;
+        index.insert(key.to_string(), ());
+        self.save_index(service, &index)?;
 
         Ok(())
     }
@@ -1024,23 +823,23 @@ impl SecretStore for KeyringStore {
         let entry = keyring::Entry::new(service, key)
             .map_err(|e| CoreError::Secret(format!("failed to create keyring entry: {e}")))?;
         entry.delete_credential().map_err(|e| match e {
-            keyring::Error::NoEntry => {
-                CoreError::SecretNotFound(format!("secret '{key}' not found in service '{service}'"))
-            }
+            keyring::Error::NoEntry => CoreError::SecretNotFound(format!(
+                "secret '{key}' not found in service '{service}'"
+            )),
             other => CoreError::Secret(format!("failed to delete secret: {other}")),
         })?;
 
-        let mut index = Self::load_index(service)?;
+        let mut index = self.load_index(service)?;
         index.remove(key);
-        Self::save_index(service, &index)?;
+        self.save_index(service, &index)?;
 
         Ok(())
     }
 
     fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
-        let index = Self::load_index(service)?;
+        let index = self.load_index(service)?;
         Ok(index
-            .iter()
+            .keys()
             .map(|key| SecretSummary {
                 key: key.clone(),
                 service: service.to_string(),
@@ -1055,6 +854,103 @@ impl SecretStore for KeyringStore {
         Err(CoreError::Secret(
             "keyring backend does not support listing services".to_string(),
         ))
+    }
+}
+
+fn random_salt() -> Vec<u8> {
+    use rand::Rng as _;
+
+    let mut salt = vec![0_u8; 32];
+    rand::rng().fill(salt.as_mut_slice());
+    salt
+}
+
+fn derive_session_key(passphrase: &SecretString, salt: &[u8]) -> Result<SecretString, CoreError> {
+    use hkdf::Hkdf;
+    use subtle::ConstantTimeEq as _;
+
+    if salt.ct_eq(&[0_u8; 32]).into() {
+        return Err(CoreError::Secret(
+            "session salt must not be all zeros".to_string(),
+        ));
+    }
+
+    let hk = Hkdf::<Sha256>::new(Some(salt), passphrase.expose_secret().as_bytes());
+    let mut okm = [0_u8; 32];
+    hk.expand(b"kyz-vault-session-key", &mut okm)
+        .map_err(|e| CoreError::Secret(format!("hkdf expand failed: {e}")))?;
+
+    let key = hex::encode(okm);
+    Ok(SecretString::from(key))
+}
+
+mod secret_fields_serde {
+    use std::collections::BTreeMap;
+
+    use secrecy::SecretString;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(
+        fields: &BTreeMap<String, SecretString>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let plain: BTreeMap<&str, &str> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), secrecy::ExposeSecret::expose_secret(v)))
+            .collect();
+        plain.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<String, SecretString>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let plain = BTreeMap::<String, String>::deserialize(deserializer)?;
+        Ok(plain
+            .into_iter()
+            .map(|(k, v)| (k, SecretString::from(v)))
+            .collect())
+    }
+}
+
+mod secret_string_serde {
+    use secrecy::SecretString;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(secrecy::ExposeSecret::expose_secret(value))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(SecretString::from(String::deserialize(deserializer)?))
+    }
+}
+
+mod bytes_hex_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex = String::deserialize(deserializer)?;
+        hex::decode(hex).map_err(serde::de::Error::custom)
     }
 }
 

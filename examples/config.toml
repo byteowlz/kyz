@@ -1,7 +1,7 @@
-"$schema" = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/rust-workspace/rust-workspace.config.schema.json"
+"$schema" = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/kyz/kyz.config.schema.json"
 
-# Configuration for rust-workspace.
-# Copy this file to $XDG_CONFIG_HOME/rust-workspace/config.toml and adjust as needed.
+# Configuration for kyz.
+# Copy this file to $XDG_CONFIG_HOME/kyz/config.toml and adjust as needed.
 
 profile = "default"
 
