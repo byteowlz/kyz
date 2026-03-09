@@ -1,0 +1,29 @@
+{
+  "todos": [
+    {
+      "id": "51f41b47",
+      "content": "Inspect rebase conflict files and determine intended merged state",
+      "status": "in_progress",
+      "priority": "high"
+    },
+    {
+      "id": "212401f9",
+      "content": "Resolve conflicts in Cargo.lock, crates/kyz-core/Cargo.toml, crates/kyz-core/src/store.rs",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "id": "38cc7f79",
+      "content": "Run fmt + remote-build check/test after conflict resolution",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "id": "bc9f5c0c",
+      "content": "Continue rebase and verify clean status",
+      "status": "pending",
+      "priority": "high"
+    }
+  ],
+  "updated_at": "2026-03-09T22:22:53.340Z"
+}

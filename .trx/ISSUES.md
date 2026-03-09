@@ -3,9 +3,11 @@
 ## Open
 
 ### [trx-092h.1] Phase 1: Local secrets CLI (P1, epic)
+
 Basic secret CRUD using OS keyring (gnome-keyring, macOS Keychain, Windows Credential Manager) via keyring crate
 
 ### [trx-092h] Cross-platform secrets manager CLI with P2P sync (P1, epic)
+
 Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption for portable vaults, iroh/libp2p for serverless P2P sync between devices.
 
 ### [trx-092h.1.15] kyz grant/revoke for provisioning workspace vaults (P2, task)
@@ -25,9 +27,11 @@ Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption f
 ### [trx-092h.1.8] MCP server: expose get/set/list tools for agent access (P2, task)
 
 ### [trx-092h.3] Phase 3: Serverless P2P sync (P2, epic)
+
 Device pairing and encrypted sync via iroh (QUIC-based P2P). No server, no cloud. Automatic conflict resolution with CRDT or LWW.
 
 ### [trx-092h.2] Phase 2: Portable age-encrypted vault (P2, epic)
+
 age-encrypted JSON vault file as alternative backend. Enables git-syncable, portable secrets.
 
 ### [trx-092h.3.6] CLI: kyz sync pair, kyz sync status, kyz sync now (P3, task)
@@ -45,6 +49,10 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 ## Closed
 
 - [trx-2svx] Encrypt session file at rest - never store vault passphrase in plaintext (closed 2026-02-17)
+- [trx-wrwg] Add constant-time token comparison for proxy/session validation (closed 2026-03-09)
+- [trx-xkqj] Derive session key via HKDF instead of storing raw passphrase in session file (closed 2026-03-09)
+- [trx-mjf1] Use secrecy::SecretString for passphrase and secret field storage (closed 2026-03-09)
+- [trx-hkjy] Custom Debug impl for SecretEntry that redacts field values (closed 2026-03-09)
 - [trx-092h.1.14] Workspace vault support (per-directory .kyz/vault.json) (closed 2026-02-11)
 - [trx-092h.1.13] Vault unlock/lock/status commands with session file (closed 2026-02-11)
 - [trx-092h.1.12] File-based vault backend (age-encrypted JSON) (closed 2026-02-11)
