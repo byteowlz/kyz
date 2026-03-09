@@ -5,10 +5,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+};
 use clap::{Args, Parser};
 use log::info;
 use serde::Serialize;
+use subtle::ConstantTimeEq as _;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -28,6 +36,9 @@ async fn try_main() -> Result<()> {
 
     let state = AppState {
         config: Arc::new(config),
+        api_token: std::env::var("KYZ_API_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty()),
     };
 
     let cors = CorsLayer::new()
@@ -39,6 +50,10 @@ async fn try_main() -> Result<()> {
         .route("/", get(root))
         .route("/health", get(health))
         .route("/config", get(get_config))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -73,6 +88,7 @@ struct CommonOpts {
 #[derive(Clone)]
 struct AppState {
     config: Arc<AppConfig>,
+    api_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +100,34 @@ struct RootResponse {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let Some(expected) = &state.api_token else {
+        return Ok(next.run(req).await);
+    };
+
+    // Keep health endpoint unauthenticated for probes.
+    if req.uri().path() == "/health" {
+        return Ok(next.run(req).await);
+    }
+
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+
+    if expected.as_bytes().ct_eq(presented.as_bytes()).into() {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
 }
 
 async fn root() -> Json<RootResponse> {
