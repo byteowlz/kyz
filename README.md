@@ -103,14 +103,17 @@ cargo run -p kyz-api -- --port 3000
 curl http://localhost:3000/health
 ```
 
+Optional API auth:
+- Set `KYZ_API_TOKEN` to require `Authorization: Bearer <token>` on all endpoints except `/health`.
+
 ## Configuration
 
-Default config path: `$XDG_CONFIG_HOME/rust-workspace/config.toml`
+Default config path: `$XDG_CONFIG_HOME/kyz/config.toml` (fallback: `~/.config/kyz/config.toml`).
 
-Override with `--config <path>` or environment variables using the `RUST_WORKSPACE__` prefix:
+Override with `--config <path>` or environment variables using the `KYZ__` prefix:
 
 ```bash
-RUST_WORKSPACE__LOGGING__LEVEL=debug cargo run -p kyz-cli -- run
+KYZ__LOGGING__LEVEL=debug cargo run -p kyz-cli -- run
 ```
 
 See `examples/config.toml` for all options.
