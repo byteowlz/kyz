@@ -16,7 +16,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
 use crate::error::CoreError;
 
@@ -368,19 +367,19 @@ pub fn decrypt_vault(encrypted: &[u8], passphrase: &SecretString) -> Result<Vaul
 // Session file management
 // ---------------------------------------------------------------------------
 
-/// A vault session tracks an unlocked vault's derived key on tmpfs.
+/// A vault session tracks an unlocked vault's passphrase on tmpfs.
 ///
 /// The session file is stored at `/run/user/<UID>/kyz/session` (Linux) or
 /// an equivalent tmpfs path. It contains the passphrase and an expiry
 /// timestamp. Only readable by the owning user (mode 0600).
+///
+/// Future: move the passphrase to the OS keyring (macOS Keychain, Linux
+/// keyutils) so only non-sensitive metadata lives on disk.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VaultSession {
-    /// Session key derived from passphrase (held in memory / on tmpfs only).
+    /// The vault passphrase (held on tmpfs only, zeroed on drop).
     #[serde(with = "secret_string_serde")]
-    pub session_key: SecretString,
-    /// Random salt used for HKDF derivation.
-    #[serde(with = "bytes_hex_serde")]
-    pub salt: Vec<u8>,
+    pub passphrase: SecretString,
     /// Unix timestamp when this session expires.
     pub expires_at: u64,
     /// Path to the vault file this session unlocks.
@@ -390,8 +389,7 @@ pub struct VaultSession {
 impl fmt::Debug for VaultSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VaultSession")
-            .field("session_key", &"[REDACTED]")
-            .field("salt", &"[REDACTED]")
+            .field("passphrase", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
             .field("vault_path", &self.vault_path)
             .finish()
@@ -401,15 +399,9 @@ impl fmt::Debug for VaultSession {
 impl VaultSession {
     /// Create a new session.
     #[must_use]
-    pub fn new(
-        session_key: SecretString,
-        salt: Vec<u8>,
-        vault_path: &Path,
-        timeout_secs: u64,
-    ) -> Self {
+    pub fn new(passphrase: SecretString, vault_path: &Path, timeout_secs: u64) -> Self {
         Self {
-            session_key,
-            salt,
+            passphrase,
             expires_at: now_unix() + timeout_secs,
             vault_path: vault_path.to_path_buf(),
         }
@@ -642,9 +634,7 @@ impl VaultStore {
         let _data = decrypt_vault(&encrypted, &passphrase)?;
 
         // Create session
-        let salt = random_salt();
-        let session_key = derive_session_key(&passphrase, &salt)?;
-        let session = VaultSession::new(session_key, salt, &self.vault_path, timeout_secs);
+        let session = VaultSession::new(passphrase, &self.vault_path, timeout_secs);
         session.save()
     }
 
@@ -684,7 +674,7 @@ impl VaultStore {
         let session = VaultSession::load(&self.vault_path)?.ok_or_else(|| {
             CoreError::Secret("vault is locked. Run 'kyz unlock' first.".to_string())
         })?;
-        Ok(session.session_key)
+        Ok(session.passphrase)
     }
 
     /// Read and decrypt the vault data.
@@ -893,33 +883,6 @@ impl SecretStore for KeyringStore {
     }
 }
 
-fn random_salt() -> Vec<u8> {
-    use rand::Rng as _;
-
-    let mut salt = vec![0_u8; 32];
-    rand::rng().fill(salt.as_mut_slice());
-    salt
-}
-
-fn derive_session_key(passphrase: &SecretString, salt: &[u8]) -> Result<SecretString, CoreError> {
-    use hkdf::Hkdf;
-    use subtle::ConstantTimeEq as _;
-
-    if salt.ct_eq(&[0_u8; 32]).into() {
-        return Err(CoreError::Secret(
-            "session salt must not be all zeros".to_string(),
-        ));
-    }
-
-    let hk = Hkdf::<Sha256>::new(Some(salt), passphrase.expose_secret().as_bytes());
-    let mut okm = [0_u8; 32];
-    hk.expand(b"kyz-vault-session-key", &mut okm)
-        .map_err(|e| CoreError::Secret(format!("hkdf expand failed: {e}")))?;
-
-    let key = hex::encode(okm);
-    Ok(SecretString::from(key))
-}
-
 mod secret_fields_serde {
     use std::collections::BTreeMap;
 
@@ -968,25 +931,6 @@ mod secret_string_serde {
         D: Deserializer<'de>,
     {
         Ok(SecretString::from(String::deserialize(deserializer)?))
-    }
-}
-
-mod bytes_hex_serde {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let hex = String::deserialize(deserializer)?;
-        hex::decode(hex).map_err(serde::de::Error::custom)
     }
 }
 

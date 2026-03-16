@@ -562,8 +562,8 @@ fn read_secret_value(explicit: Option<&str>) -> Result<String> {
     }
 
     if io::stdin().is_terminal() {
-        let value = rpassword::prompt_password("Enter secret value: ")
-            .context("reading secret from terminal")?;
+        eprintln!("Enter secret value (input is hidden; for long values, pipe via stdin):");
+        let value = rpassword::prompt_password("").context("reading secret from terminal")?;
         if value.is_empty() {
             return Err(anyhow!("secret value must not be empty"));
         }
