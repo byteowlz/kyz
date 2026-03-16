@@ -2,6 +2,16 @@
 
 ## Open
 
+### [trx-mg5q] kyz exec headless mode: detect no-TTY, create auth request, wait for approval, inject secrets (P1, task)
+
+### [trx-34sn] WebSocket wait endpoint: WS /auth/wait/:id for real-time approval notification (P1, task)
+
+### [trx-a29x] Auth approval API: POST /auth/approve/:id with passphrase, scoped decrypt, one-time secret delivery (P1, task)
+
+### [trx-h9mf] Auth request API: POST /auth/request, GET /auth/request/:id, POST /auth/deny/:id (P1, task)
+
+### [trx-7wnq] Remote auth flow for headless agent secret access (P1, epic)
+
 ### [trx-nn87] kyz exec: wrap processes with injected secrets as env vars (P1, epic)
 
 ### [trx-092h.1] Phase 1: Local secrets CLI (P1, epic)
@@ -9,6 +19,12 @@ Basic secret CRUD using OS keyring (gnome-keyring, macOS Keychain, Windows Crede
 
 ### [trx-092h] Cross-platform secrets manager CLI with P2P sync (P1, epic)
 Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption for portable vaults, iroh/libp2p for serverless P2P sync between devices.
+
+### [trx-gber] Auth request expiry and cleanup: auto-expire pending requests, garbage collect stale state (P2, task)
+
+### [trx-kq62] macOS Touch ID integration: store vault passphrase in biometric-gated Keychain via security-framework (P2, task)
+
+### [trx-p0q1] kyz exec inline auth: detect TTY, prompt passphrase/Touch ID directly, no persistent session needed (P2, task)
 
 ### [trx-092h.1.15] kyz grant/revoke for provisioning workspace vaults (P2, task)
 
@@ -31,6 +47,8 @@ Device pairing and encrypted sync via iroh (QUIC-based P2P). No server, no cloud
 
 ### [trx-092h.2] Phase 2: Portable age-encrypted vault (P2, epic)
 age-encrypted JSON vault file as alternative backend. Enables git-syncable, portable secrets.
+
+### [trx-ymjw] Audit log: record auth requests, approvals, denials with scope, requester, approver, timestamps (P3, task)
 
 ### [trx-092h.3.6] CLI: kyz sync pair, kyz sync status, kyz sync now (P3, task)
 
