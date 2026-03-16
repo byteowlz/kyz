@@ -2,6 +2,8 @@
 
 ## Open
 
+### [trx-dg9r] Scoped vault decryption: decrypt vault, filter entries by policy (secrets/tags/services), zero unmatched entries (P1, task)
+
 ### [trx-mg5q] kyz exec headless mode: detect no-TTY, create auth request, wait for approval, inject secrets (P1, task)
 
 ### [trx-34sn] WebSocket wait endpoint: WS /auth/wait/:id for real-time approval notification (P1, task)
@@ -23,8 +25,6 @@ Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption f
 ### [trx-gber] Auth request expiry and cleanup: auto-expire pending requests, garbage collect stale state (P2, task)
 
 ### [trx-kq62] macOS Touch ID integration: store vault passphrase in biometric-gated Keychain via security-framework (P2, task)
-
-### [trx-p0q1] kyz exec inline auth: detect TTY, prompt passphrase/Touch ID directly, no persistent session needed (P2, task)
 
 ### [trx-092h.1.15] kyz grant/revoke for provisioning workspace vaults (P2, task)
 
@@ -64,6 +64,7 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ## Closed
 
+- [trx-p0q1] kyz exec inline auth: detect TTY, prompt passphrase/Touch ID directly, no persistent session needed (closed 2026-03-16)
 - [trx-ne0b] Add fzf-based interactive secret picker with multi-select for kyz exec (closed 2026-03-16)
 - [trx-905m] Implement kyz exec subcommand with alias, explicit, and tag-based resolution (closed 2026-03-16)
 - [trx-a7tf] Add aliases config section with key/tag references and env mappings (closed 2026-03-16)
