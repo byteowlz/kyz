@@ -1167,7 +1167,22 @@ fn fzf_pick_secrets(store: &dyn SecretStore) -> Result<Vec<kyz_core::SecretEntry
 
 fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
     let store = ctx.secret_store()?;
-    let env = resolve_exec_env(store.as_ref(), ctx, &cmd)?;
+
+    // Try resolving secrets; if vault is locked, prompt inline
+    let env = match resolve_exec_env(store.as_ref(), ctx, &cmd) {
+        Ok(env) => env,
+        Err(e) if e.to_string().contains("vault is locked") => {
+            // Inline auth: prompt passphrase and create a temporary session
+            let vault_store = ctx.vault_store()?;
+            let passphrase = prompt_passphrase("Vault passphrase: ")?;
+            vault_store
+                .unlock(&passphrase, kyz_core::store::DEFAULT_SESSION_TIMEOUT_SECS)
+                .map_err(|e| anyhow!("{e}"))?;
+            // Retry with the now-unlocked vault
+            resolve_exec_env(store.as_ref(), ctx, &cmd)?
+        }
+        Err(e) => return Err(e),
+    };
 
     if ctx.common.dry_run {
         info!(

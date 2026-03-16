@@ -367,18 +367,34 @@ pub fn decrypt_vault(encrypted: &[u8], passphrase: &SecretString) -> Result<Vaul
 // Session file management
 // ---------------------------------------------------------------------------
 
-/// A vault session tracks an unlocked vault's passphrase on tmpfs.
+/// Metadata stored in the session file (no secrets).
 ///
-/// The session file is stored at `/run/user/<UID>/kyz/session` (Linux) or
-/// an equivalent tmpfs path. It contains the passphrase and an expiry
-/// timestamp. Only readable by the owning user (mode 0600).
+/// The session file holds only non-sensitive data: expiry time and vault path.
+/// The actual passphrase is stored in the OS keyring (macOS Keychain, Linux
+/// kernel keyutils, or Windows Credential Manager).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionMeta {
+    /// Unix timestamp when this session expires.
+    expires_at: u64,
+    /// Path to the vault file this session unlocks.
+    vault_path: PathBuf,
+}
+
+/// A vault session tracks an unlocked vault's passphrase via the OS keyring.
 ///
-/// Future: move the passphrase to the OS keyring (macOS Keychain, Linux
-/// keyutils) so only non-sensitive metadata lives on disk.
-#[derive(Clone, Serialize, Deserialize)]
+/// The passphrase is stored in the platform-native credential store:
+/// - **macOS**: Keychain (file-backed, works over SSH)
+/// - **Linux**: kernel keyutils (in-memory, works headless, cleared on reboot)
+/// - **Windows**: Credential Manager
+///
+/// A companion session file at `$XDG_RUNTIME_DIR/kyz/session-<hash>` holds
+/// only non-sensitive metadata (expiry timestamp, vault path).
+///
+/// If the OS keyring is unavailable, falls back to an age-encrypted session
+/// file with a machine-bound key.
+#[derive(Clone)]
 pub struct VaultSession {
-    /// The vault passphrase (held on tmpfs only, zeroed on drop).
-    #[serde(with = "secret_string_serde")]
+    /// The vault passphrase (in memory only, zeroed on drop).
     pub passphrase: SecretString,
     /// Unix timestamp when this session expires.
     pub expires_at: u64,
@@ -395,6 +411,9 @@ impl fmt::Debug for VaultSession {
             .finish()
     }
 }
+
+/// Keyring service name for vault session passphrases.
+const SESSION_KEYRING_SERVICE: &str = "kyz-session";
 
 impl VaultSession {
     /// Create a new session.
@@ -431,7 +450,6 @@ impl VaultSession {
         }
 
         // Fallback: user-specific temp directory
-        // Use $USER to scope the directory per-user, preventing cross-user access
         let username = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
@@ -446,82 +464,284 @@ impl VaultSession {
     /// Returns an error if the session directory cannot be determined.
     pub fn session_file_for(vault_path: &Path) -> Result<PathBuf, CoreError> {
         let dir = Self::session_dir()?;
-        // Hash the vault path to create a unique session file per vault
         let hash = simple_hash(&vault_path.to_string_lossy());
         Ok(dir.join(format!("session-{hash}")))
     }
 
-    /// Write the session to disk with restricted permissions.
+    /// Derive the keyring username for a given vault path.
+    fn keyring_user(vault_path: &Path) -> String {
+        let hash = simple_hash(&vault_path.to_string_lossy());
+        format!("vault-{hash}")
+    }
+
+    /// Store the passphrase in the OS keyring.
+    fn keyring_store(vault_path: &Path, passphrase: &str) -> Result<(), CoreError> {
+        let user = Self::keyring_user(vault_path);
+        let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
+            .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
+        entry
+            .set_password(passphrase)
+            .map_err(|e| CoreError::Secret(format!("storing passphrase in keyring: {e}")))?;
+        Ok(())
+    }
+
+    /// Retrieve the passphrase from the OS keyring.
+    fn keyring_load(vault_path: &Path) -> Result<Option<String>, CoreError> {
+        let user = Self::keyring_user(vault_path);
+        let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
+            .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
+        match entry.get_password() {
+            Ok(pass) => Ok(Some(pass)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(CoreError::Secret(format!(
+                "reading passphrase from keyring: {e}"
+            ))),
+        }
+    }
+
+    /// Remove the passphrase from the OS keyring.
+    fn keyring_delete(vault_path: &Path) -> Result<(), CoreError> {
+        let user = Self::keyring_user(vault_path);
+        let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
+            .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(CoreError::Secret(format!(
+                "removing passphrase from keyring: {e}"
+            ))),
+        }
+    }
+
+    /// Derive a machine-bound session encryption key (fallback only).
+    ///
+    /// Used when the OS keyring is unavailable. The key is derived from the
+    /// vault path, the current user, and the hostname.
+    fn fallback_encryption_key(vault_path: &Path) -> String {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| String::from("unknown"));
+
+        let hostname = hostname::get().map_or_else(
+            |_| String::from("localhost"),
+            |h| h.to_string_lossy().to_string(),
+        );
+
+        let material = format!(
+            "kyz-session:{}:{}:{}",
+            vault_path.to_string_lossy(),
+            user,
+            hostname,
+        );
+        let h1 = simple_hash(&material);
+        let h2 = simple_hash(&format!("{material}:extra"));
+        format!("{h1}{h2}")
+    }
+
+    /// Write the session to disk and store the passphrase in the OS keyring.
+    ///
+    /// The passphrase is stored in the platform-native credential store. Only
+    /// non-sensitive metadata (expiry, vault path) is written to the session
+    /// file. If the keyring is unavailable, falls back to an age-encrypted
+    /// session file.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
+    /// Returns an error if the session cannot be persisted.
     pub fn save(&self) -> Result<PathBuf, CoreError> {
         let path = Self::session_file_for(&self.vault_path)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| CoreError::Io(e))?;
-            // Set directory permissions to 0700
+            fs::create_dir_all(parent).map_err(CoreError::Io)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                    .map_err(|e| CoreError::Io(e))?;
+                    .map_err(CoreError::Io)?;
             }
         }
 
-        let json = serde_json::to_string(self)
-            .map_err(|e| CoreError::Serialization(format!("serializing session: {e}")))?;
-        fs::write(&path, &json).map_err(|e| CoreError::Io(e))?;
+        let passphrase_str = self.passphrase.expose_secret();
 
-        // Set file permissions to 0600 (owner read/write only)
+        // Try OS keyring first (passphrase never touches disk)
+        let keyring_ok = Self::keyring_store(&self.vault_path, passphrase_str).is_ok();
+
+        if keyring_ok {
+            // Keyring succeeded: write only metadata to the session file
+            let meta = SessionMeta {
+                expires_at: self.expires_at,
+                vault_path: self.vault_path.clone(),
+            };
+            let json = serde_json::to_string(&meta)
+                .map_err(|e| CoreError::Serialization(format!("serializing session meta: {e}")))?;
+            fs::write(&path, json.as_bytes()).map_err(CoreError::Io)?;
+        } else {
+            // Keyring unavailable: fall back to age-encrypted session file
+            log::debug!("OS keyring unavailable, falling back to encrypted session file");
+            let full = FallbackSession {
+                passphrase: passphrase_str.to_string(),
+                expires_at: self.expires_at,
+                vault_path: self.vault_path.clone(),
+            };
+            let json = serde_json::to_string(&full)
+                .map_err(|e| CoreError::Serialization(format!("serializing session: {e}")))?;
+            let key = Self::fallback_encryption_key(&self.vault_path);
+            let encrypted = encrypt_session_data(json.as_bytes(), &key)?;
+            fs::write(&path, &encrypted).map_err(CoreError::Io)?;
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                .map_err(|e| CoreError::Io(e))?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(CoreError::Io)?;
         }
 
         Ok(path)
     }
 
-    /// Load a session from disk for a given vault path.
+    /// Load a session for a given vault path.
     ///
-    /// Returns `None` if no session exists or it has expired.
+    /// Tries the OS keyring first (passphrase there, metadata in file). If
+    /// the keyring entry is missing, attempts to decrypt the file as a
+    /// fallback encrypted session. Returns `None` if no valid session exists.
     ///
     /// # Errors
     ///
-    /// Returns an error on I/O or parse failures.
+    /// Returns an error on I/O failures.
     pub fn load(vault_path: &Path) -> Result<Option<Self>, CoreError> {
         let path = Self::session_file_for(vault_path)?;
         if !path.exists() {
             return Ok(None);
         }
 
-        let json = fs::read_to_string(&path).map_err(|e| CoreError::Io(e))?;
-        let session: Self = serde_json::from_str(&json)
-            .map_err(|e| CoreError::Serialization(format!("parsing session: {e}")))?;
+        let raw = fs::read(&path).map_err(CoreError::Io)?;
 
-        if session.is_expired() {
-            // Clean up expired session
-            let _ = fs::remove_file(&path);
-            return Ok(None);
+        // Try loading as keyring-backed session (metadata-only JSON file)
+        if let Some(session) = Self::load_keyring_session(vault_path, &raw)? {
+            if session.is_expired() {
+                let _ = Self::destroy(vault_path);
+                return Ok(None);
+            }
+            return Ok(Some(session));
         }
 
-        Ok(Some(session))
+        // Try loading as fallback encrypted session
+        if let Some(session) = Self::load_fallback_session(vault_path, &raw) {
+            if session.is_expired() {
+                let _ = Self::destroy(vault_path);
+                return Ok(None);
+            }
+            return Ok(Some(session));
+        }
+
+        // Unrecognized format, clean up
+        let _ = fs::remove_file(&path);
+        Ok(None)
     }
 
-    /// Remove the session file (lock).
+    /// Try to load a keyring-backed session from metadata JSON.
+    fn load_keyring_session(vault_path: &Path, raw: &[u8]) -> Result<Option<Self>, CoreError> {
+        let Ok(text) = std::str::from_utf8(raw) else {
+            return Ok(None);
+        };
+        let Ok(meta) = serde_json::from_str::<SessionMeta>(text) else {
+            return Ok(None);
+        };
+
+        let Some(passphrase) = Self::keyring_load(vault_path)? else {
+            // Keyring entry gone (reboot on Linux keyutils, manual clear, etc.)
+            let path = Self::session_file_for(vault_path)?;
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        };
+
+        Ok(Some(Self {
+            passphrase: SecretString::from(passphrase),
+            expires_at: meta.expires_at,
+            vault_path: meta.vault_path,
+        }))
+    }
+
+    /// Try to load a fallback age-encrypted session.
+    fn load_fallback_session(vault_path: &Path, raw: &[u8]) -> Option<Self> {
+        let key = Self::fallback_encryption_key(vault_path);
+        let decrypted = decrypt_session_data(raw, &key).ok()?;
+        let json = String::from_utf8(decrypted).ok()?;
+        let fb: FallbackSession = serde_json::from_str(&json).ok()?;
+        Some(Self {
+            passphrase: SecretString::from(fb.passphrase),
+            expires_at: fb.expires_at,
+            vault_path: fb.vault_path,
+        })
+    }
+
+    /// Remove the session (keyring entry + session file).
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be removed.
+    /// Returns an error if cleanup fails.
     pub fn destroy(vault_path: &Path) -> Result<(), CoreError> {
+        let _ = Self::keyring_delete(vault_path);
         let path = Self::session_file_for(vault_path)?;
         if path.exists() {
-            fs::remove_file(&path).map_err(|e| CoreError::Io(e))?;
+            fs::remove_file(&path).map_err(CoreError::Io)?;
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback session (age-encrypted file when keyring is unavailable)
+// ---------------------------------------------------------------------------
+
+/// Full session data for the encrypted-file fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FallbackSession {
+    /// The vault passphrase.
+    passphrase: String,
+    /// Unix timestamp when this session expires.
+    expires_at: u64,
+    /// Path to the vault file this session unlocks.
+    vault_path: PathBuf,
+}
+
+/// Encrypt session data with a passphrase using age.
+fn encrypt_session_data(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>, CoreError> {
+    let encryptor =
+        age::Encryptor::with_user_passphrase(SecretString::from(passphrase.to_string()));
+    let mut encrypted = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut encrypted)
+        .map_err(|e| CoreError::Secret(format!("creating session encryptor: {e}")))?;
+    writer
+        .write_all(plaintext)
+        .map_err(|e| CoreError::Secret(format!("encrypting session data: {e}")))?;
+    writer
+        .finish()
+        .map_err(|e| CoreError::Secret(format!("finalizing session encryption: {e}")))?;
+    Ok(encrypted)
+}
+
+/// Decrypt session data with a passphrase using age.
+fn decrypt_session_data(encrypted: &[u8], passphrase: &str) -> Result<Vec<u8>, CoreError> {
+    let decryptor = age::Decryptor::new(encrypted)
+        .map_err(|e| CoreError::Secret(format!("reading encrypted session: {e}")))?;
+
+    if !decryptor.is_scrypt() {
+        return Err(CoreError::Secret(
+            "session file is not passphrase-encrypted".to_string(),
+        ));
+    }
+
+    let identity = age::scrypt::Identity::new(SecretString::from(passphrase.to_string()));
+
+    let mut decrypted = Vec::new();
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|e| CoreError::Secret(format!("session decryption failed: {e}")))?;
+    reader
+        .read_to_end(&mut decrypted)
+        .map_err(|e| CoreError::Secret(format!("reading decrypted session: {e}")))?;
+
+    Ok(decrypted)
 }
 
 // ---------------------------------------------------------------------------
@@ -912,25 +1132,6 @@ mod secret_fields_serde {
             .into_iter()
             .map(|(k, v)| (k, SecretString::from(v)))
             .collect())
-    }
-}
-
-mod secret_string_serde {
-    use secrecy::SecretString;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(value: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(secrecy::ExposeSecret::expose_secret(value))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Ok(SecretString::from(String::deserialize(deserializer)?))
     }
 }
 

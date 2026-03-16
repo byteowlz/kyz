@@ -28,3 +28,4 @@ keyring.workspace = true
 age.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
+hostname.workspace = true
