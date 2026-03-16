@@ -106,6 +106,45 @@ curl http://localhost:3000/health
 Optional API auth:
 - Set `KYZ_API_TOKEN` to require `Authorization: Bearer <token>` on all endpoints except `/health`.
 
+### kyz exec
+
+Wrap any command with secrets injected as environment variables:
+
+```bash
+# Using a config alias
+kyz exec --alias deploy -- make deploy
+
+# Explicit secret references
+kyz exec --secret github/deploy-key --secret aws/prod -- ./deploy.sh
+
+# Explicit env-var mapping
+kyz exec --env GITHUB_TOKEN=github/deploy-key:token -- gh pr create
+
+# Tag-based: inject all secrets tagged "dev"
+kyz exec --tag dev -- cargo test
+
+# Interactive fzf picker (multi-select with TAB)
+kyz exec --pick -- ./my-app
+```
+
+#### Aliases in config.toml
+
+```toml
+[aliases.deploy]
+secrets = ["github/deploy-key", "aws/prod-creds"]
+tags = ["deploy"]
+env_map = { GITHUB_TOKEN = "github/deploy-key:token" }
+
+[aliases.dev]
+tags = ["dev"]
+```
+
+#### Secret tags
+
+```bash
+kyz set deploy-key --service github -f token=ghp_xxx --tag deploy --tag ci
+```
+
 ## Configuration
 
 Default config path: `$XDG_CONFIG_HOME/kyz/config.toml` (fallback: `~/.config/kyz/config.toml`).

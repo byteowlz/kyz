@@ -1,6 +1,6 @@
 //! CLI interface for kyz - a cross-platform secrets manager.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::{self, IsTerminal, Read as _};
 use std::path::PathBuf;
@@ -43,6 +43,7 @@ fn try_main() -> Result<()> {
         Command::Vault { command } => handle_vault(&ctx, command),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
+        Command::Exec(cmd) => handle_exec(&ctx, cmd),
         Command::Completions { shell } => {
             handle_completions(shell);
             Ok(())
@@ -161,6 +162,8 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Wrap a command with secrets injected as environment variables.
+    Exec(ExecCommand),
     /// Generate shell completions.
     Completions {
         /// Target shell.
@@ -213,6 +216,9 @@ struct SetCommand {
     /// Set a named field (repeatable, format: name=value).
     #[arg(long = "field", short = 'f', value_name = "NAME=VALUE")]
     fields: Vec<String>,
+    /// Assign a tag to this secret (repeatable).
+    #[arg(long = "tag", short = 't', value_name = "TAG")]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -281,6 +287,35 @@ enum ConfigCommand {
     Schema,
     /// Regenerate the default configuration file.
     Reset,
+}
+
+// -- Exec command -------------------------------------------------------------
+
+#[derive(Debug, Clone, Args)]
+struct ExecCommand {
+    /// Named alias from config.toml [aliases.<name>].
+    #[arg(long, short = 'a', value_name = "ALIAS")]
+    alias: Option<String>,
+
+    /// Explicit env mapping: ENV_VAR=service/key:field (repeatable).
+    #[arg(long = "env", short = 'e', value_name = "ENV=SERVICE/KEY:FIELD")]
+    env_maps: Vec<String>,
+
+    /// Include all secrets matching this tag (repeatable).
+    #[arg(long = "tag", short = 't', value_name = "TAG")]
+    tags: Vec<String>,
+
+    /// Include all secrets for this service/key (repeatable, format: service/key).
+    #[arg(long = "secret", short = 's', value_name = "SERVICE/KEY")]
+    secrets: Vec<String>,
+
+    /// Interactive fzf picker for secret selection.
+    #[arg(long = "pick", short = 'p')]
+    pick: bool,
+
+    /// Command and arguments to execute.
+    #[arg(trailing_var_arg = true, required = true)]
+    command: Vec<String>,
 }
 
 // -- Runtime context ----------------------------------------------------------
@@ -572,7 +607,8 @@ fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
         m
     };
 
-    let entry = SecretEntry::new(&cmd.service, &cmd.key, fields);
+    let tags: BTreeSet<String> = cmd.tags.into_iter().collect();
+    let entry = SecretEntry::new(&cmd.service, &cmd.key, fields).with_tags(tags);
 
     if ctx.common.dry_run {
         info!(
@@ -919,4 +955,254 @@ fn handle_config(ctx: &RuntimeContext, command: ConfigCommand) -> Result<()> {
 fn handle_completions(shell: Shell) {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, APP_NAME, &mut io::stdout());
+}
+
+// -- Exec command handler -----------------------------------------------------
+
+/// Resolve all secrets for an exec invocation into a flat env map.
+fn resolve_exec_env(
+    store: &dyn SecretStore,
+    ctx: &RuntimeContext,
+    cmd: &ExecCommand,
+) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    let mut entries: Vec<kyz_core::SecretEntry> = Vec::new();
+
+    // 1. Resolve from alias
+    if let Some(ref alias_name) = cmd.alias {
+        let alias = ctx
+            .config
+            .aliases
+            .get(alias_name)
+            .ok_or_else(|| anyhow!("alias '{alias_name}' not found in config"))?;
+
+        // Explicit secret refs from alias
+        for secret_ref in &alias.secrets {
+            if let Some(entry) = resolve_secret_ref(store, secret_ref)? {
+                entries.push(entry);
+            }
+        }
+
+        // Tag-based resolution from alias
+        for entry in resolve_by_tags(store, &alias.tags)? {
+            entries.push(entry);
+        }
+
+        // Explicit env mappings from alias
+        for (env_var, field_ref) in &alias.env_map {
+            let value = resolve_field_ref(store, field_ref)?;
+            env.insert(env_var.clone(), value);
+        }
+    }
+
+    // 2. Explicit --secret refs
+    for secret_ref in &cmd.secrets {
+        if let Some(entry) = resolve_secret_ref(store, secret_ref)? {
+            entries.push(entry);
+        }
+    }
+
+    // 3. Tag-based --tag refs
+    for entry in resolve_by_tags(store, &cmd.tags)? {
+        entries.push(entry);
+    }
+
+    // 4. Interactive picker
+    if cmd.pick {
+        let picked = fzf_pick_secrets(store)?;
+        entries.extend(picked);
+    }
+
+    // 5. Explicit --env mappings (highest priority)
+    for mapping in &cmd.env_maps {
+        let (var, field_ref) = mapping.split_once('=').ok_or_else(|| {
+            anyhow!("invalid --env format '{mapping}', expected ENV=service/key:field")
+        })?;
+        let value = resolve_field_ref(store, field_ref)?;
+        env.insert(var.to_string(), value);
+    }
+
+    // Convert collected entries to env vars (default: uppercase field names)
+    for entry in &entries {
+        for (field_name, field_value) in &entry.fields {
+            let env_var = field_name.to_uppercase();
+            // Don't overwrite explicit mappings
+            env.entry(env_var)
+                .or_insert_with(|| field_value.expose_secret().to_string());
+        }
+    }
+
+    Ok(env)
+}
+
+/// Parse `"service/key"` and fetch the entry.
+fn resolve_secret_ref(
+    store: &dyn SecretStore,
+    ref_str: &str,
+) -> Result<Option<kyz_core::SecretEntry>> {
+    let (service, key) = ref_str
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid secret reference '{ref_str}', expected service/key"))?;
+    match store.get(service, key) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(kyz_core::error::CoreError::SecretNotFound(_)) => {
+            Err(anyhow!("secret '{ref_str}' not found"))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+/// Parse `"service/key:field"` and return the field value.
+fn resolve_field_ref(store: &dyn SecretStore, ref_str: &str) -> Result<String> {
+    let (secret_part, field_name) = ref_str.split_once(':').ok_or_else(|| {
+        anyhow!("invalid field reference '{ref_str}', expected service/key:field")
+    })?;
+    let (service, key) = secret_part
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid secret reference '{secret_part}', expected service/key"))?;
+    let entry = store.get(service, key).map_err(|e| anyhow!("{e}"))?;
+    entry
+        .field(field_name)
+        .map(String::from)
+        .ok_or_else(|| anyhow!("field '{field_name}' not found in '{secret_part}'"))
+}
+
+/// Find all entries matching any of the given tags across all services.
+fn resolve_by_tags(store: &dyn SecretStore, tags: &[String]) -> Result<Vec<kyz_core::SecretEntry>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let services = store.list_services().map_err(|e| anyhow!("{e}"))?;
+    let mut results = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for svc in &services {
+        let summaries = store.list(svc).map_err(|e| anyhow!("{e}"))?;
+        for summary in &summaries {
+            let compound = format!("{}/{}", summary.service, summary.key);
+            if seen.contains(&compound) {
+                continue;
+            }
+            if summary.tags.iter().any(|t| tags.contains(t)) {
+                let entry = store.get(svc, &summary.key).map_err(|e| anyhow!("{e}"))?;
+                seen.insert(compound);
+                results.push(entry);
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Interactive fzf picker for multi-selecting secrets.
+fn fzf_pick_secrets(store: &dyn SecretStore) -> Result<Vec<kyz_core::SecretEntry>> {
+    use std::process::{Command as Cmd, Stdio};
+
+    // Build list of all secrets
+    let services = store.list_services().map_err(|e| anyhow!("{e}"))?;
+    let mut lines = Vec::new();
+    for svc in &services {
+        let summaries = store.list(svc).map_err(|e| anyhow!("{e}"))?;
+        for s in &summaries {
+            let tags_str = if s.tags.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [{}]",
+                    s.tags.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
+            let fields_str = s.field_names.join(", ");
+            lines.push(format!(
+                "{}/{}\t{{{fields_str}}}{tags_str}",
+                s.service, s.key
+            ));
+        }
+    }
+
+    if lines.is_empty() {
+        return Err(anyhow!("no secrets found in store"));
+    }
+
+    let input = lines.join("\n");
+    let mut child = Cmd::new("fzf")
+        .args([
+            "--multi",
+            "--ansi",
+            "--header",
+            "Select secrets (TAB to multi-select, ENTER to confirm)",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to start fzf (is it installed?)")?;
+
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().context("failed to open fzf stdin")?;
+        stdin
+            .write_all(input.as_bytes())
+            .context("failed to write to fzf")?;
+    }
+
+    let output = child.wait_with_output().context("fzf failed")?;
+    if !output.status.success() {
+        return Err(anyhow!("fzf cancelled"));
+    }
+
+    let selected = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    for line in selected.lines() {
+        let ref_str = line.split('\t').next().unwrap_or(line).trim();
+        if ref_str.is_empty() {
+            continue;
+        }
+        if let Some(entry) = resolve_secret_ref(store, ref_str)? {
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
+}
+
+fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
+    let store = ctx.secret_store()?;
+    let env = resolve_exec_env(store.as_ref(), ctx, &cmd)?;
+
+    if ctx.common.dry_run {
+        info!(
+            "dry-run: would inject {} env vars and run: {:?}",
+            env.len(),
+            cmd.command
+        );
+        for (k, _) in &env {
+            println!("{k}=***");
+        }
+        return Ok(());
+    }
+
+    let program = &cmd.command[0];
+    let args = &cmd.command[1..];
+
+    // On Unix, use exec() to replace the process
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let err = std::process::Command::new(program)
+            .args(args)
+            .envs(&env)
+            .exec();
+        // exec() only returns on error
+        return Err(anyhow!("failed to exec '{}': {}", program, err));
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .envs(&env)
+            .status()
+            .context(format!("failed to run '{program}'"))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }

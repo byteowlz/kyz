@@ -17,7 +17,7 @@ pub mod paths;
 pub mod schema;
 pub mod store;
 
-pub use config::{AppConfig, LogLevel, LoggingConfig, PathsConfig, RuntimeConfig};
+pub use config::{AliasConfig, AppConfig, LogLevel, LoggingConfig, PathsConfig, RuntimeConfig};
 pub use error::{CoreError, Result};
 pub use paths::{AppPaths, default_cache_dir};
 pub use schema::{generate_example_config, generate_schema, write_generated_files};
@@ -47,6 +47,5 @@ pub fn env_prefix() -> String {
 /// Returns the default parallelism based on available CPU cores.
 #[must_use]
 pub fn default_parallelism() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }

@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use kyz_core::{write_generated_files, APP_NAME};
+use kyz_core::{APP_NAME, write_generated_files};
 
 /// Repository URL for schema $id.
 const REPO_URL: &str = "https://github.com/byteowlz/kyz";

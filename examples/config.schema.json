@@ -9,6 +9,13 @@
       "description": "JSON Schema reference for editor support",
       "type": "string"
     },
+    "aliases": {
+      "description": "Named aliases for `kyz exec`. Each alias resolves a set of secrets\nto inject as environment variables when wrapping a process.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/AliasConfig"
+      }
+    },
     "logging": {
       "description": "Logging configuration.",
       "allOf": [
@@ -48,6 +55,33 @@
     }
   },
   "definitions": {
+    "AliasConfig": {
+      "description": "Named alias for kyz exec secret injection",
+      "type": "object",
+      "properties": {
+        "env_map": {
+          "description": "Explicit env-var mappings: `{ \"ENV_VAR\" = \"service/key:field\" }`.\n\nThese override the default field-name uppercasing for specific fields.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "secrets": {
+          "description": "Explicit secret references as `\"service/key\"` strings.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "description": "Tags to match. All secrets with *any* of these tags are included.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "LogLevel": {
       "description": "Log level enumeration for schema validation.",
       "oneOf": [

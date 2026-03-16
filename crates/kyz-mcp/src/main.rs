@@ -104,8 +104,8 @@ impl McpServer {
     /// Get runtime configuration
     #[tool(description = "Returns the runtime configuration including parallelism and timeout")]
     async fn get_runtime_config(&self) -> Result<CallToolResult, McpError> {
-        let json = serde_json::to_string_pretty(&self.config.runtime)
-            .unwrap_or_else(|_| "{}".to_string());
+        let json =
+            serde_json::to_string_pretty(&self.config.runtime).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }

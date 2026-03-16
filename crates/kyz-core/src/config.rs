@@ -1,5 +1,6 @@
 //! Configuration types and loading for the application.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -8,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::{expand_str_path, write_default_config};
-use crate::{default_parallelism, env_prefix, AppPaths};
+use crate::{AppPaths, default_parallelism, env_prefix};
 
 /// Main application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -35,6 +36,11 @@ pub struct AppConfig {
 
     /// Custom paths for data and state directories.
     pub paths: PathsConfig,
+
+    /// Named aliases for `kyz exec`. Each alias resolves a set of secrets
+    /// to inject as environment variables when wrapping a process.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, AliasConfig>,
 }
 
 fn default_profile() -> String {
@@ -111,6 +117,7 @@ impl Default for AppConfig {
             logging: LoggingConfig::default(),
             runtime: RuntimeConfig::default(),
             paths: PathsConfig::default(),
+            aliases: BTreeMap::new(),
         }
     }
 }
@@ -196,6 +203,43 @@ impl Default for RuntimeConfig {
             parallelism: None,
             timeout: Some(60),
             fail_fast: true,
+        }
+    }
+}
+
+/// An alias definition for `kyz exec`.
+///
+/// Aliases resolve secrets by explicit key references and/or tags. Each
+/// resolved secret's fields are injected as environment variables into the
+/// wrapped process.
+///
+/// Field-to-env mapping: by default fields are uppercased
+/// (`service/key:field` → `FIELD`). Use `env_map` for explicit overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+#[schemars(description = "Named alias for kyz exec secret injection")]
+pub struct AliasConfig {
+    /// Explicit secret references as `"service/key"` strings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+
+    /// Tags to match. All secrets with *any* of these tags are included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
+    /// Explicit env-var mappings: `{ "ENV_VAR" = "service/key:field" }`.
+    ///
+    /// These override the default field-name uppercasing for specific fields.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_map: BTreeMap<String, String>,
+}
+
+impl Default for AliasConfig {
+    fn default() -> Self {
+        Self {
+            secrets: Vec::new(),
+            tags: Vec::new(),
+            env_map: BTreeMap::new(),
         }
     }
 }

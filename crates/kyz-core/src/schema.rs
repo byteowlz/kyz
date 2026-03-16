@@ -9,8 +9,8 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use schemars::generate::SchemaSettings;
 use schemars::Schema;
+use schemars::generate::SchemaSettings;
 use serde_json::json;
 
 use crate::config::AppConfig;

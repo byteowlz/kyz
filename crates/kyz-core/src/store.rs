@@ -7,7 +7,7 @@
 //! - [`VaultStore`] backed by age-encrypted JSON file (headless/agent use)
 //! - [`VaultSession`] for unlock/lock lifecycle with tmpfs session files
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -53,6 +53,9 @@ pub struct SecretEntry {
     /// Named fields containing the secret data.
     #[serde(with = "secret_fields_serde")]
     pub fields: BTreeMap<String, SecretString>,
+    /// Optional tags for categorization and alias matching.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub tags: BTreeSet<String>,
     /// Unix timestamp when the entry was created.
     pub created_at: u64,
     /// Unix timestamp when the entry was last modified.
@@ -68,9 +71,23 @@ impl SecretEntry {
             key: key.to_string(),
             service: service.to_string(),
             fields,
+            tags: BTreeSet::new(),
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Create a new entry with tags.
+    #[must_use]
+    pub fn with_tags(mut self, tags: BTreeSet<String>) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    /// Check if this entry has a specific tag.
+    #[must_use]
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.tags.contains(tag)
     }
 
     /// Create a new entry with a single "value" field (backwards compat).
@@ -79,6 +96,18 @@ impl SecretEntry {
         let mut fields = BTreeMap::new();
         fields.insert("value".to_string(), SecretString::from(value.to_string()));
         Self::new(service, key, fields)
+    }
+
+    /// Add a tag to this entry.
+    pub fn add_tag(&mut self, tag: &str) {
+        self.tags.insert(tag.to_string());
+        self.updated_at = now_unix();
+    }
+
+    /// Remove a tag from this entry.
+    pub fn remove_tag(&mut self, tag: &str) {
+        self.tags.remove(tag);
+        self.updated_at = now_unix();
     }
 
     /// Get a specific field value.
@@ -110,6 +139,7 @@ impl fmt::Debug for SecretEntry {
             .field("key", &self.key)
             .field("service", &self.service)
             .field("fields", &redacted_fields)
+            .field("tags", &self.tags)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish()
@@ -125,6 +155,9 @@ pub struct SecretSummary {
     pub service: String,
     /// Names of fields present in this entry.
     pub field_names: Vec<String>,
+    /// Tags assigned to this entry.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub tags: BTreeSet<String>,
     /// Unix timestamp when last modified.
     pub updated_at: u64,
 }
@@ -135,6 +168,7 @@ impl From<&SecretEntry> for SecretSummary {
             key: entry.key.clone(),
             service: entry.service.clone(),
             field_names: entry.fields.keys().cloned().collect(),
+            tags: entry.tags.clone(),
             updated_at: entry.updated_at,
         }
     }
@@ -235,6 +269,7 @@ impl VaultData {
                     .fields
                     .insert(field_name.clone(), field_value.clone());
             }
+            existing.tags.extend(entry.tags.iter().cloned());
             existing.updated_at = now_unix();
         } else {
             self.entries.insert(ck, entry);
@@ -844,6 +879,7 @@ impl SecretStore for KeyringStore {
                 key: key.clone(),
                 service: service.to_string(),
                 field_names: Vec::new(), // Can't know without fetching each entry
+                tags: BTreeSet::new(),
                 updated_at: 0,
             })
             .collect())
