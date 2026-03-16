@@ -2,8 +2,6 @@
 
 ## Open
 
-### [trx-dg9r] Scoped vault decryption: decrypt vault, filter entries by policy (secrets/tags/services), zero unmatched entries (P1, task)
-
 ### [trx-mg5q] kyz exec headless mode: detect no-TTY, create auth request, wait for approval, inject secrets (P1, task)
 
 ### [trx-34sn] WebSocket wait endpoint: WS /auth/wait/:id for real-time approval notification (P1, task)
@@ -64,6 +62,7 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ## Closed
 
+- [trx-dg9r] Scoped vault decryption: decrypt vault, filter entries by policy (secrets/tags/services), zero unmatched entries (closed 2026-03-16)
 - [trx-p0q1] kyz exec inline auth: detect TTY, prompt passphrase/Touch ID directly, no persistent session needed (closed 2026-03-16)
 - [trx-ne0b] Add fzf-based interactive secret picker with multi-select for kyz exec (closed 2026-03-16)
 - [trx-905m] Implement kyz exec subcommand with alias, explicit, and tag-based resolution (closed 2026-03-16)

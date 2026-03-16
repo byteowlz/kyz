@@ -22,8 +22,8 @@ pub use error::{CoreError, Result};
 pub use paths::{AppPaths, default_cache_dir};
 pub use schema::{generate_example_config, generate_schema, write_generated_files};
 pub use store::{
-    KeyringStore, SecretEntry, SecretStore, SecretSummary, VaultData, VaultSession, VaultStatus,
-    VaultStore,
+    EncryptedEntry, KeyringStore, SecretEntry, SecretStore, SecretSummary, VaultData, VaultFileV2,
+    VaultSession, VaultStatus, VaultStore, decrypt_entry, encrypt_entry,
 };
 
 /// Application name used for config directories and environment prefix.

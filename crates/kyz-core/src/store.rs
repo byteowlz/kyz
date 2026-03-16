@@ -364,6 +364,261 @@ pub fn decrypt_vault(encrypted: &[u8], passphrase: &SecretString) -> Result<Vaul
 }
 
 // ---------------------------------------------------------------------------
+// Vault v2: per-entry encryption
+// ---------------------------------------------------------------------------
+
+/// Vault file format v2: per-entry encrypted fields with plaintext metadata.
+///
+/// Entry names, services, tags, and timestamps are plaintext JSON. Only field
+/// values are individually age-encrypted. This allows:
+/// - Listing secrets without unlocking
+/// - Decrypting individual entries on demand (scoped access)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultFileV2 {
+    /// Schema version (always 2).
+    pub version: u32,
+    /// Entries keyed by "service/key", with encrypted field blobs.
+    pub entries: BTreeMap<String, EncryptedEntry>,
+}
+
+/// An entry with plaintext metadata and age-encrypted field values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedEntry {
+    /// The key (name) of the secret.
+    pub key: String,
+    /// The service namespace.
+    pub service: String,
+    /// Tags for categorization (plaintext for filtering).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub tags: BTreeSet<String>,
+    /// Field names (plaintext, so list output works without decrypt).
+    pub field_names: Vec<String>,
+    /// Unix timestamp when created.
+    pub created_at: u64,
+    /// Unix timestamp when last modified.
+    pub updated_at: u64,
+    /// Base64-encoded age-encrypted JSON blob of field name→value pairs.
+    pub encrypted_fields: String,
+}
+
+impl VaultFileV2 {
+    /// Current schema version.
+    pub const CURRENT_VERSION: u32 = 2;
+
+    /// Create a new empty v2 vault.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Build a compound key from service and entry key.
+    #[must_use]
+    pub fn compound_key(service: &str, key: &str) -> String {
+        format!("{service}/{key}")
+    }
+
+    /// List summaries for a service (no decryption needed).
+    #[must_use]
+    pub fn summaries(&self, service: &str) -> Vec<SecretSummary> {
+        self.entries
+            .values()
+            .filter(|e| e.service == service)
+            .map(|e| SecretSummary {
+                key: e.key.clone(),
+                service: e.service.clone(),
+                field_names: e.field_names.clone(),
+                tags: e.tags.clone(),
+                updated_at: e.updated_at,
+            })
+            .collect()
+    }
+
+    /// List all service names (no decryption needed).
+    #[must_use]
+    pub fn services(&self) -> Vec<String> {
+        let mut svcs: Vec<String> = self.entries.values().map(|e| e.service.clone()).collect();
+        svcs.sort();
+        svcs.dedup();
+        svcs
+    }
+
+    /// Get an encrypted entry by service/key.
+    #[must_use]
+    pub fn get_encrypted(&self, service: &str, key: &str) -> Option<&EncryptedEntry> {
+        self.entries.get(&Self::compound_key(service, key))
+    }
+
+    /// Insert or update an entry (encrypts field values).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encryption fails.
+    pub fn set(&mut self, entry: &SecretEntry, passphrase: &SecretString) -> Result<(), CoreError> {
+        let ck = Self::compound_key(&entry.service, &entry.key);
+
+        // If entry exists, merge fields then re-encrypt
+        if let Some(existing) = self.entries.get(&ck) {
+            let mut merged = decrypt_entry(existing, passphrase)?;
+            for (name, value) in &entry.fields {
+                merged.fields.insert(name.clone(), value.clone());
+            }
+            merged.tags.extend(entry.tags.iter().cloned());
+            merged.updated_at = now_unix();
+            let encrypted = encrypt_entry(&merged, passphrase)?;
+            self.entries.insert(ck, encrypted);
+        } else {
+            let encrypted = encrypt_entry(entry, passphrase)?;
+            self.entries.insert(ck, encrypted);
+        }
+        Ok(())
+    }
+
+    /// Remove an entry. Returns true if it existed.
+    pub fn remove(&mut self, service: &str, key: &str) -> bool {
+        self.entries
+            .remove(&Self::compound_key(service, key))
+            .is_some()
+    }
+}
+
+impl Default for VaultFileV2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Encrypt a `SecretEntry`'s fields into an `EncryptedEntry`.
+///
+/// # Errors
+///
+/// Returns an error if encryption fails.
+pub fn encrypt_entry(
+    entry: &SecretEntry,
+    passphrase: &SecretString,
+) -> Result<EncryptedEntry, CoreError> {
+    use base64::Engine as _;
+
+    // Serialize fields to JSON (exposing secret values for encryption)
+    let plain_fields: BTreeMap<&str, &str> = entry
+        .fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.expose_secret()))
+        .collect();
+    let json = serde_json::to_string(&plain_fields)
+        .map_err(|e| CoreError::Serialization(format!("serializing entry fields: {e}")))?;
+
+    // Age-encrypt
+    let encryptor = age::Encryptor::with_user_passphrase(passphrase.clone());
+    let mut encrypted = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut encrypted)
+        .map_err(|e| CoreError::Secret(format!("creating entry encryptor: {e}")))?;
+    writer
+        .write_all(json.as_bytes())
+        .map_err(|e| CoreError::Secret(format!("encrypting entry: {e}")))?;
+    writer
+        .finish()
+        .map_err(|e| CoreError::Secret(format!("finalizing entry encryption: {e}")))?;
+
+    Ok(EncryptedEntry {
+        key: entry.key.clone(),
+        service: entry.service.clone(),
+        tags: entry.tags.clone(),
+        field_names: entry.fields.keys().cloned().collect(),
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+        encrypted_fields: base64::engine::general_purpose::STANDARD.encode(&encrypted),
+    })
+}
+
+/// Decrypt an `EncryptedEntry` back into a `SecretEntry`.
+///
+/// # Errors
+///
+/// Returns an error if decryption fails (wrong passphrase or corrupt data).
+pub fn decrypt_entry(
+    entry: &EncryptedEntry,
+    passphrase: &SecretString,
+) -> Result<SecretEntry, CoreError> {
+    use base64::Engine as _;
+
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(&entry.encrypted_fields)
+        .map_err(|e| CoreError::Serialization(format!("invalid base64 in entry: {e}")))?;
+
+    let decryptor = age::Decryptor::new(&encrypted[..])
+        .map_err(|e| CoreError::Secret(format!("reading encrypted entry: {e}")))?;
+
+    let identity = age::scrypt::Identity::new(passphrase.clone());
+
+    let mut decrypted = Vec::new();
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|e| CoreError::Secret(format!("entry decryption failed: {e}")))?;
+    reader
+        .read_to_end(&mut decrypted)
+        .map_err(|e| CoreError::Secret(format!("reading decrypted entry: {e}")))?;
+
+    let plain_fields: BTreeMap<String, String> = serde_json::from_slice(&decrypted)
+        .map_err(|e| CoreError::Serialization(format!("parsing decrypted fields: {e}")))?;
+
+    let fields: BTreeMap<String, SecretString> = plain_fields
+        .into_iter()
+        .map(|(k, v)| (k, SecretString::from(v)))
+        .collect();
+
+    Ok(SecretEntry {
+        key: entry.key.clone(),
+        service: entry.service.clone(),
+        fields,
+        tags: entry.tags.clone(),
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+    })
+}
+
+/// Detect vault format version from raw file bytes.
+///
+/// V1: age binary (starts with `age-encryption.org` header).
+/// V2: JSON (starts with `{`).
+#[must_use]
+pub fn detect_vault_version(data: &[u8]) -> u32 {
+    if data.first() == Some(&b'{') {
+        // JSON — could be v2
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(data) {
+            if let Some(v) = parsed.get("version").and_then(serde_json::Value::as_u64) {
+                return v as u32;
+            }
+        }
+        return 2;
+    }
+    // Binary (age-encrypted) → v1
+    1
+}
+
+/// Migrate a v1 vault (single age blob) to v2 (per-entry encrypted).
+///
+/// # Errors
+///
+/// Returns an error if decryption or re-encryption fails.
+pub fn migrate_v1_to_v2(
+    v1_data: &[u8],
+    passphrase: &SecretString,
+) -> Result<VaultFileV2, CoreError> {
+    let v1 = decrypt_vault(v1_data, passphrase)?;
+    let mut v2 = VaultFileV2::new();
+    for (_ck, entry) in &v1.entries {
+        let encrypted = encrypt_entry(entry, passphrase)?;
+        let ck = VaultFileV2::compound_key(&entry.service, &entry.key);
+        v2.entries.insert(ck, encrypted);
+    }
+    Ok(v2)
+}
+
+// ---------------------------------------------------------------------------
 // Session file management
 // ---------------------------------------------------------------------------
 
@@ -807,7 +1062,7 @@ impl VaultStore {
     /// # Errors
     ///
     /// Returns an error if the file exists and force is false, or on I/O failure.
-    pub fn init(&self, passphrase: &str, force: bool) -> Result<(), CoreError> {
+    pub fn init(&self, _passphrase: &str, force: bool) -> Result<(), CoreError> {
         if self.vault_path.exists() && !force {
             return Err(CoreError::Secret(format!(
                 "vault already exists at {} (use --force to overwrite)",
@@ -819,9 +1074,11 @@ impl VaultStore {
             fs::create_dir_all(parent).map_err(|e| CoreError::Io(e))?;
         }
 
-        let data = VaultData::new();
-        let encrypted = encrypt_vault(&data, &SecretString::from(passphrase.to_string()))?;
-        fs::write(&self.vault_path, &encrypted).map_err(|e| CoreError::Io(e))?;
+        // Create empty v2 vault
+        let v2 = VaultFileV2::new();
+        let json = serde_json::to_string_pretty(&v2)
+            .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
+        fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
 
         // Set vault file permissions to 0600
         #[cfg(unix)]
@@ -848,10 +1105,25 @@ impl VaultStore {
             )));
         }
 
-        // Verify passphrase by attempting to decrypt
-        let encrypted = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
+        let raw = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
         let passphrase = SecretString::from(passphrase.to_string());
-        let _data = decrypt_vault(&encrypted, &passphrase)?;
+
+        // Detect format and auto-migrate v1 → v2
+        let version = detect_vault_version(&raw);
+        if version == 1 {
+            log::info!("migrating vault from v1 to v2 (per-entry encryption)");
+            let v2 = migrate_v1_to_v2(&raw, &passphrase)?;
+            let json = serde_json::to_string_pretty(&v2)
+                .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
+            fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
+        } else {
+            // v2: verify passphrase by decrypting the first entry (if any)
+            let v2: VaultFileV2 = serde_json::from_slice(&raw)
+                .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))?;
+            if let Some(first) = v2.entries.values().next() {
+                let _ = decrypt_entry(first, &passphrase)?;
+            }
+        }
 
         // Create session
         let session = VaultSession::new(passphrase, &self.vault_path, timeout_secs);
@@ -897,21 +1169,21 @@ impl VaultStore {
         Ok(session.passphrase)
     }
 
-    /// Read and decrypt the vault data.
-    fn read_data(&self) -> Result<VaultData, CoreError> {
-        let passphrase = self.require_session()?;
+    /// Read the v2 vault file (JSON parse only, no decryption).
+    fn read_vault_file(&self) -> Result<VaultFileV2, CoreError> {
         if !self.vault_path.exists() {
-            return Ok(VaultData::new());
+            return Ok(VaultFileV2::new());
         }
-        let encrypted = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
-        decrypt_vault(&encrypted, &passphrase)
+        let raw = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
+        serde_json::from_slice(&raw)
+            .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))
     }
 
-    /// Encrypt and write the vault data.
-    fn write_data(&self, data: &VaultData) -> Result<(), CoreError> {
-        let passphrase = self.require_session()?;
-        let encrypted = encrypt_vault(data, &passphrase)?;
-        fs::write(&self.vault_path, &encrypted).map_err(|e| CoreError::Io(e))?;
+    /// Write the v2 vault file.
+    fn write_vault_file(&self, vault: &VaultFileV2) -> Result<(), CoreError> {
+        let json = serde_json::to_string_pretty(vault)
+            .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
+        fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
         Ok(())
     }
 }
@@ -933,44 +1205,44 @@ pub struct VaultStatus {
 
 impl SecretStore for VaultStore {
     fn get(&self, service: &str, key: &str) -> Result<SecretEntry, CoreError> {
-        let data = self.read_data()?;
-        data.get(service, key).cloned().ok_or_else(|| {
+        let passphrase = self.require_session()?;
+        let vault = self.read_vault_file()?;
+        let encrypted = vault.get_encrypted(service, key).ok_or_else(|| {
             CoreError::SecretNotFound(format!("secret '{key}' not found in service '{service}'"))
-        })
+        })?;
+        decrypt_entry(encrypted, &passphrase)
     }
 
     fn set(&self, service: &str, key: &str, entry: &SecretEntry) -> Result<(), CoreError> {
-        let mut data = self.read_data()?;
-        // Ensure the entry has the correct service/key
+        let passphrase = self.require_session()?;
+        let mut vault = self.read_vault_file()?;
         let mut stored = entry.clone();
         stored.service = service.to_string();
         stored.key = key.to_string();
-        data.set(stored);
-        self.write_data(&data)
+        vault.set(&stored, &passphrase)?;
+        self.write_vault_file(&vault)
     }
 
     fn delete(&self, service: &str, key: &str) -> Result<(), CoreError> {
-        let mut data = self.read_data()?;
-        if !data.remove(service, key) {
+        let mut vault = self.read_vault_file()?;
+        if !vault.remove(service, key) {
             return Err(CoreError::SecretNotFound(format!(
                 "secret '{key}' not found in service '{service}'"
             )));
         }
-        self.write_data(&data)
+        self.write_vault_file(&vault)
     }
 
     fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
-        let data = self.read_data()?;
-        Ok(data
-            .list_service(service)
-            .iter()
-            .map(|e| SecretSummary::from(*e))
-            .collect())
+        // No decryption needed — metadata is plaintext in v2
+        let vault = self.read_vault_file()?;
+        Ok(vault.summaries(service))
     }
 
     fn list_services(&self) -> Result<Vec<String>, CoreError> {
-        let data = self.read_data()?;
-        Ok(data.services())
+        // No decryption needed — metadata is plaintext in v2
+        let vault = self.read_vault_file()?;
+        Ok(vault.services())
     }
 }
 
