@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-03-16
+
+### Added
+
+- **`kyz exec`**: Wrap any command with secrets injected as environment variables.
+  - `--alias <name>`: Resolve secrets from a named alias in `config.toml`.
+  - `--secret <service/key>`: Inject all fields of a specific secret.
+  - `--env VAR=service/key:field`: Map a specific field to an env var.
+  - `--tag <tag>`: Inject all secrets matching a tag.
+  - `--pick`: Interactive fzf multi-select picker for secrets.
+  - `--dry-run`: Preview which env vars would be injected.
+  - On Unix, uses `exec()` to replace the process (no parent lingering).
+- **Secret tags**: `SecretEntry` now supports optional tags for categorization.
+  - `kyz set <key> --tag <tag>` (repeatable) assigns tags on creation.
+  - Tags are merged on update and included in list/summary output.
+- **Config aliases** (`[aliases.<name>]` in `config.toml`):
+  - `secrets`: List of explicit `service/key` references.
+  - `tags`: Match secrets by tag (any match is included).
+  - `env_map`: Explicit `{ ENV_VAR = "service/key:field" }` overrides.
+
+### Security
+
+- `SecretEntry` fields now use `secrecy::SecretString` — values are zeroed on drop and cannot be accidentally logged.
+- `VaultSession` no longer stores the raw vault passphrase. Session files contain an HKDF-SHA256 derived key + random salt instead.
+- Custom `Debug` implementations for `SecretEntry` (redacts field values) and `VaultSession` (redacts session key and salt).
+- `kyz-api` bearer token validation uses constant-time comparison (`subtle::ConstantTimeEq`) to prevent timing side-channel attacks. Set `KYZ_API_TOKEN` to enable.
+
+### Changed
+
+- `encrypt_vault()` / `decrypt_vault()` now accept `&SecretString` instead of `&str`.
+- `VaultSession` struct fields changed: `passphrase` → `session_key` + `salt`.
+- `SecretSummary` now includes `tags` field.
+- Config env prefix corrected to `KYZ__` in documentation.
+- Default config path documented as `$XDG_CONFIG_HOME/kyz/config.toml`.
+
+### Dependencies
+
+- Added: `hkdf`, `sha2`, `rand`, `subtle`, `hex`, `zeroize`.
+- `secrecy` now uses the `serde` feature.
+
 ## [0.3.0] - 2026-02-17
 
 ### Security
@@ -32,6 +72,3 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - `hostname` crate dependency for machine-bound session key derivation.
-
-## Unreleased
-
