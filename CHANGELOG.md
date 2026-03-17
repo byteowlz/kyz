@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-03-17
+
+### Fixed
+
+- **`kyz exec` argument parsing**: Added `-c` / `--shell-command` flag to properly handle shell command strings with variable expansion. Previously, `kyz exec "echo $VAR"` would try to exec a program with the entire string as the name. Now use `kyz exec -c 'echo $VAR'` or separate kyz flags from command args with `--`.
+- **`-p` flag positioning**: With `trailing_var_arg`, once a positional argument is encountered, all following args become command args (even `-p`). Now `-p` and other flags must come before the command, or use `-c` for shell evaluation.
+
+### Changed
+
+- `ExecCommand.command` is no longer required; use `-c` or `--` with args.
+
 ## [0.4.0] - 2026-03-16
 
 ### Added

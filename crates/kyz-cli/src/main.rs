@@ -313,8 +313,13 @@ struct ExecCommand {
     #[arg(long = "pick", short = 'p')]
     pick: bool,
 
-    /// Command and arguments to execute.
-    #[arg(trailing_var_arg = true, required = true)]
+    /// Run a shell command string (passed to sh -c). Variables like $VAR
+    /// are expanded by the shell after secrets are injected.
+    #[arg(long = "shell-command", short = 'c', value_name = "CMD", conflicts_with = "command")]
+    shell_command: Option<String>,
+
+    /// Command and arguments to execute (use -- to separate from kyz flags).
+    #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 }
 
@@ -1166,6 +1171,9 @@ fn fzf_pick_secrets(store: &dyn SecretStore) -> Result<Vec<kyz_core::SecretEntry
 }
 
 fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
+    // Resolve the effective command: -c takes priority, then trailing args
+    let (program, args) = resolve_exec_command(&cmd)?;
+
     let store = ctx.secret_store()?;
 
     // Try resolving secrets; if vault is locked, prompt inline
@@ -1186,9 +1194,10 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
 
     if ctx.common.dry_run {
         info!(
-            "dry-run: would inject {} env vars and run: {:?}",
+            "dry-run: would inject {} env vars and run: {} {:?}",
             env.len(),
-            cmd.command
+            program,
+            args
         );
         for (k, _) in &env {
             println!("{k}=***");
@@ -1196,15 +1205,12 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
         return Ok(());
     }
 
-    let program = &cmd.command[0];
-    let args = &cmd.command[1..];
-
     // On Unix, use exec() to replace the process
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        let err = std::process::Command::new(program)
-            .args(args)
+        let err = std::process::Command::new(&program)
+            .args(&args)
             .envs(&env)
             .exec();
         // exec() only returns on error
@@ -1213,11 +1219,32 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
 
     #[cfg(not(unix))]
     {
-        let status = std::process::Command::new(program)
-            .args(args)
+        let status = std::process::Command::new(&program)
+            .args(&args)
             .envs(&env)
             .status()
             .context(format!("failed to run '{program}'"))?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Resolve the program and arguments from the exec command.
+///
+/// Priority:
+/// 1. `-c 'shell command string'` -> runs via `sh -c "..."`
+/// 2. Trailing positional args (`-- cmd arg1 arg2`)
+fn resolve_exec_command(cmd: &ExecCommand) -> Result<(String, Vec<String>)> {
+    if let Some(ref shell_cmd) = cmd.shell_command {
+        // Determine the shell to use ($SHELL or fallback to sh)
+        let shell = env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        Ok((shell, vec!["-c".to_string(), shell_cmd.clone()]))
+    } else if cmd.command.is_empty() {
+        Err(anyhow!(
+            "no command specified; use -c 'command' or -- command [args...]"
+        ))
+    } else {
+        let program = cmd.command[0].clone();
+        let args = cmd.command[1..].to_vec();
+        Ok((program, args))
     }
 }
