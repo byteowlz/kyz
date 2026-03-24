@@ -15,12 +15,15 @@ use axum::{
 };
 use clap::{Args, Parser};
 use log::info;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use kyz_core::{AppConfig, AppPaths, AuthRequestStore, CreateAuthRequest, DenyAuthRequest};
+use kyz_core::{
+    AppConfig, AppPaths, AuthRequestStore, CreateAuthRequest, DenyAuthRequest, SecretStore,
+    VaultStore,
+};
 
 fn main() -> anyhow::Result<()> {
     try_main()
@@ -34,12 +37,16 @@ async fn try_main() -> Result<()> {
     let paths = AppPaths::discover(cli.common.config.as_deref())?;
     let config = AppConfig::load(&paths, false)?;
 
+    let vault_store =
+        VaultStore::resolve(cli.common.vault.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let state = AppState {
         config: Arc::new(config),
         api_token: std::env::var("KYZ_API_TOKEN")
             .ok()
             .filter(|t| !t.is_empty()),
         auth_requests: AuthRequestStore::new(),
+        vault_store: Arc::new(vault_store),
     };
 
     let cors = CorsLayer::new()
@@ -55,6 +62,7 @@ async fn try_main() -> Result<()> {
         .route("/auth/request", get(list_auth_requests))
         .route("/auth/request/{id}", get(get_auth_request))
         .route("/auth/deny/{id}", post(deny_auth_request))
+        .route("/auth/approve/{id}", post(approve_auth_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -85,6 +93,10 @@ struct CommonOpts {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Explicit vault file path (overrides auto-discovery).
+    #[arg(long, value_name = "PATH")]
+    vault: Option<PathBuf>,
+
     /// Port to listen on
     #[arg(short, long, default_value = "3000")]
     port: u16,
@@ -95,6 +107,7 @@ struct AppState {
     config: Arc<AppConfig>,
     api_token: Option<String>,
     auth_requests: AuthRequestStore,
+    vault_store: Arc<VaultStore>,
 }
 
 #[derive(Serialize)]
@@ -234,4 +247,143 @@ async fn deny_auth_request(
     info!("Auth request denied: {}", request.id);
 
     Ok(Json(request))
+}
+
+// ---------------------------------------------------------------------------
+// Auth approval handler
+// ---------------------------------------------------------------------------
+
+/// Request body for approving an auth request.
+#[derive(Debug, Deserialize)]
+struct ApproveAuthBody {
+    /// Vault passphrase (required to decrypt the requested secrets).
+    passphrase: String,
+}
+
+/// Response from a successful approval: the resolved secrets.
+#[derive(Debug, Serialize)]
+struct ApproveAuthResponse {
+    /// The auth request (now approved).
+    request: kyz_core::AuthRequest,
+    /// Resolved secrets keyed by the scope reference that requested them.
+    secrets: std::collections::BTreeMap<String, ResolvedSecret>,
+}
+
+/// A single resolved secret, either a full entry or a specific field.
+#[derive(Debug, Serialize)]
+struct ResolvedSecret {
+    /// The service/key that was resolved.
+    service: String,
+    /// The key name.
+    key: String,
+    /// If a specific field was requested, just that value. Otherwise all fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
+    /// The resolved value(s).
+    values: std::collections::BTreeMap<String, String>,
+}
+
+/// `POST /auth/approve/:id` — approve a request, decrypt and deliver secrets.
+async fn approve_auth_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ApproveAuthBody>,
+) -> Result<Json<ApproveAuthResponse>, StatusCode> {
+    // 1. Look up and validate the request
+    let request = state
+        .auth_requests
+        .get(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if request.status != kyz_core::AuthRequestStatus::Pending {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    // 2. Temporarily unlock vault with the provided passphrase to read secrets
+    let vault = state.vault_store.as_ref();
+    vault.unlock(&body.passphrase, 30).map_err(|e| {
+        log::error!("Vault unlock failed during approval: {e}");
+        StatusCode::UNAUTHORIZED
+    })?;
+
+    // 3. Resolve each requested scope
+    let mut secrets = std::collections::BTreeMap::new();
+    for scope in &request.scopes {
+        match resolve_scope(vault, scope) {
+            Ok(resolved) => {
+                secrets.insert(scope.clone(), resolved);
+            }
+            Err(e) => {
+                log::warn!("Failed to resolve scope '{scope}': {e}");
+                // Lock vault and reject — don't partially deliver
+                let _ = vault.lock();
+                return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            }
+        }
+    }
+
+    // 4. Lock vault immediately after reading
+    let _ = vault.lock();
+
+    // 5. Mark the request as approved
+    let approved = state
+        .auth_requests
+        .approve(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    info!(
+        "Auth request approved: {} — delivered {} secret(s)",
+        approved.id,
+        secrets.len()
+    );
+
+    Ok(Json(ApproveAuthResponse {
+        request: approved,
+        secrets,
+    }))
+}
+
+/// Parse a scope reference like `"service/key"` or `"service/key:field"` and resolve it.
+fn resolve_scope(
+    store: &dyn SecretStore,
+    scope: &str,
+) -> std::result::Result<ResolvedSecret, String> {
+    // Split optional field
+    let (secret_ref, field_name) = if let Some((s, f)) = scope.split_once(':') {
+        (s, Some(f))
+    } else {
+        (scope, None)
+    };
+
+    let (service, key) = secret_ref
+        .split_once('/')
+        .ok_or_else(|| format!("invalid scope '{scope}', expected service/key[:field]"))?;
+
+    let entry = store
+        .get(service, key)
+        .map_err(|e| format!("failed to get '{secret_ref}': {e}"))?;
+
+    let mut values = std::collections::BTreeMap::new();
+
+    if let Some(field) = field_name {
+        let val = entry
+            .field(field)
+            .ok_or_else(|| format!("field '{field}' not found in '{secret_ref}'"))?;
+        values.insert(field.to_string(), val.to_string());
+    } else {
+        for (name, value) in &entry.fields {
+            values.insert(
+                name.clone(),
+                secrecy::ExposeSecret::expose_secret(value).to_string(),
+            );
+        }
+    }
+
+    Ok(ResolvedSecret {
+        service: service.to_string(),
+        key: key.to_string(),
+        field: field_name.map(String::from),
+        values,
+    })
 }
