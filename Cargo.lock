@@ -1620,6 +1620,7 @@ dependencies = [
  "env_logger",
  "kyz-core",
  "log",
+ "secrecy",
  "serde",
  "serde_json",
  "subtle",
