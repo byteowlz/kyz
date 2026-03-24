@@ -63,6 +63,7 @@ async fn try_main() -> Result<()> {
         .route("/auth/request/{id}", get(get_auth_request))
         .route("/auth/deny/{id}", post(deny_auth_request))
         .route("/auth/approve/{id}", post(approve_auth_request))
+        .route("/auth/secrets/{id}", get(pickup_secrets))
         .route("/auth/wait/{id}", get(wait_auth_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -327,7 +328,17 @@ async fn approve_auth_request(
     // 4. Lock vault immediately after reading
     let _ = vault.lock();
 
-    // 5. Mark the request as approved
+    // 5. Stash secrets for agent pickup
+    let mut stash = std::collections::BTreeMap::new();
+    for (scope, resolved) in &secrets {
+        stash.insert(scope.clone(), resolved.values.clone());
+    }
+    state
+        .auth_requests
+        .stash_secrets(&id, stash)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // 6. Mark the request as approved (fires broadcast notification)
     let approved = state
         .auth_requests
         .approve(&id)
@@ -387,6 +398,29 @@ fn resolve_scope(
         field: field_name.map(String::from),
         values,
     })
+}
+
+// ---------------------------------------------------------------------------
+// One-time secret pickup endpoint
+// ---------------------------------------------------------------------------
+
+/// `GET /auth/secrets/:id` — one-time pickup of stashed secrets after approval.
+async fn pickup_secrets(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<
+    Json<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>,
+    StatusCode,
+> {
+    let secrets = state
+        .auth_requests
+        .pickup_secrets(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    info!("Secrets picked up for auth request: {id}");
+
+    Ok(Json(secrets))
 }
 
 // ---------------------------------------------------------------------------

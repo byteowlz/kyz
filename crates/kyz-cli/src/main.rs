@@ -1170,24 +1170,192 @@ fn fzf_pick_secrets(store: &dyn SecretStore) -> Result<Vec<kyz_core::SecretEntry
     Ok(entries)
 }
 
+/// Default kyz-api base URL for headless auth flow.
+const DEFAULT_API_URL: &str = "http://127.0.0.1:3000";
+
+/// Resolve secrets via the remote kyz-api auth flow (headless/no-TTY mode).
+///
+/// 1. Collects the secret scopes needed from alias/tags/secrets
+/// 2. Creates an auth request via POST /auth/request
+/// 3. Waits via WebSocket /auth/wait/:id for approval
+/// 4. On approval, the secrets are delivered in the response
+fn resolve_exec_env_headless(
+    ctx: &RuntimeContext,
+    cmd: &ExecCommand,
+) -> Result<BTreeMap<String, String>> {
+    let api_url = std::env::var("KYZ_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+    let api_token = std::env::var("KYZ_API_TOKEN").ok();
+
+    // 1. Collect scopes from alias/tags/secrets/env_maps
+    let mut scopes: Vec<String> = Vec::new();
+
+    if let Some(ref alias_name) = cmd.alias {
+        let alias = ctx
+            .config
+            .aliases
+            .get(alias_name)
+            .ok_or_else(|| anyhow!("alias '{alias_name}' not found in config"))?;
+        scopes.extend(alias.secrets.clone());
+        // env_map values are field refs like "service/key:field"
+        for field_ref in alias.env_map.values() {
+            scopes.push(field_ref.clone());
+        }
+    }
+    scopes.extend(cmd.secrets.clone());
+    for mapping in &cmd.env_maps {
+        if let Some((_, field_ref)) = mapping.split_once('=') {
+            scopes.push(field_ref.to_string());
+        }
+    }
+
+    if scopes.is_empty() {
+        return Err(anyhow!(
+            "headless mode requires explicit secret scopes (--alias, --secret, or --env)"
+        ));
+    }
+
+    // 2. Create auth request
+    let requester = std::env::var("KYZ_REQUESTER")
+        .unwrap_or_else(|_| format!("kyz-exec-{}", std::process::id()));
+
+    let create_body = serde_json::json!({
+        "requester": requester,
+        "scopes": scopes,
+        "reason": format!("kyz exec headless: {:?}", cmd.command),
+        "ttl_seconds": 300
+    });
+
+    let mut req = ureq::post(&format!("{api_url}/auth/request"));
+    if let Some(ref token) = api_token {
+        req = req.header("Authorization", &format!("Bearer {token}"));
+    }
+
+    let resp: serde_json::Value = req
+        .send_json(&create_body)
+        .context("failed to create auth request")?
+        .body_mut()
+        .read_json()
+        .context("failed to parse auth request response")?;
+
+    let request_id = resp["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing request id in response"))?;
+
+    eprintln!("⏳ Waiting for approval of auth request: {request_id}");
+    eprintln!("   Approve at: {api_url}/auth/approve/{request_id}");
+
+    // 3. Wait via WebSocket
+    let ws_url = format!(
+        "{}/auth/wait/{request_id}",
+        api_url
+            .replace("http://", "ws://")
+            .replace("https://", "wss://")
+    );
+
+    let (mut ws_socket, _) =
+        tungstenite::connect(&ws_url).context("failed to connect WebSocket for auth wait")?;
+
+    let status = loop {
+        let msg = ws_socket.read().context("WebSocket read error")?;
+        match msg {
+            tungstenite::Message::Text(text) => {
+                let event: serde_json::Value =
+                    serde_json::from_str(&text).context("invalid WS message")?;
+                if let Some(s) = event["status"].as_str() {
+                    break s.to_string();
+                }
+            }
+            tungstenite::Message::Close(_) => {
+                return Err(anyhow!("WebSocket closed without status update"));
+            }
+            _ => continue,
+        }
+    };
+
+    if status != "approved" {
+        return Err(anyhow!("auth request {request_id} was {status}"));
+    }
+
+    // 4. Pick up secrets (one-time)
+    let mut pickup_req = ureq::get(&format!("{api_url}/auth/secrets/{request_id}"));
+    if let Some(ref token) = api_token {
+        pickup_req = pickup_req.header("Authorization", &format!("Bearer {token}"));
+    }
+
+    let stashed: BTreeMap<String, BTreeMap<String, String>> = pickup_req
+        .call()
+        .context("failed to pick up secrets")?
+        .body_mut()
+        .read_json()
+        .context("failed to parse secrets response")?;
+
+    eprintln!(
+        "✅ Auth request {request_id} approved — received {} scope(s)",
+        stashed.len()
+    );
+
+    // 5. Flatten into env vars
+    let mut env = BTreeMap::new();
+
+    // Apply alias env_map if present
+    if let Some(ref alias_name) = cmd.alias {
+        if let Some(alias) = ctx.config.aliases.get(alias_name) {
+            for (env_var, field_ref) in &alias.env_map {
+                // Look up field_ref in stashed secrets
+                if let Some(values) = stashed.get(field_ref) {
+                    // field_ref is "service/key:field", values has {field: value}
+                    for v in values.values() {
+                        env.insert(env_var.clone(), v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply explicit --env mappings
+    for mapping in &cmd.env_maps {
+        if let Some((var, field_ref)) = mapping.split_once('=') {
+            if let Some(values) = stashed.get(field_ref) {
+                for v in values.values() {
+                    env.insert(var.to_string(), v.clone());
+                }
+            }
+        }
+    }
+
+    // Default: uppercase field names for any remaining secrets
+    for (_scope, values) in &stashed {
+        for (field_name, field_value) in values {
+            let env_var = field_name.to_uppercase();
+            env.entry(env_var).or_insert_with(|| field_value.clone());
+        }
+    }
+
+    Ok(env)
+}
+
 fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
     // Resolve the effective command: -c takes priority, then trailing args
     let (program, args) = resolve_exec_command(&cmd)?;
 
     let store = ctx.secret_store()?;
 
-    // Try resolving secrets; if vault is locked, prompt inline
+    // Try resolving secrets; if vault is locked, handle interactively or headless
     let env = match resolve_exec_env(store.as_ref(), ctx, &cmd) {
         Ok(env) => env,
         Err(e) if e.to_string().contains("vault is locked") => {
-            // Inline auth: prompt passphrase and create a temporary session
-            let vault_store = ctx.vault_store()?;
-            let passphrase = prompt_passphrase("Vault passphrase: ")?;
-            vault_store
-                .unlock(&passphrase, kyz_core::store::DEFAULT_SESSION_TIMEOUT_SECS)
-                .map_err(|e| anyhow!("{e}"))?;
-            // Retry with the now-unlocked vault
-            resolve_exec_env(store.as_ref(), ctx, &cmd)?
+            if io::stdin().is_terminal() {
+                // Interactive: prompt passphrase inline
+                let vault_store = ctx.vault_store()?;
+                let passphrase = prompt_passphrase("Vault passphrase: ")?;
+                vault_store
+                    .unlock(&passphrase, kyz_core::store::DEFAULT_SESSION_TIMEOUT_SECS)
+                    .map_err(|e| anyhow!("{e}"))?;
+                resolve_exec_env(store.as_ref(), ctx, &cmd)?
+            } else {
+                // Headless: use remote auth flow via kyz-api
+                resolve_exec_env_headless(ctx, &cmd)?
+            }
         }
         Err(e) => return Err(e),
     };
