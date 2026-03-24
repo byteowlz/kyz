@@ -104,10 +104,15 @@ pub struct AuthRequestEvent {
     pub status: AuthRequestStatus,
 }
 
+/// Stashed secrets for one-time pickup by the requesting agent.
+pub type StashedSecrets = BTreeMap<String, BTreeMap<String, String>>;
+
 /// Thread-safe in-memory store for auth requests.
 #[derive(Debug, Clone)]
 pub struct AuthRequestStore {
     requests: Arc<RwLock<BTreeMap<AuthRequestId, AuthRequest>>>,
+    /// One-time secret stash: request_id → { scope → { field → value } }.
+    secret_stash: Arc<RwLock<BTreeMap<AuthRequestId, StashedSecrets>>>,
     /// Broadcast channel for status change notifications.
     notify: Arc<broadcast::Sender<AuthRequestEvent>>,
 }
@@ -119,6 +124,7 @@ impl AuthRequestStore {
         let (tx, _) = broadcast::channel(64);
         Self {
             requests: Arc::new(RwLock::new(BTreeMap::new())),
+            secret_stash: Arc::new(RwLock::new(BTreeMap::new())),
             notify: Arc::new(tx),
         }
     }
@@ -126,6 +132,32 @@ impl AuthRequestStore {
     /// Subscribe to status change events for any request.
     pub fn subscribe(&self) -> broadcast::Receiver<AuthRequestEvent> {
         self.notify.subscribe()
+    }
+
+    /// Stash resolved secrets for one-time pickup by the requesting agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned.
+    pub fn stash_secrets(&self, id: &str, secrets: StashedSecrets) -> Result<(), String> {
+        self.secret_stash
+            .write()
+            .map_err(|e| format!("lock poisoned: {e}"))?
+            .insert(id.to_string(), secrets);
+        Ok(())
+    }
+
+    /// Pick up stashed secrets (one-time: removes from stash).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned.
+    pub fn pickup_secrets(&self, id: &str) -> Result<Option<StashedSecrets>, String> {
+        Ok(self
+            .secret_stash
+            .write()
+            .map_err(|e| format!("lock poisoned: {e}"))?
+            .remove(id))
     }
 
     /// Create a new auth request and return it.

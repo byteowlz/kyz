@@ -10,8 +10,6 @@
 
 ### [trx-mg5q] kyz exec headless mode: detect no-TTY, create auth request, wait for approval, inject secrets (P1, task)
 
-### [trx-34sn] WebSocket wait endpoint: WS /auth/wait/:id for real-time approval notification (P1, task)
-
 ### [trx-7wnq] Remote auth flow for headless agent secret access (P1, epic)
 
 ### [trx-nn87] kyz exec: wrap processes with injected secrets as env vars (P1, epic)
@@ -77,6 +75,7 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ## Closed
 
+- [trx-34sn] WebSocket wait endpoint: WS /auth/wait/:id for real-time approval notification (closed 2026-03-24)
 - [trx-a29x] Auth approval API: POST /auth/approve/:id with passphrase, scoped decrypt, one-time secret delivery (closed 2026-03-24)
 - [trx-h9mf] Auth request API: POST /auth/request, GET /auth/request/:id, POST /auth/deny/:id (closed 2026-03-24)
 - [trx-ee9z] Enforce passphrase strength on vault init/unlock (closed 2026-03-24)
