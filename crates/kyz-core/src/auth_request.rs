@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -94,19 +95,37 @@ pub struct DenyAuthRequest {
 // In-memory store
 // ---------------------------------------------------------------------------
 
+/// Notification sent when an auth request's status changes.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthRequestEvent {
+    /// The request ID.
+    pub id: AuthRequestId,
+    /// New status.
+    pub status: AuthRequestStatus,
+}
+
 /// Thread-safe in-memory store for auth requests.
 #[derive(Debug, Clone)]
 pub struct AuthRequestStore {
     requests: Arc<RwLock<BTreeMap<AuthRequestId, AuthRequest>>>,
+    /// Broadcast channel for status change notifications.
+    notify: Arc<broadcast::Sender<AuthRequestEvent>>,
 }
 
 impl AuthRequestStore {
     /// Create a new empty store.
     #[must_use]
     pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(64);
         Self {
             requests: Arc::new(RwLock::new(BTreeMap::new())),
+            notify: Arc::new(tx),
         }
+    }
+
+    /// Subscribe to status change events for any request.
+    pub fn subscribe(&self) -> broadcast::Receiver<AuthRequestEvent> {
+        self.notify.subscribe()
     }
 
     /// Create a new auth request and return it.
@@ -234,6 +253,12 @@ impl AuthRequestStore {
 
         let result = request.clone();
         drop(store);
+
+        let _ = self.notify.send(AuthRequestEvent {
+            id: result.id.clone(),
+            status: AuthRequestStatus::Denied,
+        });
+
         Ok(result)
     }
 
@@ -270,6 +295,12 @@ impl AuthRequestStore {
 
         let result = request.clone();
         drop(store);
+
+        let _ = self.notify.send(AuthRequestEvent {
+            id: result.id.clone(),
+            status: AuthRequestStatus::Approved,
+        });
+
         Ok(result)
     }
 

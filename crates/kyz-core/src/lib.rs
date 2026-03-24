@@ -19,8 +19,8 @@ pub mod schema;
 pub mod store;
 
 pub use auth_request::{
-    AuthRequest, AuthRequestId, AuthRequestStatus, AuthRequestStore, CreateAuthRequest,
-    DenyAuthRequest,
+    AuthRequest, AuthRequestEvent, AuthRequestId, AuthRequestStatus, AuthRequestStore,
+    CreateAuthRequest, DenyAuthRequest,
 };
 pub use config::{AliasConfig, AppConfig, LogLevel, LoggingConfig, PathsConfig, RuntimeConfig};
 pub use error::{CoreError, Result};
