@@ -1,29 +1,35 @@
 {
   "todos": [
     {
-      "id": "589de6ee",
+      "id": "7863aab1",
       "content": "trx-ee9z: passphrase strength enforcement",
       "status": "completed",
       "priority": "high"
     },
     {
-      "id": "d7df8161",
+      "id": "9964ed2d",
       "content": "trx-h9mf: Auth request API",
       "status": "completed",
       "priority": "high"
     },
     {
-      "id": "17872a4f",
-      "content": "trx-a29x: Auth approval API (POST /auth/approve/:id with passphrase, scoped decrypt, one-time secret delivery)",
+      "id": "7b27a492",
+      "content": "trx-a29x: Auth approval API",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "1dbbefa5",
+      "content": "trx-34sn: WebSocket wait endpoint (WS /auth/wait/:id)",
       "status": "in_progress",
       "priority": "high"
     },
     {
-      "id": "594628c5",
-      "content": "trx-34sn: WebSocket wait endpoint",
+      "id": "ebb47ac4",
+      "content": "trx-mg5q: kyz exec headless mode",
       "status": "pending",
       "priority": "medium"
     }
   ],
-  "updated_at": "2026-03-24T14:37:48.532Z"
+  "updated_at": "2026-03-24T14:40:04.534Z"
 }

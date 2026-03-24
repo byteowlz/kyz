@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
+    extract::{Path, Query, Request, State, WebSocketUpgrade, ws},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::Response,
@@ -63,6 +63,7 @@ async fn try_main() -> Result<()> {
         .route("/auth/request/{id}", get(get_auth_request))
         .route("/auth/deny/{id}", post(deny_auth_request))
         .route("/auth/approve/{id}", post(approve_auth_request))
+        .route("/auth/wait/{id}", get(wait_auth_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -386,4 +387,89 @@ fn resolve_scope(
         field: field_name.map(String::from),
         values,
     })
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket wait endpoint
+// ---------------------------------------------------------------------------
+
+/// `GET /auth/wait/:id` — WebSocket upgrade. Sends a JSON message when the
+/// request is approved, denied, or expires, then closes.
+async fn wait_auth_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, StatusCode> {
+    // Verify the request exists
+    let request = state
+        .auth_requests
+        .get(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // If already resolved, reject upgrade — caller should just GET the request
+    if request.status != kyz_core::AuthRequestStatus::Pending {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let auth_store = state.auth_requests.clone();
+    let request_id = id.clone();
+
+    Ok(upgrade.on_upgrade(move |socket| handle_wait_ws(socket, auth_store, request_id)))
+}
+
+/// Handle the WebSocket connection: subscribe and wait for status change.
+async fn handle_wait_ws(
+    mut socket: ws::WebSocket,
+    auth_store: kyz_core::AuthRequestStore,
+    request_id: String,
+) {
+    let mut rx = auth_store.subscribe();
+
+    // Also check periodically for expiry (every 5 seconds)
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(event) if event.id == request_id => {
+                        let msg = serde_json::json!({
+                            "type": "status_change",
+                            "id": event.id,
+                            "status": event.status,
+                        });
+                        let _ = socket.send(ws::Message::Text(msg.to_string().into())).await;
+                        let _ = socket.send(ws::Message::Close(None)).await;
+                        return;
+                    }
+                    Ok(_) => continue, // different request
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let _ = socket.send(ws::Message::Close(None)).await;
+                        return;
+                    }
+                }
+            }
+            _ = interval.tick() => {
+                // Check for expiry
+                if let Ok(Some(req)) = auth_store.get(&request_id) {
+                    if req.status != kyz_core::AuthRequestStatus::Pending {
+                        let msg = serde_json::json!({
+                            "type": "status_change",
+                            "id": req.id,
+                            "status": req.status,
+                        });
+                        let _ = socket.send(ws::Message::Text(msg.to_string().into())).await;
+                        let _ = socket.send(ws::Message::Close(None)).await;
+                        return;
+                    }
+                } else {
+                    // Request gone
+                    let _ = socket.send(ws::Message::Close(None)).await;
+                    return;
+                }
+            }
+        }
+    }
 }
