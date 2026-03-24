@@ -30,3 +30,4 @@ secrecy.workspace = true
 zeroize.workspace = true
 hostname.workspace = true
 base64.workspace = true
+zxcvbn.workspace = true

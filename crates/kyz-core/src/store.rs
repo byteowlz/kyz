@@ -377,6 +377,12 @@ pub fn decrypt_vault(encrypted: &[u8], passphrase: &SecretString) -> Result<Vaul
 pub struct VaultFileV2 {
     /// Schema version (always 2).
     pub version: u32,
+    /// Whether passphrase strength policy has already been checked for this vault.
+    ///
+    /// New vaults start as `false` and are validated on first unlock.
+    /// Legacy vaults missing this field default to `true` to avoid lockouts.
+    #[serde(default = "default_policy_checked")]
+    pub passphrase_policy_checked: bool,
     /// Entries keyed by "service/key", with encrypted field blobs.
     pub entries: BTreeMap<String, EncryptedEntry>,
 }
@@ -401,6 +407,10 @@ pub struct EncryptedEntry {
     pub encrypted_fields: String,
 }
 
+const fn default_policy_checked() -> bool {
+    true
+}
+
 impl VaultFileV2 {
     /// Current schema version.
     pub const CURRENT_VERSION: u32 = 2;
@@ -410,6 +420,7 @@ impl VaultFileV2 {
     pub fn new() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
+            passphrase_policy_checked: false,
             entries: BTreeMap::new(),
         }
     }
@@ -1062,7 +1073,9 @@ impl VaultStore {
     /// # Errors
     ///
     /// Returns an error if the file exists and force is false, or on I/O failure.
-    pub fn init(&self, _passphrase: &str, force: bool) -> Result<(), CoreError> {
+    pub fn init(&self, passphrase: &str, force: bool) -> Result<(), CoreError> {
+        ensure_passphrase_strength(passphrase)?;
+
         if self.vault_path.exists() && !force {
             return Err(CoreError::Secret(format!(
                 "vault already exists at {} (use --force to overwrite)",
@@ -1106,27 +1119,38 @@ impl VaultStore {
         }
 
         let raw = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
-        let passphrase = SecretString::from(passphrase.to_string());
+        let passphrase_secret = SecretString::from(passphrase.to_string());
 
         // Detect format and auto-migrate v1 → v2
         let version = detect_vault_version(&raw);
         if version == 1 {
             log::info!("migrating vault from v1 to v2 (per-entry encryption)");
-            let v2 = migrate_v1_to_v2(&raw, &passphrase)?;
+            let mut v2 = migrate_v1_to_v2(&raw, &passphrase_secret)?;
+            // Legacy vaults are treated as already policy-checked.
+            v2.passphrase_policy_checked = true;
             let json = serde_json::to_string_pretty(&v2)
                 .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
             fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
         } else {
             // v2: verify passphrase by decrypting the first entry (if any)
-            let v2: VaultFileV2 = serde_json::from_slice(&raw)
+            let mut v2: VaultFileV2 = serde_json::from_slice(&raw)
                 .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))?;
             if let Some(first) = v2.entries.values().next() {
-                let _ = decrypt_entry(first, &passphrase)?;
+                let _ = decrypt_entry(first, &passphrase_secret)?;
+            }
+
+            // First unlock for new vaults: enforce passphrase strength once.
+            if !v2.passphrase_policy_checked {
+                ensure_passphrase_strength(passphrase)?;
+                v2.passphrase_policy_checked = true;
+                let json = serde_json::to_string_pretty(&v2)
+                    .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
+                fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
             }
         }
 
         // Create session
-        let session = VaultSession::new(passphrase, &self.vault_path, timeout_secs);
+        let session = VaultSession::new(passphrase_secret, &self.vault_path, timeout_secs);
         session.save()
     }
 
@@ -1405,6 +1429,48 @@ mod secret_fields_serde {
             .map(|(k, v)| (k, SecretString::from(v)))
             .collect())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Passphrase policy
+// ---------------------------------------------------------------------------
+
+const MIN_PASSPHRASE_LEN: usize = 16;
+const PASS_PHRASE_POLICY_ENV_BYPASS: &str = "KYZ_VAULT_PASSWORD";
+
+fn should_skip_passphrase_policy() -> bool {
+    std::env::var_os(PASS_PHRASE_POLICY_ENV_BYPASS).is_some()
+}
+
+fn passphrase_strength_error_details(passphrase: &str) -> Option<String> {
+    if passphrase.chars().count() >= MIN_PASSPHRASE_LEN {
+        return None;
+    }
+
+    let entropy = zxcvbn::zxcvbn(passphrase, &[]);
+    if entropy.score() >= zxcvbn::Score::Three {
+        None
+    } else {
+        Some(format!(
+            "passphrase too weak: {} chars, zxcvbn score {}",
+            passphrase.chars().count(),
+            u8::from(entropy.score())
+        ))
+    }
+}
+
+fn ensure_passphrase_strength(passphrase: &str) -> Result<(), CoreError> {
+    if should_skip_passphrase_policy() {
+        return Ok(());
+    }
+
+    if let Some(details) = passphrase_strength_error_details(passphrase) {
+        return Err(CoreError::Secret(format!(
+            "Weak vault passphrase rejected ({details}). Use at least {MIN_PASSPHRASE_LEN} characters OR a passphrase with zxcvbn score >= 3. Set {PASS_PHRASE_POLICY_ENV_BYPASS} in CI/automation to bypass this check."
+        )));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
