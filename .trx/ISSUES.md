@@ -8,9 +8,6 @@
 
 ### [trx-8dbe] OAuth architecture: add kyz-oauth first, migrate eavs later (P1, epic)
 
-### [trx-ee9z] Enforce passphrase strength on vault init/unlock (P1, task)
-Before shipping git sync, kyz must reject weak passphrases that would be vulnerable to offline brute-force if the encrypted vault file is exposed.\n\nRequirements:\n- Minimum 16 characters or zxcvbn score >= 3\n- Enforce at: vault init, unlock (first time), passphrase rotation\n- Skip check when KYZ_VAULT_PASSWORD env var is set (CI/automation)\n- Clear error message explaining why and what's needed\n\nBlocks: trx-3b5m (kyz sync)
-
 ### [trx-mg5q] kyz exec headless mode: detect no-TTY, create auth request, wait for approval, inject secrets (P1, task)
 
 ### [trx-34sn] WebSocket wait endpoint: WS /auth/wait/:id for real-time approval notification (P1, task)
@@ -84,6 +81,7 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ## Closed
 
+- [trx-ee9z] Enforce passphrase strength on vault init/unlock (closed 2026-03-24)
 - [trx-dg9r] Scoped vault decryption: decrypt vault, filter entries by policy (secrets/tags/services), zero unmatched entries (closed 2026-03-16)
 - [trx-p0q1] kyz exec inline auth: detect TTY, prompt passphrase/Touch ID directly, no persistent session needed (closed 2026-03-16)
 - [trx-ne0b] Add fzf-based interactive secret picker with multi-select for kyz exec (closed 2026-03-16)
