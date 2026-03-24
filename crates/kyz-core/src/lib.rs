@@ -11,12 +11,17 @@
 //! - Vault session management (unlock/lock lifecycle)
 //! - Common types and error handling
 
+pub mod auth_request;
 pub mod config;
 pub mod error;
 pub mod paths;
 pub mod schema;
 pub mod store;
 
+pub use auth_request::{
+    AuthRequest, AuthRequestId, AuthRequestStatus, AuthRequestStore, CreateAuthRequest,
+    DenyAuthRequest,
+};
 pub use config::{AliasConfig, AppConfig, LogLevel, LoggingConfig, PathsConfig, RuntimeConfig};
 pub use error::{CoreError, Result};
 pub use paths::{AppPaths, default_cache_dir};
