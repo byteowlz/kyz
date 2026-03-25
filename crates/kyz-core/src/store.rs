@@ -1194,20 +1194,24 @@ impl VaultStore {
     }
 
     /// Read the v2 vault file (JSON parse only, no decryption).
+    /// Acquires a shared (read) flock for safe concurrent access.
     fn read_vault_file(&self) -> Result<VaultFileV2, CoreError> {
         if !self.vault_path.exists() {
             return Ok(VaultFileV2::new());
         }
-        let raw = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
         serde_json::from_slice(&raw)
             .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))
     }
 
     /// Write the v2 vault file.
+    /// Acquires an exclusive (write) flock to prevent concurrent corruption.
     fn write_vault_file(&self, vault: &VaultFileV2) -> Result<(), CoreError> {
+        let _lock = VaultFileLock::exclusive(&self.vault_path)?;
         let json = serde_json::to_string_pretty(vault)
             .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
-        fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
+        fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
         Ok(())
     }
 }
@@ -1428,6 +1432,66 @@ mod secret_fields_serde {
             .into_iter()
             .map(|(k, v)| (k, SecretString::from(v)))
             .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File locking
+// ---------------------------------------------------------------------------
+
+/// Advisory file lock for vault operations.
+///
+/// Uses platform-native locking: `flock` on Unix, `LockFileEx` on Windows.
+/// The lock is released when the guard is dropped.
+struct VaultFileLock {
+    _file: fs::File,
+}
+
+impl VaultFileLock {
+    /// Acquire a shared (read) lock. Multiple readers can hold this simultaneously.
+    fn shared(vault_path: &Path) -> Result<Self, CoreError> {
+        let lock_path = vault_path.with_extension("json.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| CoreError::Io(e))?;
+
+        Self::flock_shared(&file, &lock_path)?;
+        Ok(Self { _file: file })
+    }
+
+    /// Acquire an exclusive (write) lock. Only one writer at a time.
+    fn exclusive(vault_path: &Path) -> Result<Self, CoreError> {
+        let lock_path = vault_path.with_extension("json.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| CoreError::Io(e))?;
+
+        Self::flock_exclusive(&file, &lock_path)?;
+        Ok(Self { _file: file })
+    }
+
+    fn flock_shared(file: &fs::File, lock_path: &Path) -> Result<(), CoreError> {
+        fs2::FileExt::lock_shared(file).map_err(|e| {
+            CoreError::Secret(format!(
+                "failed to acquire shared lock on {}: {e}",
+                lock_path.display()
+            ))
+        })
+    }
+
+    fn flock_exclusive(file: &fs::File, lock_path: &Path) -> Result<(), CoreError> {
+        fs2::FileExt::lock_exclusive(file).map_err(|e| {
+            CoreError::Secret(format!(
+                "failed to acquire exclusive lock on {}: {e}",
+                lock_path.display()
+            ))
+        })
     }
 }
 
