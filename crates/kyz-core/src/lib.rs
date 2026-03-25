@@ -15,6 +15,7 @@ pub mod auth_request;
 pub mod config;
 pub mod error;
 pub mod paths;
+pub mod policy;
 pub mod schema;
 pub mod store;
 
@@ -25,6 +26,7 @@ pub use auth_request::{
 pub use config::{AliasConfig, AppConfig, LogLevel, LoggingConfig, PathsConfig, RuntimeConfig};
 pub use error::{CoreError, Result};
 pub use paths::{AppPaths, default_cache_dir};
+pub use policy::{Policy, PolicyViolation, default_policy, resolve_policy};
 pub use schema::{generate_example_config, generate_schema, write_generated_files};
 pub use store::{
     EncryptedEntry, KeyringStore, SecretEntry, SecretStore, SecretSummary, VaultData, VaultFileV2,

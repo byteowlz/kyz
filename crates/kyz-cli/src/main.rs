@@ -296,6 +296,14 @@ enum ConfigCommand {
 
 #[derive(Debug, Clone, Args)]
 struct ExecCommand {
+    /// Path to a policy file (overrides auto-discovery).
+    #[arg(long, value_name = "PATH")]
+    policy: Option<PathBuf>,
+
+    /// Disable all policy checks (use with caution).
+    #[arg(long)]
+    no_policy: bool,
+
     /// Named alias from config.toml [aliases.<name>].
     #[arg(long, short = 'a', value_name = "ALIAS")]
     alias: Option<String>,
@@ -325,6 +333,14 @@ struct ExecCommand {
 
 #[derive(Debug, Clone, Args)]
 struct PipeCommand {
+    /// Path to a policy file (overrides auto-discovery).
+    #[arg(long, value_name = "PATH")]
+    policy: Option<PathBuf>,
+
+    /// Disable all policy checks (use with caution).
+    #[arg(long)]
+    no_policy: bool,
+
     /// Secret reference: service/key or service/key:field.
     #[arg(value_name = "SERVICE/KEY[:FIELD]")]
     secret: String,
@@ -1387,6 +1403,15 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
     let program = &cmd.command[0];
     let args = &cmd.command[1..];
 
+    // Enforce command policy
+    let pol = kyz_core::resolve_policy(cmd.policy.as_deref(), cmd.no_policy)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let args_owned: Vec<String> = args.to_vec();
+    let secret_names: Vec<String> = cmd.secrets.clone();
+    pol.check_all(program, &args_owned, &secret_names)
+        .map_err(|v| anyhow!("{v}"))?;
+
     let clean_env = scrubbed_env();
 
     // On Unix, use exec() to replace the process
@@ -1478,6 +1503,16 @@ fn handle_pipe(ctx: &RuntimeContext, cmd: PipeCommand) -> Result<()> {
 
     let program = &cmd.command[0];
     let args = &cmd.command[1..];
+
+    // Enforce command policy
+    let pol = kyz_core::resolve_policy(cmd.policy.as_deref(), cmd.no_policy)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let args_owned: Vec<String> = args.to_vec();
+    pol.check_secret_command(&cmd.secret, program)
+        .map_err(|v| anyhow!("{v}"))?;
+    pol.check_args(program, &args_owned)
+        .map_err(|v| anyhow!("{v}"))?;
 
     let clean_env = scrubbed_env();
 
