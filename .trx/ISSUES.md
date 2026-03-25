@@ -6,8 +6,6 @@
 
 ### [trx-q53x.3] kyz wrap: bootstrap agent session with pre-approved secrets + policy (P1, task)
 
-### [trx-q53x.2] Command policy engine: deny dangerous commands, per-secret allowlists, .kyz-policy.json (P1, task)
-
 ### [trx-q53x] Agent-safe secret injection: pipe, wrap, policy, audit, scrub, flock (P1, epic)
 
 ### [trx-8dbe.2] Implement generic TOML-driven provider model in kyz-oauth (P1, task)
@@ -83,6 +81,7 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ## Closed
 
+- [trx-q53x.2] Command policy engine: deny dangerous commands, per-secret allowlists, .kyz-policy.json (closed 2026-03-25)
 - [trx-q53x.5] Env scrubbing: strip KYZ_VAULT_PASSWORD and KYZ_* sensitive vars from child processes (closed 2026-03-25)
 - [trx-q53x.6] File locking: flock on vault reads/writes to prevent concurrent corruption (closed 2026-03-25)
 - [trx-q53x.1] kyz pipe: inject secret into command stdin (never touches env/args) (closed 2026-03-25)

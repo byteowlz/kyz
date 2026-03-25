@@ -32,3 +32,4 @@ keyring.workspace = true
 secrecy.workspace = true
 ureq.workspace = true
 tungstenite.workspace = true
+tempfile.workspace = true
