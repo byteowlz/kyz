@@ -26,8 +26,6 @@ Basic secret CRUD using OS keyring (gnome-keyring, macOS Keychain, Windows Crede
 ### [trx-092h] Cross-platform secrets manager CLI with P2P sync (P1, epic)
 Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption for portable vaults, iroh/libp2p for serverless P2P sync between devices.
 
-### [trx-q53x.5] Env scrubbing: strip KYZ_VAULT_PASSWORD and KYZ_* sensitive vars from child processes (P2, task)
-
 ### [trx-q53x.4] Audit logging: structured stderr log for all secret access (exec/pipe/wrap) (P2, task)
 
 ### [trx-8dbe.5] Design agent-scoped OAuth alias/capability model for surgical token access (P2, feature)
@@ -85,6 +83,7 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 
 ## Closed
 
+- [trx-q53x.5] Env scrubbing: strip KYZ_VAULT_PASSWORD and KYZ_* sensitive vars from child processes (closed 2026-03-25)
 - [trx-q53x.6] File locking: flock on vault reads/writes to prevent concurrent corruption (closed 2026-03-25)
 - [trx-q53x.1] kyz pipe: inject secret into command stdin (never touches env/args) (closed 2026-03-25)
 - [trx-mg5q] kyz exec headless mode: detect no-TTY, create auth request, wait for approval, inject secrets (closed 2026-03-24)
