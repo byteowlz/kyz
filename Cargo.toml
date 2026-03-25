@@ -57,6 +57,8 @@ getrandom = "0.3"
 ureq = { version = "3.0", features = ["json"] }
 tungstenite = "0.26"
 hostname = "0.4"
+tempfile = "3.16"
+humantime = "2.2"
 zxcvbn = "3.1"
 
 # TUI

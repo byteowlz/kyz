@@ -45,6 +45,7 @@ fn try_main() -> Result<()> {
         Command::Config { command } => handle_config(&ctx, command),
         Command::Exec(cmd) => handle_exec(&ctx, cmd),
         Command::Pipe(cmd) => handle_pipe(&ctx, cmd),
+        Command::Wrap(cmd) => handle_wrap(&ctx, cmd),
         Command::Completions { shell } => {
             handle_completions(shell);
             Ok(())
@@ -167,6 +168,8 @@ enum Command {
     Exec(ExecCommand),
     /// Pipe a secret into a command's stdin (never touches env or args).
     Pipe(PipeCommand),
+    /// Wrap an agent with pre-approved secret access and policy enforcement.
+    Wrap(WrapCommand),
     /// Generate shell completions.
     Completions {
         /// Target shell.
@@ -355,6 +358,23 @@ struct PipeCommand {
     newline: bool,
 
     /// Command and arguments to execute.
+    #[arg(trailing_var_arg = true, required = true)]
+    command: Vec<String>,
+}
+
+// -- Wrap command -------------------------------------------------------------
+
+#[derive(Debug, Clone, Args)]
+struct WrapCommand {
+    /// Secret names to pre-approve (comma-separated, or '*' for all).
+    #[arg(long, value_delimiter = ',', required = true)]
+    allow: Vec<String>,
+
+    /// Enforce no-read mode: block kyz get inside the wrapped session.
+    #[arg(long, default_value_t = true)]
+    no_read: bool,
+
+    /// Command and arguments to execute in the wrapped session.
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
 }
@@ -678,6 +698,19 @@ fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
 }
 
 fn handle_get(ctx: &RuntimeContext, cmd: GetCommand) -> Result<()> {
+    // No-read mode: block secret retrieval in wrapped agent sessions
+    if std::env::var("KYZ_NO_READ").is_ok() {
+        kyz_core::audit::audit(
+            "get_blocked",
+            Some(&format!("{}/{}", cmd.service, cmd.key)),
+            None,
+            Some("no-read mode active"),
+        );
+        return Err(anyhow!(
+            "secret retrieval blocked: running in no-read mode (KYZ_NO_READ is set). Use kyz exec or kyz pipe to inject secrets into commands."
+        ));
+    }
+
     let store = ctx.secret_store()?;
     let entry = store
         .get(&cmd.service, &cmd.key)
@@ -795,6 +828,12 @@ fn handle_list(ctx: &RuntimeContext, cmd: ListCommand) -> Result<()> {
 }
 
 fn handle_export(ctx: &RuntimeContext, cmd: ExportCommand) -> Result<()> {
+    if std::env::var("KYZ_NO_READ").is_ok() {
+        return Err(anyhow!(
+            "export blocked: running in no-read mode (KYZ_NO_READ is set)"
+        ));
+    }
+
     let store = ctx.secret_store()?;
 
     let services = if let Some(ref svc) = cmd.service {
@@ -1414,8 +1453,12 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
         .map_err(|e| anyhow!("{e}"))?;
 
     let secret_names: Vec<String> = cmd.secrets.clone();
-    pol.check_all(&program, &args, &secret_names)
-        .map_err(|v| anyhow!("{v}"))?;
+    if let Err(v) = pol.check_all(&program, &args, &secret_names) {
+        kyz_core::audit::audit_policy_violation(&program, &v.to_string());
+        return Err(anyhow!("{v}"));
+    }
+
+    kyz_core::audit::audit_exec(&secret_names, &program);
 
     let clean_env = scrubbed_env();
 
@@ -1535,10 +1578,16 @@ fn handle_pipe(ctx: &RuntimeContext, cmd: PipeCommand) -> Result<()> {
         .map_err(|e| anyhow!("{e}"))?;
 
     let args_owned: Vec<String> = args.to_vec();
-    pol.check_secret_command(&cmd.secret, program)
-        .map_err(|v| anyhow!("{v}"))?;
-    pol.check_args(program, &args_owned)
-        .map_err(|v| anyhow!("{v}"))?;
+    if let Err(v) = pol.check_secret_command(&cmd.secret, program) {
+        kyz_core::audit::audit_policy_violation(program, &v.to_string());
+        return Err(anyhow!("{v}"));
+    }
+    if let Err(v) = pol.check_args(program, &args_owned) {
+        kyz_core::audit::audit_policy_violation(program, &v.to_string());
+        return Err(anyhow!("{v}"));
+    }
+
+    kyz_core::audit::audit_pipe(&cmd.secret, program);
 
     let clean_env = scrubbed_env();
 
@@ -1566,4 +1615,116 @@ fn handle_pipe(ctx: &RuntimeContext, cmd: PipeCommand) -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+fn handle_wrap(ctx: &RuntimeContext, cmd: WrapCommand) -> Result<()> {
+    let store = ctx.secret_store()?;
+    let allow_all = cmd.allow.len() == 1 && cmd.allow[0] == "*";
+
+    // Verify requested secrets exist
+    if !allow_all {
+        for name in &cmd.allow {
+            // Parse as service/key
+            let (service, key) = name.split_once('/').ok_or_else(|| {
+                anyhow!("invalid secret reference '{name}', expected service/key")
+            })?;
+            store.get(service, key).map_err(|e| anyhow!("{e}"))?;
+        }
+    }
+
+    // Get or prompt for passphrase
+    let vault_store = ctx.vault_store()?;
+    let passphrase = if io::stdin().is_terminal() {
+        prompt_passphrase("Vault passphrase: ")?
+    } else {
+        std::env::var("KYZ_VAULT_PASSWORD")
+            .map_err(|_| anyhow!("no TTY and KYZ_VAULT_PASSWORD not set"))?
+    };
+
+    // Ensure vault is unlocked
+    let _ = vault_store
+        .unlock(&passphrase, kyz_core::store::DEFAULT_SESSION_TIMEOUT_SECS)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    if ctx.common.dry_run {
+        info!(
+            "dry-run: would wrap {:?} with access to {} secret(s)",
+            cmd.command,
+            if allow_all {
+                "all".to_string()
+            } else {
+                cmd.allow.len().to_string()
+            }
+        );
+        return Ok(());
+    }
+
+    kyz_core::audit::audit_wrap(&cmd.allow, &cmd.command[0]);
+
+    // Build child environment
+    let mut child_env: Vec<(String, String)> = scrubbed_env();
+
+    // Set vault path + passphrase for the wrapped session
+    child_env.push(("KYZ_VAULT_PASSWORD".to_string(), passphrase));
+
+    // Signal no-read mode to kyz inside the wrapped session
+    if cmd.no_read {
+        child_env.push(("KYZ_NO_READ".to_string(), "1".to_string()));
+    }
+
+    // Create a temporary policy file scoping to allowed secrets
+    let temp_policy = if !allow_all {
+        let policy = build_wrap_policy(&cmd.allow);
+        let tmp = tempfile::NamedTempFile::new().context("creating temp policy file")?;
+        std::fs::write(tmp.path(), &policy).context("writing temp policy")?;
+        child_env.push(("KYZ_POLICY".to_string(), tmp.path().display().to_string()));
+        Some(tmp)
+    } else {
+        None
+    };
+
+    eprintln!(
+        "[kyz] wrapping {:?} with access to {} secret(s)",
+        cmd.command[0],
+        if allow_all {
+            "all".to_string()
+        } else {
+            cmd.allow.len().to_string()
+        }
+    );
+
+    let program = &cmd.command[0];
+    let args = &cmd.command[1..];
+
+    let status = std::process::Command::new(program)
+        .args(args)
+        .env_clear()
+        .envs(child_env.iter().map(|(k, v)| (k, v)))
+        .status()
+        .context(format!("failed to run '{program}'"))?;
+
+    // Clean up temp policy
+    drop(temp_policy);
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Build a JSON policy for a wrapped session.
+fn build_wrap_policy(allowed_secrets: &[String]) -> String {
+    let policy = kyz_core::default_policy();
+    let mut json = serde_json::to_value(&policy).unwrap_or_default();
+
+    // Add per-secret rules (no command restriction — just documenting which secrets exist)
+    if let Some(obj) = json.as_object_mut() {
+        let mut secrets = serde_json::Map::new();
+        for name in allowed_secrets {
+            secrets.insert(name.clone(), serde_json::json!({}));
+        }
+        obj.insert("secrets".to_string(), serde_json::Value::Object(secrets));
+    }
+
+    serde_json::to_string_pretty(&json).unwrap_or_default()
 }

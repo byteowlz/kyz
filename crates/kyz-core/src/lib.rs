@@ -11,6 +11,7 @@
 //! - Vault session management (unlock/lock lifecycle)
 //! - Common types and error handling
 
+pub mod audit;
 pub mod auth_request;
 pub mod config;
 pub mod error;
