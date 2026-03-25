@@ -44,6 +44,7 @@ fn try_main() -> Result<()> {
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
         Command::Exec(cmd) => handle_exec(&ctx, cmd),
+        Command::Pipe(cmd) => handle_pipe(&ctx, cmd),
         Command::Completions { shell } => {
             handle_completions(shell);
             Ok(())
@@ -164,6 +165,8 @@ enum Command {
     },
     /// Wrap a command with secrets injected as environment variables.
     Exec(ExecCommand),
+    /// Pipe a secret into a command's stdin (never touches env or args).
+    Pipe(PipeCommand),
     /// Generate shell completions.
     Completions {
         /// Target shell.
@@ -312,6 +315,23 @@ struct ExecCommand {
     /// Interactive fzf picker for secret selection.
     #[arg(long = "pick", short = 'p')]
     pick: bool,
+
+    /// Command and arguments to execute.
+    #[arg(trailing_var_arg = true, required = true)]
+    command: Vec<String>,
+}
+
+// -- Pipe command -------------------------------------------------------------
+
+#[derive(Debug, Clone, Args)]
+struct PipeCommand {
+    /// Secret reference: service/key or service/key:field.
+    #[arg(value_name = "SERVICE/KEY[:FIELD]")]
+    secret: String,
+
+    /// Append a trailing newline to the piped value.
+    #[arg(long)]
+    newline: bool,
 
     /// Command and arguments to execute.
     #[arg(trailing_var_arg = true, required = true)]
@@ -1388,4 +1408,76 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
             .context(format!("failed to run '{program}'"))?;
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+fn handle_pipe(ctx: &RuntimeContext, cmd: PipeCommand) -> Result<()> {
+    let store = ctx.secret_store()?;
+
+    // Parse secret reference: "service/key" or "service/key:field"
+    let (secret_ref, field_name) = if let Some((s, f)) = cmd.secret.split_once(':') {
+        (s, Some(f))
+    } else {
+        (cmd.secret.as_str(), None)
+    };
+
+    let (service, key) = secret_ref.split_once('/').ok_or_else(|| {
+        anyhow!(
+            "invalid secret reference '{}', expected service/key[:field]",
+            cmd.secret
+        )
+    })?;
+
+    let entry = store.get(service, key).map_err(|e| anyhow!("{e}"))?;
+
+    let value = if let Some(field) = field_name {
+        entry
+            .field(field)
+            .ok_or_else(|| anyhow!("field '{field}' not found in '{secret_ref}'"))?
+            .to_string()
+    } else {
+        // Single-value entries: use "value" field. Multi-field: error.
+        entry
+            .value()
+            .map(String::from)
+            .ok_or_else(|| {
+                anyhow!(
+                    "secret '{secret_ref}' has multiple fields ({}). Specify a field with service/key:field",
+                    entry.fields.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })?
+    };
+
+    if ctx.common.dry_run {
+        info!(
+            "dry-run: would pipe secret '{}' into {:?}",
+            cmd.secret, cmd.command
+        );
+        return Ok(());
+    }
+
+    let program = &cmd.command[0];
+    let args = &cmd.command[1..];
+
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context(format!("failed to start '{program}'"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        stdin
+            .write_all(value.as_bytes())
+            .context("failed to write secret to stdin")?;
+        if cmd.newline {
+            stdin.write_all(b"\n").context("failed to write newline")?;
+        }
+        // stdin is dropped here, closing the pipe
+    }
+
+    let status = child.wait().context("failed to wait for child process")?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }

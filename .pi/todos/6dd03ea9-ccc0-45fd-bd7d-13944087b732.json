@@ -1,41 +1,47 @@
 {
   "todos": [
     {
-      "id": "eab85738",
-      "content": "trx-ee9z: passphrase strength enforcement",
-      "status": "completed",
-      "priority": "high"
-    },
-    {
-      "id": "3a7dc75c",
-      "content": "trx-h9mf: Auth request API",
-      "status": "completed",
-      "priority": "high"
-    },
-    {
-      "id": "74b7d0f3",
-      "content": "trx-a29x: Auth approval API",
-      "status": "completed",
-      "priority": "high"
-    },
-    {
-      "id": "d4588e0e",
-      "content": "trx-34sn: WebSocket wait endpoint",
-      "status": "completed",
-      "priority": "high"
-    },
-    {
-      "id": "e38bfa0a",
-      "content": "trx-mg5q: kyz exec headless mode",
+      "id": "07d9108f",
+      "content": "trx-q53x.1: kyz pipe (stdin injection)",
       "status": "in_progress",
       "priority": "high"
     },
     {
-      "id": "3aa5a127",
-      "content": "trx-gber: Auth request expiry and cleanup",
+      "id": "30e34b57",
+      "content": "trx-q53x.6: file locking (flock)",
+      "status": "in_progress",
+      "priority": "high"
+    },
+    {
+      "id": "31821ab2",
+      "content": "trx-q53x.2: command policy engine",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "id": "d0c22816",
+      "content": "trx-q53x.5: env scrubbing",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "id": "32df6dd5",
+      "content": "trx-q53x.3: kyz wrap",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "id": "e2500cec",
+      "content": "trx-q53x.7: no-read policy mode",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "id": "b601084c",
+      "content": "trx-q53x.4: audit logging",
       "status": "pending",
       "priority": "medium"
     }
   ],
-  "updated_at": "2026-03-24T14:42:15.974Z"
+  "updated_at": "2026-03-24T15:19:32.155Z"
 }
