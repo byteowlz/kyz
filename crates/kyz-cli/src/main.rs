@@ -1387,12 +1387,16 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
     let program = &cmd.command[0];
     let args = &cmd.command[1..];
 
+    let clean_env = scrubbed_env();
+
     // On Unix, use exec() to replace the process
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         let err = std::process::Command::new(program)
             .args(args)
+            .env_clear()
+            .envs(clean_env.iter().map(|(k, v)| (k, v)))
             .envs(&env)
             .exec();
         // exec() only returns on error
@@ -1403,11 +1407,28 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
     {
         let status = std::process::Command::new(program)
             .args(args)
+            .env_clear()
+            .envs(clean_env.iter().map(|(k, v)| (k, v)))
             .envs(&env)
             .status()
             .context(format!("failed to run '{program}'"))?;
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+/// Sensitive env var prefixes/names to strip from child processes.
+const SCRUB_ENV_VARS: &[&str] = &["KYZ_VAULT_PASSWORD", "KYZ_API_TOKEN", "KYZ_PASSPHRASE"];
+
+const SCRUB_ENV_PREFIXES: &[&str] = &["KYZ_VAULT_PASS", "KYZ_SESSION_"];
+
+/// Build a scrubbed copy of the current environment, removing sensitive kyz vars.
+fn scrubbed_env() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(key, _)| {
+            !SCRUB_ENV_VARS.iter().any(|s| key == *s)
+                && !SCRUB_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
+        })
+        .collect()
 }
 
 fn handle_pipe(ctx: &RuntimeContext, cmd: PipeCommand) -> Result<()> {
@@ -1458,8 +1479,12 @@ fn handle_pipe(ctx: &RuntimeContext, cmd: PipeCommand) -> Result<()> {
     let program = &cmd.command[0];
     let args = &cmd.command[1..];
 
+    let clean_env = scrubbed_env();
+
     let mut child = std::process::Command::new(program)
         .args(args)
+        .env_clear()
+        .envs(clean_env.iter().map(|(k, v)| (k, v)))
         .stdin(std::process::Stdio::piped())
         .spawn()
         .context(format!("failed to start '{program}'"))?;
