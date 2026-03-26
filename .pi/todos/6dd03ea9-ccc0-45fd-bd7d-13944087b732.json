@@ -1,0 +1,23 @@
+{
+  "todos": [
+    {
+      "id": "7721dbf0",
+      "content": "Add high-value kyz-core tests (crypto roundtrip, vault CRUD, merge behavior, passphrase policy)",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "51b2401f",
+      "content": "Run formatting and kyz-core tests",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "52a721b2",
+      "content": "Share test summary and next suggested tests",
+      "status": "completed",
+      "priority": "medium"
+    }
+  ],
+  "updated_at": "2026-03-26T15:36:10.928Z"
+}

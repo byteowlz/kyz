@@ -377,6 +377,12 @@ pub fn decrypt_vault(encrypted: &[u8], passphrase: &SecretString) -> Result<Vaul
 pub struct VaultFileV2 {
     /// Schema version (always 2).
     pub version: u32,
+    /// Whether passphrase strength policy has already been checked for this vault.
+    ///
+    /// New vaults start as `false` and are validated on first unlock.
+    /// Legacy vaults missing this field default to `true` to avoid lockouts.
+    #[serde(default = "default_policy_checked")]
+    pub passphrase_policy_checked: bool,
     /// Entries keyed by "service/key", with encrypted field blobs.
     pub entries: BTreeMap<String, EncryptedEntry>,
 }
@@ -401,6 +407,10 @@ pub struct EncryptedEntry {
     pub encrypted_fields: String,
 }
 
+const fn default_policy_checked() -> bool {
+    true
+}
+
 impl VaultFileV2 {
     /// Current schema version.
     pub const CURRENT_VERSION: u32 = 2;
@@ -410,6 +420,7 @@ impl VaultFileV2 {
     pub fn new() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
+            passphrase_policy_checked: false,
             entries: BTreeMap::new(),
         }
     }
@@ -1062,7 +1073,9 @@ impl VaultStore {
     /// # Errors
     ///
     /// Returns an error if the file exists and force is false, or on I/O failure.
-    pub fn init(&self, _passphrase: &str, force: bool) -> Result<(), CoreError> {
+    pub fn init(&self, passphrase: &str, force: bool) -> Result<(), CoreError> {
+        ensure_passphrase_strength(passphrase)?;
+
         if self.vault_path.exists() && !force {
             return Err(CoreError::Secret(format!(
                 "vault already exists at {} (use --force to overwrite)",
@@ -1106,27 +1119,38 @@ impl VaultStore {
         }
 
         let raw = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
-        let passphrase = SecretString::from(passphrase.to_string());
+        let passphrase_secret = SecretString::from(passphrase.to_string());
 
         // Detect format and auto-migrate v1 → v2
         let version = detect_vault_version(&raw);
         if version == 1 {
             log::info!("migrating vault from v1 to v2 (per-entry encryption)");
-            let v2 = migrate_v1_to_v2(&raw, &passphrase)?;
+            let mut v2 = migrate_v1_to_v2(&raw, &passphrase_secret)?;
+            // Legacy vaults are treated as already policy-checked.
+            v2.passphrase_policy_checked = true;
             let json = serde_json::to_string_pretty(&v2)
                 .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
             fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
         } else {
             // v2: verify passphrase by decrypting the first entry (if any)
-            let v2: VaultFileV2 = serde_json::from_slice(&raw)
+            let mut v2: VaultFileV2 = serde_json::from_slice(&raw)
                 .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))?;
             if let Some(first) = v2.entries.values().next() {
-                let _ = decrypt_entry(first, &passphrase)?;
+                let _ = decrypt_entry(first, &passphrase_secret)?;
+            }
+
+            // First unlock for new vaults: enforce passphrase strength once.
+            if !v2.passphrase_policy_checked {
+                ensure_passphrase_strength(passphrase)?;
+                v2.passphrase_policy_checked = true;
+                let json = serde_json::to_string_pretty(&v2)
+                    .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
+                fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
             }
         }
 
         // Create session
-        let session = VaultSession::new(passphrase, &self.vault_path, timeout_secs);
+        let session = VaultSession::new(passphrase_secret, &self.vault_path, timeout_secs);
         session.save()
     }
 
@@ -1408,6 +1432,48 @@ mod secret_fields_serde {
 }
 
 // ---------------------------------------------------------------------------
+// Passphrase policy
+// ---------------------------------------------------------------------------
+
+const MIN_PASSPHRASE_LEN: usize = 16;
+const PASS_PHRASE_POLICY_ENV_BYPASS: &str = "KYZ_VAULT_PASSWORD";
+
+fn should_skip_passphrase_policy() -> bool {
+    std::env::var_os(PASS_PHRASE_POLICY_ENV_BYPASS).is_some()
+}
+
+fn passphrase_strength_error_details(passphrase: &str) -> Option<String> {
+    if passphrase.chars().count() >= MIN_PASSPHRASE_LEN {
+        return None;
+    }
+
+    let entropy = zxcvbn::zxcvbn(passphrase, &[]);
+    if entropy.score() >= zxcvbn::Score::Three {
+        None
+    } else {
+        Some(format!(
+            "passphrase too weak: {} chars, zxcvbn score {}",
+            passphrase.chars().count(),
+            u8::from(entropy.score())
+        ))
+    }
+}
+
+fn ensure_passphrase_strength(passphrase: &str) -> Result<(), CoreError> {
+    if should_skip_passphrase_policy() {
+        return Ok(());
+    }
+
+    if let Some(details) = passphrase_strength_error_details(passphrase) {
+        return Err(CoreError::Secret(format!(
+            "Weak vault passphrase rejected ({details}). Use at least {MIN_PASSPHRASE_LEN} characters OR a passphrase with zxcvbn score >= 3. Set {PASS_PHRASE_POLICY_ENV_BYPASS} in CI/automation to bypass this check."
+        )));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1433,6 +1499,144 @@ fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_vault_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("kyz-{label}-{}-{nanos}.json", std::process::id()))
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_entry_roundtrip() {
+        let mut fields = BTreeMap::new();
+        fields.insert("username".to_string(), SecretString::from("alice".to_string()));
+        fields.insert("password".to_string(), SecretString::from("s3cr3t".to_string()));
+        let entry = SecretEntry::new("svc", "db", fields.clone());
+
+        let passphrase = SecretString::from("a-very-strong-passphrase-123".to_string());
+        let encrypted = encrypt_entry(&entry, &passphrase)
+            .map_err(|e| format!("encrypt failed: {e}"))
+            .expect("entry encrypt/decrypt roundtrip should succeed");
+        let decrypted = decrypt_entry(&encrypted, &passphrase)
+            .map_err(|e| format!("decrypt failed: {e}"))
+            .expect("entry encrypt/decrypt roundtrip should succeed");
+
+        assert_eq!(decrypted.service, "svc");
+        assert_eq!(decrypted.key, "db");
+        assert_eq!(decrypted.field("username"), Some("alice"));
+        assert_eq!(decrypted.field("password"), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn test_vault_store_crud_roundtrip() {
+        let vault_path = temp_vault_path("crud");
+        let store = VaultStore::new(vault_path.clone());
+        let passphrase = "a-very-strong-passphrase-123";
+
+        store
+            .init(passphrase, false)
+            .map_err(|e| format!("init failed: {e}"))
+            .expect("vault init should succeed");
+        store
+            .unlock(passphrase, 60)
+            .map_err(|e| format!("unlock failed: {e}"))
+            .expect("vault unlock should succeed");
+
+        let entry = SecretEntry::single("app", "api-key", "token-123");
+        store
+            .set("app", "api-key", &entry)
+            .map_err(|e| format!("set failed: {e}"))
+            .expect("vault set should succeed");
+
+        let fetched = store
+            .get("app", "api-key")
+            .map_err(|e| format!("get failed: {e}"))
+            .expect("vault get should succeed");
+        assert_eq!(fetched.value(), Some("token-123"));
+
+        let summaries = store
+            .list("app")
+            .map_err(|e| format!("list failed: {e}"))
+            .expect("vault list should succeed");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].key, "api-key");
+
+        store
+            .delete("app", "api-key")
+            .map_err(|e| format!("delete failed: {e}"))
+            .expect("vault delete should succeed");
+        let missing = store.get("app", "api-key");
+        assert!(missing.is_err());
+
+        let _ = store.lock();
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[test]
+    fn test_secret_entry_and_vaultdata_merge_behavior() {
+        let mut first = SecretEntry::single("svc", "name", "v1");
+        first.add_tag("prod");
+
+        let mut second_fields = BTreeMap::new();
+        second_fields.insert("token".to_string(), SecretString::from("abc".to_string()));
+        let second = SecretEntry::new("svc", "name", second_fields);
+
+        let mut data = VaultData::new();
+        data.set(first);
+        data.set(second);
+
+        let merged = data.get("svc", "name").expect("merged entry should exist");
+        assert_eq!(merged.value(), Some("v1"));
+        assert_eq!(merged.field("token"), Some("abc"));
+        assert!(merged.has_tag("prod"));
+    }
+
+    #[test]
+    fn test_passphrase_strength_rejected_on_init() {
+        let vault_path = temp_vault_path("weak-init");
+        let store = VaultStore::new(vault_path.clone());
+
+        let result = store.init("weak", false);
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(err.to_string().contains("Weak vault passphrase rejected"));
+        }
+
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[test]
+    fn test_first_unlock_marks_policy_checked() {
+        let vault_path = temp_vault_path("policy-checked");
+        let store = VaultStore::new(vault_path.clone());
+        let passphrase = "a-very-strong-passphrase-123";
+
+        store
+            .init(passphrase, false)
+            .map_err(|e| format!("init failed: {e}"))
+            .expect("vault init should succeed");
+        store
+            .unlock(passphrase, 60)
+            .map_err(|e| format!("unlock failed: {e}"))
+            .expect("first unlock should succeed");
+
+        let raw = std::fs::read(&vault_path)
+            .map_err(|e| format!("read vault failed: {e}"))
+            .expect("vault file should be readable");
+        let parsed: VaultFileV2 = serde_json::from_slice(&raw)
+            .map_err(|e| format!("parse vault failed: {e}"))
+            .expect("vault should parse as v2 json");
+        assert!(parsed.passphrase_policy_checked);
+
+        let _ = store.lock();
+        let _ = std::fs::remove_file(&vault_path);
+    }
 }
 
 /// Simple deterministic hash for path-to-filename mapping.

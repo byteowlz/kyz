@@ -1,29 +1,47 @@
 {
   "todos": [
     {
-      "id": "51f41b47",
-      "content": "Inspect rebase conflict files and determine intended merged state",
-      "status": "in_progress",
+      "id": "da8b34c8",
+      "content": "Design vault v2 format: per-entry encryption, plaintext metadata",
+      "status": "completed",
       "priority": "high"
     },
     {
-      "id": "212401f9",
-      "content": "Resolve conflicts in Cargo.lock, crates/kyz-core/Cargo.toml, crates/kyz-core/src/store.rs",
-      "status": "pending",
+      "id": "af4a31a2",
+      "content": "Implement EncryptedEntry / VaultDataV2 types + per-entry encrypt/decrypt",
+      "status": "completed",
       "priority": "high"
     },
     {
-      "id": "38cc7f79",
-      "content": "Run fmt + remote-build check/test after conflict resolution",
-      "status": "pending",
+      "id": "bcf3f9fd",
+      "content": "Add scoped decrypt: only decrypt entries matching policy",
+      "status": "completed",
       "priority": "high"
     },
     {
-      "id": "bc9f5c0c",
-      "content": "Continue rebase and verify clean status",
-      "status": "pending",
+      "id": "b5f7fabb",
+      "content": "Vault v1→v2 migration (auto-migrate on unlock)",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "b9d7d3d4",
+      "content": "Update VaultStore + CLI to use v2 format",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "e2134a8e",
+      "content": "Update kyz exec to use scoped decrypt path",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "b22ef7a3",
+      "content": "Generate config, test, commit",
+      "status": "completed",
       "priority": "high"
     }
   ],
-  "updated_at": "2026-03-09T22:22:53.340Z"
+  "updated_at": "2026-03-16T16:16:08.447Z"
 }

@@ -2,6 +2,15 @@
 
 ## Open
 
+### [trx-8dbe.2] Implement generic TOML-driven provider model in kyz-oauth (P1, task)
+
+### [trx-8dbe.1] Create crates/kyz-oauth with config-first OAuth architecture (P1, task)
+
+### [trx-8dbe] OAuth architecture: add kyz-oauth first, migrate eavs later (P1, epic)
+
+### [trx-ee9z] Enforce passphrase strength on vault init/unlock (P1, task)
+Before shipping git sync, kyz must reject weak passphrases that would be vulnerable to offline brute-force if the encrypted vault file is exposed.\n\nRequirements:\n- Minimum 16 characters or zxcvbn score >= 3\n- Enforce at: vault init, unlock (first time), passphrase rotation\n- Skip check when KYZ_VAULT_PASSWORD env var is set (CI/automation)\n- Clear error message explaining why and what's needed\n\nBlocks: trx-3b5m (kyz sync)
+
 ### [trx-mg5q] kyz exec headless mode: detect no-TTY, create auth request, wait for approval, inject secrets (P1, task)
 
 ### [trx-34sn] WebSocket wait endpoint: WS /auth/wait/:id for real-time approval notification (P1, task)
@@ -19,6 +28,15 @@ Basic secret CRUD using OS keyring (gnome-keyring, macOS Keychain, Windows Crede
 
 ### [trx-092h] Cross-platform secrets manager CLI with P2P sync (P1, epic)
 Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption for portable vaults, iroh/libp2p for serverless P2P sync between devices.
+
+### [trx-8dbe.5] Design agent-scoped OAuth alias/capability model for surgical token access (P2, feature)
+
+### [trx-8dbe.4] Add builtin provider definitions and example provider TOMLs for kyz-oauth (P2, task)
+
+### [trx-8dbe.3] Add 'kyz oauth' CLI subcommands on top of kyz-oauth (P2, task)
+
+### [trx-3b5m] kyz sync: git push/pull for encrypted vault files (P2, feature)
+Add git sync support for vault files, allowing teams to commit .kyz/vault.json to repos and share secrets with anyone who knows the passphrase. Inspired by pi-cryptex's cryptex_git_sync.\n\nSubcommands:\n- kyz sync push [--repo <url>] [--branch <branch>]\n- kyz sync pull --repo <url> [--branch <branch>]\n\nPush from current repo (omit --repo) or to a dedicated secrets repo.\n\nPrerequisite: passphrase strength enforcement (see linked issue).\n\nThe age encryption (scrypt KDF + ChaCha20-Poly1305) makes this safe for public repos if passphrase entropy is sufficient.
 
 ### [trx-gber] Auth request expiry and cleanup: auto-expire pending requests, garbage collect stale state (P2, task)
 
@@ -45,6 +63,10 @@ Device pairing and encrypted sync via iroh (QUIC-based P2P). No server, no cloud
 
 ### [trx-092h.2] Phase 2: Portable age-encrypted vault (P2, epic)
 age-encrypted JSON vault file as alternative backend. Enables git-syncable, portable secrets.
+
+### [trx-8dbe.7] Evaluate and plan phased eavs migration to kyz-oauth (P3, task)
+
+### [trx-8dbe.6] Expose agent-safe OAuth access via kyz-mcp / kyz-api (P3, task)
 
 ### [trx-ymjw] Audit log: record auth requests, approvals, denials with scope, requester, approver, timestamps (P3, task)
 
