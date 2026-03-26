@@ -41,3 +41,4 @@ criterion/
 # IDE/Editor specific (Rust)
 .cargo/
 !.cargo/config.toml
+.pi/todos/
