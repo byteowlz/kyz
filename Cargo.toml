@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/kyz-core",
-  "crates/kyz-cli",
-  "crates/kyz-tui",
-  "crates/kyz-mcp",
-  "crates/kyz-api",
+    "crates/kyz-core",
+    "crates/kyz-cli",
+    "crates/kyz-tui",
+    "crates/kyz-mcp",
+    "crates/kyz-api",
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/byteowlz/kyz"
@@ -37,11 +37,7 @@ clap_complete = "4.5"
 rpassword = "7.4"
 
 # Secrets
-keyring = { version = "3", features = [
-  "apple-native",
-  "windows-native",
-  "linux-native",
-] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 age = { version = "0.11", features = [] }
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = "1.8"
@@ -142,7 +138,7 @@ large_types_passed_by_value = "deny"
 
 # === MINIMAL RELAXATIONS ===
 # Only the absolutely necessary ones
-multiple_crate_versions = "allow" # Unavoidable with transitive deps
+multiple_crate_versions = "allow"   # Unavoidable with transitive deps
 
 # Cast lints - too many false positives even for strict projects
 cast_possible_truncation = "allow"
@@ -151,11 +147,11 @@ cast_precision_loss = "allow"
 cast_possible_wrap = "allow"
 
 # Nursery lints that have too many false positives
-cognitive_complexity = "allow" # Use clippy.toml threshold instead
+cognitive_complexity = "allow"      # Use clippy.toml threshold instead
 
 # CLI/TUI/API templates need stdout/stderr output
-print_stdout = "allow" # CLIs/TUIs/APIs need to print to stdout
-print_stderr = "allow" # CLIs/TUIs/APIs need to print to stderr
+print_stdout = "allow"              # CLIs/TUIs/APIs need to print to stdout
+print_stderr = "allow"              # CLIs/TUIs/APIs need to print to stderr
 
 # CLI option structs inherently have many boolean flags
-struct_excessive_bools = "allow" # CLI flag structs have many bools
+struct_excessive_bools = "allow"    # CLI flag structs have many bools
