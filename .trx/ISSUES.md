@@ -2,13 +2,25 @@
 
 ## Open
 
+### [trx-7wnq.3] SSH wrapper mediation contract for alias-compatible agent UX (P1, task)
+Define and implement wrapper/proxy contract so agents can use ssh alias commands while key material stays in kyz-managed trusted path. Include alias resolution, per-host approval checks, and auditing.
+
+### [trx-7wnq.2] Policy presets and anti-nag strategy for approvals (P1, task)
+Implement risk-tiered policy evaluation and reusable presets (host groups/capability bundles/process allowlist) to reduce repetitive prompts while preserving security controls.
+
+### [trx-7wnq.1] Approval lease engine: scoped TTL/use-count grants for agent capabilities (P1, feature)
+Implement lease primitives for approval decisions: scope dimensions (session/process/capability/target), ttl, max_uses, and revocation. Expose APIs for check/grant/revoke with deterministic expiry behavior.
+
 ### [trx-8dbe.2] Implement generic TOML-driven provider model in kyz-oauth (P1, task)
 
 ### [trx-8dbe.1] Create crates/kyz-oauth with config-first OAuth architecture (P1, task)
 
 ### [trx-8dbe] OAuth architecture: add kyz-oauth first, migrate eavs later (P1, epic)
 
+### [trx-ymjw] Audit log: record auth requests, approvals, denials with scope, requester, approver, timestamps (P1, task)
+
 ### [trx-7wnq] Remote auth flow for headless agent secret access (P1, epic)
+Design and implement remote/headless auth flow for agent secret access that is secure and ergonomic (low approval fatigue).\n\nGoals\n- Keep raw secrets out of agent env/files whenever possible.\n- Support temporary scoped approvals (leases) without requiring agent process restarts for mediated capabilities.\n- Provide strong auditability and revocation while minimizing approval nags.\n\nScope\n1) Approval lease model\n   - lease fields: actor/session/process, capability, target (host/path/secret_ref), ttl, max_uses, risk_tier.\n   - grant modes: once, session, timed (e.g. 15m/1h).\n   - deterministic expiry and revocation semantics.\n2) Policy and anti-nag ergonomics\n   - risk-tiered prompts (low-risk auto+audit, high-risk explicit).\n   - host-group and capability presets to avoid repeated prompts.\n   - process allowlist integration for trusted executables.\n3) SSH mediation compatibility\n   - support ssh-wrapper flow where agent uses normal ssh alias commands while real key material remains inaccessible.\n   - alias resolution in trusted layer; per-host approval and audit events.\n4) Observability\n   - structured events for request/grant/deny/use/expire/revoke.\n\nDefinition of done\n- Headless/agent flows can request secrets with scoped leases.\n- Approval prompts are bounded and non-spammy under normal workflows.\n- All approvals and uses are auditable and revocable.\n- SSH mediated flow works with aliases and no key exposure to agents.
 
 ### [trx-nn87] kyz exec: wrap processes with injected secrets as env vars (P1, epic)
 
@@ -56,8 +68,6 @@ age-encrypted JSON vault file as alternative backend. Enables git-syncable, port
 ### [trx-8dbe.7] Evaluate and plan phased eavs migration to kyz-oauth (P3, task)
 
 ### [trx-8dbe.6] Expose agent-safe OAuth access via kyz-mcp / kyz-api (P3, task)
-
-### [trx-ymjw] Audit log: record auth requests, approvals, denials with scope, requester, approver, timestamps (P3, task)
 
 ### [trx-092h.3.6] CLI: kyz sync pair, kyz sync status, kyz sync now (P3, task)
 
