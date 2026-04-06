@@ -112,7 +112,9 @@ kyz vault status          # Show lock state and session info
 
 ## Policy Engine
 
-kyz enforces command policies when injecting secrets. Policies block dangerous commands that could exfiltrate secret values (e.g., `cat`, `echo`, `env`).
+kyz enforces command policies when injecting secrets. Policies block obvious exfiltration vectors — commands like `cat`, `echo`, `env`, and `printenv` that trivially leak values.
+
+**This is a best-effort guardrail, not a security boundary.** Any sufficiently creative command can exfiltrate environment variables (writing to a file, sending over the network, spawning a subshell, etc.). The policy engine raises the bar and catches accidental leaks, but it cannot cover every possible path. Treat it as defense-in-depth alongside access controls, audit logging, and limiting which secrets are injected in the first place.
 
 Policy files are discovered from:
 1. `.kyz-policy.json` in the current directory
@@ -186,10 +188,7 @@ kyz completions bash > ~/.local/share/bash-completion/completions/kyz
 
 ### kyz-tui
 
-Terminal UI built with ratatui:
-- Three-pane layout (navigation, list, details)
-- Vim-style navigation (j/k/h/l)
-- Modal help system
+Stub. The ratatui scaffolding is in place (three-pane layout, vim keybindings, help overlay) but it displays hardcoded placeholder items. No vault or secret browsing yet.
 
 ```bash
 kyz-tui
@@ -197,7 +196,7 @@ kyz-tui
 
 ### kyz-mcp
 
-MCP (Model Context Protocol) server for LLM tool integration:
+MCP server stub. Currently exposes only template tools (`get_profile`, `echo`, `get_runtime_config`). Secret management tools are not yet implemented.
 
 ```bash
 kyz-mcp

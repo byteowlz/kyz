@@ -2,15 +2,6 @@
 
 ## Open
 
-### [trx-c5mz] pi-kyz extension: automatic secret injection and scrubbing for pi agents (P1, feature)
-Create a pi extension for kyz that provides automatic secret injection and output scrubbing for AI agent sessions.
-
-## Core features
-1. **bash env injection** — override built-in bash tool, inject vault secrets as env vars via spawnHook
-2. **output scrubbing** — tool_result event scrubs secret values from ALL tool output (bash, read, grep, etc.)
-...
-
-
 ### [trx-7wnq.3] SSH wrapper mediation contract for alias-compatible agent UX (P1, task)
 Define and implement wrapper/proxy contract so agents can use ssh alias commands while key material stays in kyz-managed trusted path. Include alias resolution, per-host approval checks, and auditing.
 
@@ -38,24 +29,6 @@ Basic secret CRUD using OS keyring (gnome-keyring, macOS Keychain, Windows Crede
 
 ### [trx-092h] Cross-platform secrets manager CLI with P2P sync (P1, epic)
 Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption for portable vaults, iroh/libp2p for serverless P2P sync between devices.
-
-### [trx-gvr0] Secret scanning: detect leaked vault values in project files (P2, feature)
-Scan git-tracked files for accidentally committed secret values from the vault. Match against actual decrypted secret values, not regex patterns — zero false positives.
-
-Subcommands:
-- kyz scan — scan all git-tracked files in cwd
-- kyz scan --staged — scan only staged files (git pre-commit hook use case)
-...
-
-
-### [trx-e969] Secret history and rollback: automatic versioning of secret values (P2, feature)
-Automatically keep the last N versions of each secret value when updated via 'kyz set'. Add subcommands:
-
-- kyz history <service/key> — show version history with timestamps
-- kyz rollback <service/key> --to <version> — restore a previous value (archives current before restoring, so rollback is reversible)
-
-...
-
 
 ### [trx-8dbe.5] Design agent-scoped OAuth alias/capability model for surgical token access (P2, feature)
 
@@ -92,15 +65,6 @@ Device pairing and encrypted sync via iroh (QUIC-based P2P). No server, no cloud
 ### [trx-092h.2] Phase 2: Portable age-encrypted vault (P2, epic)
 age-encrypted JSON vault file as alternative backend. Enables git-syncable, portable secrets.
 
-### [trx-980c] Named environments: dev/staging/prod vault separation (P3, feature)
-Allow organizing secrets into named environments (dev, staging, prod) with separate vault files per environment.
-
-CLI:
-- kyz --env prod set api/key — store in prod environment
-- kyz --env prod list — list secrets in prod
-...
-
-
 ### [trx-8dbe.7] Evaluate and plan phased eavs migration to kyz-oauth (P3, task)
 
 ### [trx-8dbe.6] Expose agent-safe OAuth access via kyz-mcp / kyz-api (P3, task)
@@ -119,6 +83,10 @@ CLI:
 
 ## Closed
 
+- [trx-c5mz] pi-kyz extension: automatic secret injection and scrubbing for pi agents (closed 2026-04-06)
+- [trx-gvr0] Secret scanning: detect leaked vault values in project files (closed 2026-04-06)
+- [trx-980c] Named environments: dev/staging/prod vault separation (closed 2026-04-06)
+- [trx-e969] Secret history and rollback: automatic versioning of secret values (closed 2026-04-06)
 - [trx-q53x] Agent-safe secret injection: pipe, wrap, policy, audit, scrub, flock (closed 2026-03-25)
 - [trx-q53x.7] No-read policy mode: kyz exec/pipe/wrap enforce --no-read, block kyz get inside wrapped sessions (closed 2026-03-25)
 - [trx-q53x.4] Audit logging: structured stderr log for all secret access (exec/pipe/wrap) (closed 2026-03-25)

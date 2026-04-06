@@ -405,7 +405,26 @@ pub struct EncryptedEntry {
     pub updated_at: u64,
     /// Base64-encoded age-encrypted JSON blob of field name→value pairs.
     pub encrypted_fields: String,
+    /// Previous versions of this entry, newest first (max retained by config).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<HistoryEntry>,
 }
+
+/// A historical version of a secret entry's encrypted fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// Monotonic version number (1-based, increments on each update).
+    pub version: u32,
+    /// Unix timestamp when this version was archived (i.e., when it was replaced).
+    pub archived_at: u64,
+    /// Field names at the time of this version.
+    pub field_names: Vec<String>,
+    /// Base64-encoded age-encrypted JSON blob of field values at that time.
+    pub encrypted_fields: String,
+}
+
+/// Default number of history versions to retain per entry.
+pub const DEFAULT_HISTORY_RETENTION: u32 = 10;
 
 const fn default_policy_checked() -> bool {
     true
@@ -464,26 +483,153 @@ impl VaultFileV2 {
 
     /// Insert or update an entry (encrypts field values).
     ///
+    /// When updating an existing entry, the current version is archived
+    /// into the `history` field before being overwritten.
+    ///
     /// # Errors
     ///
     /// Returns an error if encryption fails.
     pub fn set(&mut self, entry: &SecretEntry, passphrase: &SecretString) -> Result<(), CoreError> {
+        self.set_with_retention(entry, passphrase, DEFAULT_HISTORY_RETENTION)
+    }
+
+    /// Insert or update an entry with a specific history retention limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encryption fails.
+    pub fn set_with_retention(
+        &mut self,
+        entry: &SecretEntry,
+        passphrase: &SecretString,
+        max_history: u32,
+    ) -> Result<(), CoreError> {
         let ck = Self::compound_key(&entry.service, &entry.key);
 
-        // If entry exists, merge fields then re-encrypt
+        // If entry exists, archive current version then merge and re-encrypt
         if let Some(existing) = self.entries.get(&ck) {
             let mut merged = decrypt_entry(existing, passphrase)?;
+
+            // Archive the current version before overwriting
+            let mut history = existing.history.clone();
+            let next_version = history.first().map_or(1, |h| h.version + 1);
+            history.insert(
+                0,
+                HistoryEntry {
+                    version: next_version,
+                    archived_at: now_unix(),
+                    field_names: existing.field_names.clone(),
+                    encrypted_fields: existing.encrypted_fields.clone(),
+                },
+            );
+            // Trim history to max retention
+            if max_history > 0 {
+                history.truncate(max_history as usize);
+            }
+
             for (name, value) in &entry.fields {
                 merged.fields.insert(name.clone(), value.clone());
             }
             merged.tags.extend(entry.tags.iter().cloned());
             merged.updated_at = now_unix();
-            let encrypted = encrypt_entry(&merged, passphrase)?;
+            let mut encrypted = encrypt_entry(&merged, passphrase)?;
+            encrypted.history = history;
             self.entries.insert(ck, encrypted);
         } else {
             let encrypted = encrypt_entry(entry, passphrase)?;
             self.entries.insert(ck, encrypted);
         }
+        Ok(())
+    }
+
+    /// Rollback an entry to a specific history version.
+    ///
+    /// The current entry is archived (so rollback is reversible) and the
+    /// requested version's fields are restored as the active entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry or version is not found, or decryption fails.
+    pub fn rollback(
+        &mut self,
+        service: &str,
+        key: &str,
+        target_version: u32,
+        passphrase: &SecretString,
+    ) -> Result<(), CoreError> {
+        self.rollback_with_retention(
+            service,
+            key,
+            target_version,
+            passphrase,
+            DEFAULT_HISTORY_RETENTION,
+        )
+    }
+
+    /// Rollback with a specific history retention limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry or version is not found, or decryption fails.
+    pub fn rollback_with_retention(
+        &mut self,
+        service: &str,
+        key: &str,
+        target_version: u32,
+        passphrase: &SecretString,
+        max_history: u32,
+    ) -> Result<(), CoreError> {
+        let ck = Self::compound_key(service, key);
+        let existing = self.entries.get(&ck).ok_or_else(|| {
+            CoreError::SecretNotFound(format!("secret '{key}' not found in service '{service}'"))
+        })?;
+
+        // Find the target version in history
+        let target_idx = existing
+            .history
+            .iter()
+            .position(|h| h.version == target_version)
+            .ok_or_else(|| {
+                CoreError::Secret(format!(
+                    "version {target_version} not found in history for '{service}/{key}'"
+                ))
+            })?;
+
+        let target = &existing.history[target_idx];
+
+        // Decrypt the target version's fields
+        let target_entry = EncryptedEntry {
+            key: existing.key.clone(),
+            service: existing.service.clone(),
+            tags: existing.tags.clone(),
+            field_names: target.field_names.clone(),
+            created_at: existing.created_at,
+            updated_at: now_unix(),
+            encrypted_fields: target.encrypted_fields.clone(),
+            history: Vec::new(),
+        };
+        let restored = decrypt_entry(&target_entry, passphrase)?;
+
+        // Archive current version before rollback (so rollback is reversible)
+        let mut history = existing.history.clone();
+        let next_version = history.first().map_or(1, |h| h.version + 1);
+        history.insert(
+            0,
+            HistoryEntry {
+                version: next_version,
+                archived_at: now_unix(),
+                field_names: existing.field_names.clone(),
+                encrypted_fields: existing.encrypted_fields.clone(),
+            },
+        );
+        if max_history > 0 {
+            history.truncate(max_history as usize);
+        }
+
+        // Re-encrypt restored fields and update
+        let mut new_entry = encrypt_entry(&restored, passphrase)?;
+        new_entry.history = history;
+        self.entries.insert(ck, new_entry);
         Ok(())
     }
 
@@ -542,6 +688,7 @@ pub fn encrypt_entry(
         created_at: entry.created_at,
         updated_at: entry.updated_at,
         encrypted_fields: base64::engine::general_purpose::STANDARD.encode(&encrypted),
+        history: Vec::new(),
     })
 }
 
@@ -1021,13 +1168,17 @@ fn decrypt_session_data(encrypted: &[u8], passphrase: &str) -> Result<Vec<u8>, C
 ///
 /// Vault location resolution order:
 /// 1. Explicit path (if provided)
-/// 2. Workspace vault: `<cwd>/.kyz/vault.json`
-/// 3. Central vault: `$XDG_DATA_HOME/kyz/vault.json`
+/// 2. Named environment: `$XDG_DATA_HOME/kyz/envs/<name>/vault.json`
+/// 3. Workspace vault: `<cwd>/.kyz/vault.json`
+/// 4. Central vault: `$XDG_DATA_HOME/kyz/vault.json`
 #[derive(Debug, Clone)]
 pub struct VaultStore {
     /// Path to the vault file.
     vault_path: PathBuf,
 }
+
+/// Subdirectory name for named environment vaults.
+pub const ENVS_DIR: &str = "envs";
 
 impl VaultStore {
     /// Create a store for a specific vault file.
@@ -1042,14 +1193,35 @@ impl VaultStore {
         &self.vault_path
     }
 
-    /// Resolve vault path: explicit > workspace > central.
+    /// Resolve vault path: explicit > named env > workspace > central.
     ///
     /// # Errors
     ///
     /// Returns an error if no vault can be found or paths fail to resolve.
     pub fn resolve(explicit: Option<&Path>) -> Result<Self, CoreError> {
+        Self::resolve_with_env(explicit, None)
+    }
+
+    /// Resolve vault path with optional named environment.
+    ///
+    /// When `env_name` is `Some`, the vault is stored under
+    /// `$XDG_DATA_HOME/kyz/envs/<name>/vault.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no vault can be found or paths fail to resolve.
+    pub fn resolve_with_env(
+        explicit: Option<&Path>,
+        env_name: Option<&str>,
+    ) -> Result<Self, CoreError> {
         if let Some(p) = explicit {
             return Ok(Self::new(p.to_path_buf()));
+        }
+
+        // Named environment: $XDG_DATA_HOME/kyz/envs/<name>/vault.json
+        if let Some(name) = env_name {
+            let env_vault = env_vault_path(name)?;
+            return Ok(Self::new(env_vault));
         }
 
         // Check for workspace vault in cwd
@@ -1186,6 +1358,33 @@ impl VaultStore {
     }
 
     /// Load the session key, or return an error if locked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault is locked.
+    pub fn require_session_pub(&self) -> Result<SecretString, CoreError> {
+        self.require_session()
+    }
+
+    /// Read the v2 vault file (public wrapper).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or parsed.
+    pub fn read_vault_file_pub(&self) -> Result<VaultFileV2, CoreError> {
+        self.read_vault_file()
+    }
+
+    /// Write the v2 vault file (public wrapper).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written.
+    pub fn write_vault_file_pub(&self, vault: &VaultFileV2) -> Result<(), CoreError> {
+        self.write_vault_file(vault)
+    }
+
+    /// Load the session key, or return an error if locked.
     fn require_session(&self) -> Result<SecretString, CoreError> {
         let session = VaultSession::load(&self.vault_path)?.ok_or_else(|| {
             CoreError::Secret("vault is locked. Run 'kyz unlock' first.".to_string())
@@ -1242,13 +1441,7 @@ impl SecretStore for VaultStore {
     }
 
     fn set(&self, service: &str, key: &str, entry: &SecretEntry) -> Result<(), CoreError> {
-        let passphrase = self.require_session()?;
-        let mut vault = self.read_vault_file()?;
-        let mut stored = entry.clone();
-        stored.service = service.to_string();
-        stored.key = key.to_string();
-        vault.set(&stored, &passphrase)?;
-        self.write_vault_file(&vault)
+        self.set_with_retention(service, key, entry, DEFAULT_HISTORY_RETENTION)
     }
 
     fn delete(&self, service: &str, key: &str) -> Result<(), CoreError> {
@@ -1271,6 +1464,29 @@ impl SecretStore for VaultStore {
         // No decryption needed — metadata is plaintext in v2
         let vault = self.read_vault_file()?;
         Ok(vault.services())
+    }
+}
+
+impl VaultStore {
+    /// Store with a specific history retention limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is locked or encryption fails.
+    pub fn set_with_retention(
+        &self,
+        service: &str,
+        key: &str,
+        entry: &SecretEntry,
+        max_history: u32,
+    ) -> Result<(), CoreError> {
+        let passphrase = self.require_session()?;
+        let mut vault = self.read_vault_file()?;
+        let mut stored = entry.clone();
+        stored.service = service.to_string();
+        stored.key = key.to_string();
+        vault.set_with_retention(&stored, &passphrase, max_history)?;
+        self.write_vault_file(&vault)
     }
 }
 
@@ -1541,6 +1757,45 @@ fn ensure_passphrase_strength(passphrase: &str) -> Result<(), CoreError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Get the vault file path for a named environment.
+///
+/// # Errors
+///
+/// Returns an error if the data directory cannot be determined.
+pub fn env_vault_path(env_name: &str) -> Result<PathBuf, CoreError> {
+    let data_dir = crate::paths::default_data_dir()
+        .map_err(|e| CoreError::Path(format!("cannot determine data dir: {e}")))?;
+    Ok(data_dir.join(ENVS_DIR).join(env_name).join(VAULT_FILENAME))
+}
+
+/// List all named environments that have vault files.
+///
+/// # Errors
+///
+/// Returns an error if the data directory cannot be determined or read.
+pub fn list_environments() -> Result<Vec<String>, CoreError> {
+    let data_dir = crate::paths::default_data_dir()
+        .map_err(|e| CoreError::Path(format!("cannot determine data dir: {e}")))?;
+    let envs_dir = data_dir.join(ENVS_DIR);
+    if !envs_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut envs = Vec::new();
+    let entries = fs::read_dir(&envs_dir).map_err(CoreError::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(CoreError::Io)?;
+        let path = entry.path();
+        if path.is_dir() && path.join(VAULT_FILENAME).exists() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                envs.push(name.to_string());
+            }
+        }
+    }
+    envs.sort();
+    Ok(envs)
+}
+
 /// Get the central vault file path.
 ///
 /// # Errors
@@ -1579,8 +1834,14 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt_entry_roundtrip() {
         let mut fields = BTreeMap::new();
-        fields.insert("username".to_string(), SecretString::from("alice".to_string()));
-        fields.insert("password".to_string(), SecretString::from("s3cr3t".to_string()));
+        fields.insert(
+            "username".to_string(),
+            SecretString::from("alice".to_string()),
+        );
+        fields.insert(
+            "password".to_string(),
+            SecretString::from("s3cr3t".to_string()),
+        );
         let entry = SecretEntry::new("svc", "db", fields.clone());
 
         let passphrase = SecretString::from("a-very-strong-passphrase-123".to_string());
@@ -1659,6 +1920,175 @@ mod tests {
         assert_eq!(merged.value(), Some("v1"));
         assert_eq!(merged.field("token"), Some("abc"));
         assert!(merged.has_tag("prod"));
+    }
+
+    #[test]
+    fn test_vault_history_on_update() {
+        let vault_path = temp_vault_path("history");
+        let store = VaultStore::new(vault_path.clone());
+        let passphrase = "a-very-strong-passphrase-123";
+
+        store
+            .init(passphrase, false)
+            .map_err(|e| format!("init failed: {e}"))
+            .expect("vault init should succeed");
+        store
+            .unlock(passphrase, 60)
+            .map_err(|e| format!("unlock failed: {e}"))
+            .expect("vault unlock should succeed");
+
+        // First set — no history
+        let entry1 = SecretEntry::single("app", "key", "value-1");
+        store
+            .set("app", "key", &entry1)
+            .map_err(|e| format!("set failed: {e}"))
+            .expect("first set should succeed");
+
+        let vault = store
+            .read_vault_file_pub()
+            .map_err(|e| format!("read failed: {e}"))
+            .expect("read should succeed");
+        let enc = vault
+            .get_encrypted("app", "key")
+            .expect("entry should exist");
+        assert!(enc.history.is_empty(), "first set should have no history");
+
+        // Second set — should archive v1
+        let entry2 = SecretEntry::single("app", "key", "value-2");
+        store
+            .set("app", "key", &entry2)
+            .map_err(|e| format!("set failed: {e}"))
+            .expect("second set should succeed");
+
+        let vault = store
+            .read_vault_file_pub()
+            .map_err(|e| format!("read failed: {e}"))
+            .expect("read should succeed");
+        let enc = vault
+            .get_encrypted("app", "key")
+            .expect("entry should exist");
+        assert_eq!(enc.history.len(), 1, "should have 1 history entry");
+        assert_eq!(enc.history[0].version, 1);
+
+        // Verify current value is value-2
+        let fetched = store
+            .get("app", "key")
+            .map_err(|e| format!("get failed: {e}"))
+            .expect("get should succeed");
+        assert_eq!(fetched.value(), Some("value-2"));
+
+        let _ = store.lock();
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[test]
+    fn test_vault_rollback() {
+        let vault_path = temp_vault_path("rollback");
+        let store = VaultStore::new(vault_path.clone());
+        let passphrase = "a-very-strong-passphrase-123";
+
+        store
+            .init(passphrase, false)
+            .map_err(|e| format!("init failed: {e}"))
+            .expect("init should succeed");
+        store
+            .unlock(passphrase, 60)
+            .map_err(|e| format!("unlock failed: {e}"))
+            .expect("unlock should succeed");
+
+        // Create three versions
+        store
+            .set("app", "key", &SecretEntry::single("app", "key", "v1"))
+            .map_err(|e| format!("set failed: {e}"))
+            .expect("set should succeed");
+        store
+            .set("app", "key", &SecretEntry::single("app", "key", "v2"))
+            .map_err(|e| format!("set failed: {e}"))
+            .expect("set should succeed");
+        store
+            .set("app", "key", &SecretEntry::single("app", "key", "v3"))
+            .map_err(|e| format!("set failed: {e}"))
+            .expect("set should succeed");
+
+        // Current should be v3, history should have v2(version=2), v1(version=1)
+        let fetched = store
+            .get("app", "key")
+            .map_err(|e| format!("get failed: {e}"))
+            .expect("get should succeed");
+        assert_eq!(fetched.value(), Some("v3"));
+
+        // Rollback to version 1
+        let passphrase_secret = SecretString::from(passphrase.to_string());
+        let mut vault = store
+            .read_vault_file_pub()
+            .map_err(|e| format!("read failed: {e}"))
+            .expect("read should succeed");
+        vault
+            .rollback("app", "key", 1, &passphrase_secret)
+            .map_err(|e| format!("rollback failed: {e}"))
+            .expect("rollback should succeed");
+        store
+            .write_vault_file_pub(&vault)
+            .map_err(|e| format!("write failed: {e}"))
+            .expect("write should succeed");
+
+        // Current value should be v1 again
+        let fetched = store
+            .get("app", "key")
+            .map_err(|e| format!("get failed: {e}"))
+            .expect("get should succeed");
+        assert_eq!(fetched.value(), Some("v1"));
+
+        // History should now have 3 entries (v3 archived by rollback, v2, v1)
+        let vault = store
+            .read_vault_file_pub()
+            .map_err(|e| format!("read failed: {e}"))
+            .expect("read should succeed");
+        let enc = vault
+            .get_encrypted("app", "key")
+            .expect("entry should exist");
+        assert_eq!(enc.history.len(), 3);
+
+        let _ = store.lock();
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[test]
+    fn test_history_retention_limit() {
+        let vault_path = temp_vault_path("retention");
+        let store = VaultStore::new(vault_path.clone());
+        let passphrase = "a-very-strong-passphrase-123";
+
+        store
+            .init(passphrase, false)
+            .map_err(|e| format!("init failed: {e}"))
+            .expect("init should succeed");
+        store
+            .unlock(passphrase, 60)
+            .map_err(|e| format!("unlock failed: {e}"))
+            .expect("unlock should succeed");
+
+        // Set with retention of 2
+        for i in 0..5 {
+            let entry = SecretEntry::single("app", "key", &format!("v{i}"));
+            store
+                .set_with_retention("app", "key", &entry, 2)
+                .map_err(|e| format!("set failed: {e}"))
+                .expect("set should succeed");
+        }
+
+        // Should only have 2 history entries
+        let vault = store
+            .read_vault_file_pub()
+            .map_err(|e| format!("read failed: {e}"))
+            .expect("read should succeed");
+        let enc = vault
+            .get_encrypted("app", "key")
+            .expect("entry should exist");
+        assert_eq!(enc.history.len(), 2, "history should be trimmed to 2");
+
+        let _ = store.lock();
+        let _ = std::fs::remove_file(&vault_path);
     }
 
     #[test]

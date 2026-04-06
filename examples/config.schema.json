@@ -16,6 +16,14 @@
         "$ref": "#/definitions/AliasConfig"
       }
     },
+    "history_retention": {
+      "description": "Maximum number of history versions to retain per secret entry.\nOlder versions are discarded on each update. Set to 0 to disable history.",
+      "type": "integer",
+      "format": "uint32",
+      "default": 10,
+      "maximum": 100,
+      "minimum": 0
+    },
     "logging": {
       "description": "Logging configuration.",
       "allOf": [

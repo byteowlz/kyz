@@ -105,8 +105,12 @@ clippy-crate CRATE:
 fix:
     cargo clippy --workspace --fix --allow-dirty
 
+# Run ast-grep rules (no-unwrap, no-debug, no-clippy-allow)
+ast-grep:
+    ast-grep scan -c .ast-grep/sgconfig.yml
+
 # Run all checks
-check-all: fmt-check clippy test
+check-all: fmt-check clippy ast-grep test
 
 # === Config Generation ===
 

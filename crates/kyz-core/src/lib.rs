@@ -17,6 +17,7 @@ pub mod config;
 pub mod error;
 pub mod paths;
 pub mod policy;
+pub mod scan;
 pub mod schema;
 pub mod store;
 
@@ -30,8 +31,9 @@ pub use paths::{AppPaths, default_cache_dir};
 pub use policy::{Policy, PolicyViolation, default_policy, resolve_policy};
 pub use schema::{generate_example_config, generate_schema, write_generated_files};
 pub use store::{
-    EncryptedEntry, KeyringStore, SecretEntry, SecretStore, SecretSummary, VaultData, VaultFileV2,
-    VaultSession, VaultStatus, VaultStore, decrypt_entry, encrypt_entry,
+    DEFAULT_HISTORY_RETENTION, EncryptedEntry, HistoryEntry, KeyringStore, SecretEntry,
+    SecretStore, SecretSummary, VaultData, VaultFileV2, VaultSession, VaultStatus, VaultStore,
+    decrypt_entry, encrypt_entry, env_vault_path, list_environments,
 };
 
 /// Application name used for config directories and environment prefix.

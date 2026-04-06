@@ -37,6 +37,12 @@ pub struct AppConfig {
     /// Custom paths for data and state directories.
     pub paths: PathsConfig,
 
+    /// Maximum number of history versions to retain per secret entry.
+    /// Older versions are discarded on each update. Set to 0 to disable history.
+    #[serde(default = "default_history_retention")]
+    #[schemars(range(min = 0, max = 100))]
+    pub history_retention: u32,
+
     /// Named aliases for `kyz exec`. Each alias resolves a set of secrets
     /// to inject as environment variables when wrapping a process.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -109,6 +115,10 @@ impl AppConfig {
     }
 }
 
+const fn default_history_retention() -> u32 {
+    10
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -117,6 +127,7 @@ impl Default for AppConfig {
             logging: LoggingConfig::default(),
             runtime: RuntimeConfig::default(),
             paths: PathsConfig::default(),
+            history_retention: default_history_retention(),
             aliases: BTreeMap::new(),
         }
     }

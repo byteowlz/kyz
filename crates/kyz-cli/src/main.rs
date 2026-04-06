@@ -41,8 +41,12 @@ fn try_main() -> Result<()> {
         Command::Export(cmd) => handle_export(&ctx, cmd),
         Command::Import(cmd) => handle_import(&ctx, cmd),
         Command::Vault { command } => handle_vault(&ctx, command),
+        Command::Env(_) => handle_env(&ctx),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
+        Command::Scan(cmd) => handle_scan(&ctx, cmd),
+        Command::History(cmd) => handle_history(&ctx, cmd),
+        Command::Rollback(cmd) => handle_rollback(&ctx, cmd),
         Command::Exec(cmd) => handle_exec(&ctx, cmd),
         Command::Pipe(cmd) => handle_pipe(&ctx, cmd),
         Command::Wrap(cmd) => handle_wrap(&ctx, cmd),
@@ -78,6 +82,10 @@ pub struct CommonOpts {
     /// Explicit vault file path (overrides auto-discovery).
     #[arg(long, value_name = "PATH", global = true)]
     pub vault: Option<PathBuf>,
+    /// Named environment (dev, staging, prod). Selects the vault at
+    /// `$XDG_DATA_HOME/kyz/envs/<name>/vault.json`. Also set via `KYZ_ENV`.
+    #[arg(long = "env", value_name = "NAME", global = true, env = "KYZ_ENV")]
+    pub env_name: Option<String>,
     /// Reduce output to only errors.
     #[arg(short, long, action = clap::ArgAction::SetTrue, global = true)]
     pub quiet: bool,
@@ -158,6 +166,8 @@ enum Command {
     },
     /// Create config directories and default files.
     Init(InitCommand),
+    /// List named environments.
+    Env(EnvCommand),
     /// Inspect and manage configuration.
     Config {
         /// Configuration subcommand.
@@ -168,6 +178,12 @@ enum Command {
     Exec(ExecCommand),
     /// Pipe a secret into a command's stdin (never touches env or args).
     Pipe(PipeCommand),
+    /// Scan git-tracked files for leaked vault secret values.
+    Scan(ScanCommand),
+    /// Show version history for a secret.
+    History(HistoryCommand),
+    /// Rollback a secret to a previous version.
+    Rollback(RollbackCommand),
     /// Wrap an agent with pre-approved secret access and policy enforcement.
     Wrap(WrapCommand),
     /// Generate shell completions.
@@ -275,6 +291,9 @@ struct ImportCommand {
 }
 
 #[derive(Debug, Clone, Copy, Args)]
+struct EnvCommand;
+
+#[derive(Debug, Clone, Copy, Args)]
 struct InitCommand {
     /// Recreate configuration even if it already exists.
     #[arg(long = "force")]
@@ -293,6 +312,46 @@ enum ConfigCommand {
     Schema,
     /// Regenerate the default configuration file.
     Reset,
+}
+
+// -- Scan command -------------------------------------------------------------
+
+#[derive(Debug, Clone, Args)]
+struct ScanCommand {
+    /// Only scan staged files (for pre-commit hooks).
+    #[arg(long)]
+    staged: bool,
+    /// Scan a specific directory instead of the current directory.
+    #[arg(long, value_name = "DIR")]
+    path: Option<PathBuf>,
+    /// Output suitable for git pre-commit hook (exit code 1 on match, minimal output).
+    #[arg(long)]
+    hook: bool,
+}
+
+// -- History / Rollback commands -----------------------------------------------
+
+#[derive(Debug, Clone, Args)]
+struct HistoryCommand {
+    /// Secret reference as service/key.
+    #[arg(value_name = "SERVICE/KEY")]
+    secret: String,
+    /// Service namespace (used if secret doesn't contain '/').
+    #[arg(long, default_value = DEFAULT_SERVICE)]
+    service: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RollbackCommand {
+    /// Secret reference as service/key.
+    #[arg(value_name = "SERVICE/KEY")]
+    secret: String,
+    /// Version number to rollback to.
+    #[arg(long = "to", value_name = "VERSION")]
+    version: u32,
+    /// Service namespace (used if secret doesn't contain '/').
+    #[arg(long, default_value = DEFAULT_SERVICE)]
+    service: String,
 }
 
 // -- Exec command -------------------------------------------------------------
@@ -329,7 +388,12 @@ struct ExecCommand {
 
     /// Run a shell command string (passed to sh -c). Variables like $VAR
     /// are expanded by the shell after secrets are injected.
-    #[arg(long = "shell-command", short = 'c', value_name = "CMD", conflicts_with = "command")]
+    #[arg(
+        long = "shell-command",
+        short = 'c',
+        value_name = "CMD",
+        conflicts_with = "command"
+    )]
     shell_command: Option<String>,
 
     /// Command and arguments to execute (use -- to separate from kyz flags).
@@ -464,10 +528,13 @@ impl RuntimeContext {
         self.paths.ensure_directories()
     }
 
-    /// Resolve the vault store from CLI options.
+    /// Resolve the vault store from CLI options (--vault, --env, or auto-discover).
     fn vault_store(&self) -> Result<VaultStore> {
-        let store =
-            VaultStore::resolve(self.common.vault.as_deref()).map_err(|e| anyhow!("{e}"))?;
+        let store = VaultStore::resolve_with_env(
+            self.common.vault.as_deref(),
+            self.common.env_name.as_deref(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
         Ok(store)
     }
 
@@ -656,8 +723,6 @@ fn fields_to_plain(fields: &BTreeMap<String, SecretString>) -> BTreeMap<String, 
 }
 
 fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
-    let store = ctx.secret_store()?;
-
     // Build fields from --field args or fallback to positional value
     let fields = if !cmd.fields.is_empty() {
         parse_fields(&cmd.fields)?
@@ -681,8 +746,9 @@ fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
         return Ok(());
     }
 
-    store
-        .set(&cmd.service, &cmd.key, &entry)
+    let vault_store = ctx.vault_store()?;
+    vault_store
+        .set_with_retention(&cmd.service, &cmd.key, &entry, ctx.config.history_retention)
         .map_err(|e| anyhow!("{e}"))?;
 
     if !ctx.common.quiet {
@@ -822,6 +888,245 @@ fn handle_list(ctx: &RuntimeContext, cmd: ListCommand) -> Result<()> {
             } else {
                 println!("{}  [{}]", entry.key, entry.field_names.join(", "));
             }
+        }
+    }
+    Ok(())
+}
+
+fn handle_scan(ctx: &RuntimeContext, cmd: ScanCommand) -> Result<()> {
+    use kyz_core::scan;
+
+    let store = ctx.vault_store()?;
+    let passphrase = store.require_session_pub().map_err(|e| anyhow!("{e}"))?;
+    let vault = store.read_vault_file_pub().map_err(|e| anyhow!("{e}"))?;
+
+    // Build index of secret values → names
+    let secret_index = scan::build_secret_index(&vault, &passphrase).map_err(|e| anyhow!("{e}"))?;
+
+    if secret_index.is_empty() {
+        if !ctx.common.quiet {
+            println!("No secrets in vault to scan for.");
+        }
+        return Ok(());
+    }
+
+    // Get files to scan
+    let opts = scan::ScanOptions {
+        staged_only: cmd.staged,
+        path: cmd.path.clone(),
+    };
+    let files = scan::get_files_to_scan(&opts).map_err(|e| anyhow!("{e}"))?;
+
+    let base_dir = cmd
+        .path
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+
+    // Scan
+    let result = scan::scan_files(&files, &secret_index, &base_dir).map_err(|e| anyhow!("{e}"))?;
+
+    // Output results
+    if ctx.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).context("serializing scan result")?
+        );
+    } else if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&result).context("serializing scan result")?
+        );
+    } else if result.matches.is_empty() {
+        if !ctx.common.quiet && !cmd.hook {
+            println!(
+                "✅ No leaked secrets found ({} files scanned, {} secrets checked)",
+                result.files_scanned,
+                secret_index.len()
+            );
+        }
+    } else {
+        if !cmd.hook {
+            eprintln!(
+                "⚠️  Found {} leaked secret(s) in {} file(s):",
+                result.matches.len(),
+                result.files_scanned
+            );
+        }
+        for m in &result.matches {
+            println!("{}:{}: {}", m.file.display(), m.line, m.secret_name);
+        }
+    }
+
+    // Return error if matches found (for --hook / CI use)
+    if !result.matches.is_empty() && cmd.hook {
+        return Err(anyhow!("found {} leaked secret(s)", result.matches.len()));
+    }
+
+    Ok(())
+}
+
+/// Parse a secret reference that may or may not contain a '/'.
+fn parse_secret_ref<'a>(secret: &'a str, default_service: &'a str) -> (&'a str, &'a str) {
+    secret.split_once('/').unwrap_or((default_service, secret))
+}
+
+fn handle_history(ctx: &RuntimeContext, cmd: HistoryCommand) -> Result<()> {
+    let (service, key) = parse_secret_ref(&cmd.secret, &cmd.service);
+    let store = ctx.vault_store()?;
+    let vault = store.read_vault_file_pub()?;
+
+    let encrypted = vault
+        .get_encrypted(service, key)
+        .ok_or_else(|| anyhow!("secret '{key}' not found in service '{service}'"))?;
+
+    if encrypted.history.is_empty() {
+        if ctx.common.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "service": service,
+                    "key": key,
+                    "history": []
+                })
+            );
+        } else if ctx.common.yaml {
+            println!(
+                "{}",
+                serde_yaml::to_string(&serde_json::json!({
+                    "service": service,
+                    "key": key,
+                    "history": []
+                }))
+                .context("serializing to YAML")?
+            );
+        } else {
+            println!("No history for '{service}/{key}'");
+        }
+        return Ok(());
+    }
+
+    if ctx.common.json {
+        let history: Vec<serde_json::Value> = encrypted
+            .history
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "version": h.version,
+                    "archived_at": h.archived_at,
+                    "field_names": h.field_names,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "service": service,
+                "key": key,
+                "current_fields": encrypted.field_names,
+                "current_updated_at": encrypted.updated_at,
+                "history": history,
+            }))
+            .context("serializing to JSON")?
+        );
+    } else if ctx.common.yaml {
+        let history: Vec<serde_json::Value> = encrypted
+            .history
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "version": h.version,
+                    "archived_at": h.archived_at,
+                    "field_names": h.field_names,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_yaml::to_string(&serde_json::json!({
+                "service": service,
+                "key": key,
+                "current_fields": encrypted.field_names,
+                "current_updated_at": encrypted.updated_at,
+                "history": history,
+            }))
+            .context("serializing to YAML")?
+        );
+    } else {
+        println!("History for '{service}/{key}':");
+        println!(
+            "  current  [{}]  updated {}",
+            encrypted.field_names.join(", "),
+            format_timestamp(encrypted.updated_at)
+        );
+        for h in &encrypted.history {
+            println!(
+                "  v{}  [{}]  archived {}",
+                h.version,
+                h.field_names.join(", "),
+                format_timestamp(h.archived_at)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_rollback(ctx: &RuntimeContext, cmd: RollbackCommand) -> Result<()> {
+    let (service, key) = parse_secret_ref(&cmd.secret, &cmd.service);
+
+    if ctx.common.dry_run {
+        info!(
+            "dry-run: would rollback '{service}/{key}' to version {}",
+            cmd.version
+        );
+        return Ok(());
+    }
+
+    let store = ctx.vault_store()?;
+    let passphrase = store.require_session_pub()?;
+    let mut vault = store.read_vault_file_pub()?;
+    let retention = ctx.config.history_retention;
+
+    vault
+        .rollback_with_retention(service, key, cmd.version, &passphrase, retention)
+        .map_err(|e| anyhow!("{e}"))?;
+    store.write_vault_file_pub(&vault)?;
+
+    if !ctx.common.quiet {
+        println!("Rolled back '{service}/{key}' to version {}", cmd.version);
+    }
+    Ok(())
+}
+
+/// Format a Unix timestamp as a human-readable string.
+fn format_timestamp(ts: u64) -> String {
+    humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts))
+        .to_string()
+}
+
+fn handle_env(ctx: &RuntimeContext) -> Result<()> {
+    let envs = kyz_core::list_environments().map_err(|e| anyhow!("{e}"))?;
+
+    if ctx.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "environments": envs }))
+                .context("serializing to JSON")?
+        );
+    } else if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&serde_json::json!({ "environments": envs }))
+                .context("serializing to YAML")?
+        );
+    } else if envs.is_empty() {
+        println!("No named environments found.");
+        println!("Create one with: kyz --env <name> vault create");
+    } else {
+        println!("Named environments:");
+        for env in &envs {
+            let vault_path = kyz_core::env_vault_path(env).map_err(|e| anyhow!("{e}"))?;
+            println!("  {env}  ({})", vault_path.display());
         }
     }
     Ok(())

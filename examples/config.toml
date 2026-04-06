@@ -4,6 +4,7 @@
 # Copy this file to $XDG_CONFIG_HOME/kyz/config.toml and adjust as needed.
 
 profile = "default"
+history_retention = 10
 
 [logging]
 level = "info"
