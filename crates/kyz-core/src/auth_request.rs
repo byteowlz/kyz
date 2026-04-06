@@ -111,7 +111,7 @@ pub type StashedSecrets = BTreeMap<String, BTreeMap<String, String>>;
 #[derive(Debug, Clone)]
 pub struct AuthRequestStore {
     requests: Arc<RwLock<BTreeMap<AuthRequestId, AuthRequest>>>,
-    /// One-time secret stash: request_id → { scope → { field → value } }.
+    /// One-time secret stash: `request_id` → { scope → { field → value } }.
     secret_stash: Arc<RwLock<BTreeMap<AuthRequestId, StashedSecrets>>>,
     /// Broadcast channel for status change notifications.
     notify: Arc<broadcast::Sender<AuthRequestEvent>>,
@@ -130,6 +130,7 @@ impl AuthRequestStore {
     }
 
     /// Subscribe to status change events for any request.
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<AuthRequestEvent> {
         self.notify.subscribe()
     }

@@ -35,3 +35,6 @@ fs2.workspace = true
 tokio.workspace = true
 getrandom.workspace = true
 zxcvbn.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

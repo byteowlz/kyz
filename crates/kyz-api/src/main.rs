@@ -446,8 +446,8 @@ async fn wait_auth_request(
         return Err(StatusCode::CONFLICT);
     }
 
-    let auth_store = state.auth_requests.clone();
-    let request_id = id.clone();
+    let auth_store = state.auth_requests;
+    let request_id = id;
 
     Ok(upgrade.on_upgrade(move |socket| handle_wait_ws(socket, auth_store, request_id)))
 }
@@ -477,8 +477,8 @@ async fn handle_wait_ws(
                         let _ = socket.send(ws::Message::Close(None)).await;
                         return;
                     }
-                    Ok(_) => continue, // different request
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Ok(_)
+                    | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {} // different request or lagged
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         let _ = socket.send(ws::Message::Close(None)).await;
                         return;

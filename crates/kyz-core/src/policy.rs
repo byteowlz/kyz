@@ -162,24 +162,22 @@ impl Policy {
         self.check_command(command)?;
 
         // Then check per-secret restrictions
-        if let Some(rule) = self.secrets.get(secret_name) {
-            if !rule.allow_commands.is_empty() {
-                let base = Path::new(command)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(command);
+        if let Some(rule) = self.secrets.get(secret_name)
+            && !rule.allow_commands.is_empty()
+        {
+            let base = Path::new(command)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(command);
 
-                if !rule
-                    .allow_commands
-                    .iter()
-                    .any(|a| base == a || command == a)
-                {
-                    return Err(PolicyViolation {
-                        reason: format!(
-                            "secret '{secret_name}' cannot be used with command '{base}'"
-                        ),
-                    });
-                }
+            if !rule
+                .allow_commands
+                .iter()
+                .any(|a| base == a || command == a)
+            {
+                return Err(PolicyViolation {
+                    reason: format!("secret '{secret_name}' cannot be used with command '{base}'"),
+                });
             }
         }
 

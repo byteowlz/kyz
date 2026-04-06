@@ -229,6 +229,7 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 #[schemars(description = "Named alias for kyz exec secret injection")]
+#[derive(Default)]
 pub struct AliasConfig {
     /// Explicit secret references as `"service/key"` strings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -243,16 +244,6 @@ pub struct AliasConfig {
     /// These override the default field-name uppercasing for specific fields.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_map: BTreeMap<String, String>,
-}
-
-impl Default for AliasConfig {
-    fn default() -> Self {
-        Self {
-            secrets: Vec::new(),
-            tags: Vec::new(),
-            env_map: BTreeMap::new(),
-        }
-    }
 }
 
 /// Path override configuration.

@@ -112,7 +112,9 @@ impl SecretEntry {
     /// Get a specific field value.
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&str> {
-        self.fields.get(name).map(|v| v.expose_secret())
+        self.fields
+            .get(name)
+            .map(secrecy::ExposeSecret::expose_secret)
     }
 
     /// Get the "value" field (convenience for single-value entries).
@@ -240,7 +242,7 @@ impl VaultData {
 
     /// Create a new empty vault.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
             entries: BTreeMap::new(),
@@ -436,7 +438,7 @@ impl VaultFileV2 {
 
     /// Create a new empty v2 vault.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
             passphrase_policy_checked: false,
@@ -746,10 +748,10 @@ pub fn decrypt_entry(
 pub fn detect_vault_version(data: &[u8]) -> u32 {
     if data.first() == Some(&b'{') {
         // JSON — could be v2
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(data) {
-            if let Some(v) = parsed.get("version").and_then(serde_json::Value::as_u64) {
-                return v as u32;
-            }
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(data)
+            && let Some(v) = parsed.get("version").and_then(serde_json::Value::as_u64)
+        {
+            return v as u32;
         }
         return 2;
     }
@@ -768,7 +770,7 @@ pub fn migrate_v1_to_v2(
 ) -> Result<VaultFileV2, CoreError> {
     let v1 = decrypt_vault(v1_data, passphrase)?;
     let mut v2 = VaultFileV2::new();
-    for (_ck, entry) in &v1.entries {
+    for entry in v1.entries.values() {
         let encrypted = encrypt_entry(entry, passphrase)?;
         let ck = VaultFileV2::compound_key(&entry.service, &entry.key);
         v2.entries.insert(ck, encrypted);
@@ -1183,7 +1185,7 @@ pub const ENVS_DIR: &str = "envs";
 impl VaultStore {
     /// Create a store for a specific vault file.
     #[must_use]
-    pub fn new(vault_path: PathBuf) -> Self {
+    pub const fn new(vault_path: PathBuf) -> Self {
         Self { vault_path }
     }
 
@@ -1256,21 +1258,21 @@ impl VaultStore {
         }
 
         if let Some(parent) = self.vault_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| CoreError::Io(e))?;
+            fs::create_dir_all(parent).map_err(CoreError::Io)?;
         }
 
         // Create empty v2 vault
         let v2 = VaultFileV2::new();
         let json = serde_json::to_string_pretty(&v2)
             .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
-        fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
+        fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
 
         // Set vault file permissions to 0600
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&self.vault_path, fs::Permissions::from_mode(0o600))
-                .map_err(|e| CoreError::Io(e))?;
+                .map_err(CoreError::Io)?;
         }
 
         Ok(())
@@ -1290,7 +1292,7 @@ impl VaultStore {
             )));
         }
 
-        let raw = fs::read(&self.vault_path).map_err(|e| CoreError::Io(e))?;
+        let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
         let passphrase_secret = SecretString::from(passphrase.to_string());
 
         // Detect format and auto-migrate v1 → v2
@@ -1302,7 +1304,7 @@ impl VaultStore {
             v2.passphrase_policy_checked = true;
             let json = serde_json::to_string_pretty(&v2)
                 .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
-            fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
+            fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
         } else {
             // v2: verify passphrase by decrypting the first entry (if any)
             let mut v2: VaultFileV2 = serde_json::from_slice(&raw)
@@ -1317,7 +1319,7 @@ impl VaultStore {
                 v2.passphrase_policy_checked = true;
                 let json = serde_json::to_string_pretty(&v2)
                     .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
-                fs::write(&self.vault_path, json.as_bytes()).map_err(|e| CoreError::Io(e))?;
+                fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
             }
         }
 
@@ -1515,19 +1517,31 @@ impl KeyringStore {
     }
 
     /// Load the key index for a service.
-    fn load_index(&self, service: &str) -> Result<BTreeMap<String, ()>, CoreError> {
+    ///
+    /// Handles both legacy `BTreeMap<String, ()>` format and current
+    /// `BTreeSet<String>` format transparently.
+    fn load_index(service: &str) -> Result<BTreeSet<String>, CoreError> {
         let entry = keyring::Entry::new(service, INDEX_KEY)
             .map_err(|e| CoreError::Secret(format!("failed to create index entry: {e}")))?;
         match entry.get_password() {
-            Ok(json) => serde_json::from_str(&json)
-                .map_err(|e| CoreError::Secret(format!("corrupted key index: {e}"))),
-            Err(keyring::Error::NoEntry) => Ok(BTreeMap::new()),
+            Ok(json) => {
+                // Try new format (array) first, fall back to legacy (object with null values)
+                if let Ok(set) = serde_json::from_str::<BTreeSet<String>>(&json) {
+                    return Ok(set);
+                }
+                // Legacy format: {"key": null, ...} → extract keys
+                let map: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(&json)
+                        .map_err(|e| CoreError::Secret(format!("corrupted key index: {e}")))?;
+                Ok(map.keys().cloned().collect())
+            }
+            Err(keyring::Error::NoEntry) => Ok(BTreeSet::new()),
             Err(e) => Err(CoreError::Secret(format!("failed to read key index: {e}"))),
         }
     }
 
     /// Save the key index for a service.
-    fn save_index(&self, service: &str, index: &BTreeMap<String, ()>) -> Result<(), CoreError> {
+    fn save_index(service: &str, index: &BTreeSet<String>) -> Result<(), CoreError> {
         let entry = keyring::Entry::new(service, INDEX_KEY)
             .map_err(|e| CoreError::Secret(format!("failed to create index entry: {e}")))?;
         let json = serde_json::to_string(index)
@@ -1573,9 +1587,9 @@ impl SecretStore for KeyringStore {
             .set_password(&json)
             .map_err(|e| CoreError::Secret(format!("failed to set secret: {e}")))?;
 
-        let mut index = self.load_index(service)?;
-        index.insert(key.to_string(), ());
-        self.save_index(service, &index)?;
+        let mut index = Self::load_index(service)?;
+        index.insert(key.to_string());
+        Self::save_index(service, &index)?;
 
         Ok(())
     }
@@ -1590,17 +1604,17 @@ impl SecretStore for KeyringStore {
             other => CoreError::Secret(format!("failed to delete secret: {other}")),
         })?;
 
-        let mut index = self.load_index(service)?;
+        let mut index = Self::load_index(service)?;
         index.remove(key);
-        self.save_index(service, &index)?;
+        Self::save_index(service, &index)?;
 
         Ok(())
     }
 
     fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
-        let index = self.load_index(service)?;
+        let index = Self::load_index(service)?;
         Ok(index
-            .keys()
+            .iter()
             .map(|key| SecretSummary {
                 key: key.clone(),
                 service: service.to_string(),
@@ -1672,7 +1686,7 @@ impl VaultFileLock {
             .truncate(false)
             .write(true)
             .open(&lock_path)
-            .map_err(|e| CoreError::Io(e))?;
+            .map_err(CoreError::Io)?;
 
         Self::flock_shared(&file, &lock_path)?;
         Ok(Self { _file: file })
@@ -1686,7 +1700,7 @@ impl VaultFileLock {
             .truncate(false)
             .write(true)
             .open(&lock_path)
-            .map_err(|e| CoreError::Io(e))?;
+            .map_err(CoreError::Io)?;
 
         Self::flock_exclusive(&file, &lock_path)?;
         Ok(Self { _file: file })
@@ -1786,10 +1800,11 @@ pub fn list_environments() -> Result<Vec<String>, CoreError> {
     for entry in entries {
         let entry = entry.map_err(CoreError::Io)?;
         let path = entry.path();
-        if path.is_dir() && path.join(VAULT_FILENAME).exists() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                envs.push(name.to_string());
-            }
+        if path.is_dir()
+            && path.join(VAULT_FILENAME).exists()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+        {
+            envs.push(name.to_string());
         }
     }
     envs.sort();

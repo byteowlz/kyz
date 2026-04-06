@@ -35,21 +35,21 @@ fn try_main() -> Result<()> {
 
     match cli.command {
         Command::Set(cmd) => handle_set(&ctx, cmd),
-        Command::Get(cmd) => handle_get(&ctx, cmd),
-        Command::Delete(cmd) => handle_delete(&ctx, cmd),
-        Command::List(cmd) => handle_list(&ctx, cmd),
-        Command::Export(cmd) => handle_export(&ctx, cmd),
-        Command::Import(cmd) => handle_import(&ctx, cmd),
+        Command::Get(cmd) => handle_get(&ctx, &cmd),
+        Command::Delete(cmd) => handle_delete(&ctx, &cmd),
+        Command::List(cmd) => handle_list(&ctx, &cmd),
+        Command::Export(cmd) => handle_export(&ctx, &cmd),
+        Command::Import(cmd) => handle_import(&ctx, &cmd),
         Command::Vault { command } => handle_vault(&ctx, command),
         Command::Env(_) => handle_env(&ctx),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
-        Command::Scan(cmd) => handle_scan(&ctx, cmd),
-        Command::History(cmd) => handle_history(&ctx, cmd),
-        Command::Rollback(cmd) => handle_rollback(&ctx, cmd),
+        Command::Scan(cmd) => handle_scan(&ctx, &cmd),
+        Command::History(cmd) => handle_history(&ctx, &cmd),
+        Command::Rollback(cmd) => handle_rollback(&ctx, &cmd),
         Command::Exec(cmd) => handle_exec(&ctx, cmd),
-        Command::Pipe(cmd) => handle_pipe(&ctx, cmd),
-        Command::Wrap(cmd) => handle_wrap(&ctx, cmd),
+        Command::Pipe(cmd) => handle_pipe(&ctx, &cmd),
+        Command::Wrap(cmd) => handle_wrap(&ctx, &cmd),
         Command::Completions { shell } => {
             handle_completions(shell);
             Ok(())
@@ -370,7 +370,7 @@ struct ExecCommand {
     #[arg(long, short = 'a', value_name = "ALIAS")]
     alias: Option<String>,
 
-    /// Explicit env mapping: ENV_VAR=service/key:field (repeatable).
+    /// Explicit env mapping: `ENV_VAR=service/key:field` (repeatable).
     #[arg(long = "env", short = 'e', value_name = "ENV=SERVICE/KEY:FIELD")]
     env_maps: Vec<String>,
 
@@ -549,14 +549,14 @@ impl RuntimeContext {
 
 fn handle_vault(ctx: &RuntimeContext, command: VaultCommand) -> Result<()> {
     match command {
-        VaultCommand::Create(cmd) => handle_vault_create(ctx, cmd),
-        VaultCommand::Unlock(cmd) => handle_vault_unlock(ctx, cmd),
+        VaultCommand::Create(cmd) => handle_vault_create(ctx, &cmd),
+        VaultCommand::Unlock(cmd) => handle_vault_unlock(ctx, &cmd),
         VaultCommand::Lock => handle_vault_lock(ctx),
         VaultCommand::Status => handle_vault_status(ctx),
     }
 }
 
-fn handle_vault_create(ctx: &RuntimeContext, cmd: VaultCreateCommand) -> Result<()> {
+fn handle_vault_create(ctx: &RuntimeContext, cmd: &VaultCreateCommand) -> Result<()> {
     let store = ctx.vault_store()?;
 
     let passphrase = prompt_new_passphrase()?;
@@ -579,7 +579,7 @@ fn handle_vault_create(ctx: &RuntimeContext, cmd: VaultCreateCommand) -> Result<
     Ok(())
 }
 
-fn handle_vault_unlock(ctx: &RuntimeContext, cmd: VaultUnlockCommand) -> Result<()> {
+fn handle_vault_unlock(ctx: &RuntimeContext, cmd: &VaultUnlockCommand) -> Result<()> {
     let store = ctx.vault_store()?;
 
     let passphrase = prompt_passphrase("Vault passphrase: ")?;
@@ -724,13 +724,13 @@ fn fields_to_plain(fields: &BTreeMap<String, SecretString>) -> BTreeMap<String, 
 
 fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
     // Build fields from --field args or fallback to positional value
-    let fields = if !cmd.fields.is_empty() {
-        parse_fields(&cmd.fields)?
-    } else {
+    let fields = if cmd.fields.is_empty() {
         let value = read_secret_value(cmd.value.as_deref())?;
         let mut m = BTreeMap::new();
         m.insert("value".to_string(), SecretString::from(value));
         m
+    } else {
+        parse_fields(&cmd.fields)?
     };
 
     let tags: BTreeSet<String> = cmd.tags.into_iter().collect();
@@ -763,7 +763,7 @@ fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
     Ok(())
 }
 
-fn handle_get(ctx: &RuntimeContext, cmd: GetCommand) -> Result<()> {
+fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
     // No-read mode: block secret retrieval in wrapped agent sessions
     if std::env::var("KYZ_NO_READ").is_ok() {
         kyz_core::audit::audit(
@@ -834,7 +834,7 @@ fn handle_get(ctx: &RuntimeContext, cmd: GetCommand) -> Result<()> {
     Ok(())
 }
 
-fn handle_delete(ctx: &RuntimeContext, cmd: DeleteCommand) -> Result<()> {
+fn handle_delete(ctx: &RuntimeContext, cmd: &DeleteCommand) -> Result<()> {
     if ctx.common.dry_run {
         info!(
             "dry-run: would delete secret '{}' from service '{}'",
@@ -857,7 +857,7 @@ fn handle_delete(ctx: &RuntimeContext, cmd: DeleteCommand) -> Result<()> {
     Ok(())
 }
 
-fn handle_list(ctx: &RuntimeContext, cmd: ListCommand) -> Result<()> {
+fn handle_list(ctx: &RuntimeContext, cmd: &ListCommand) -> Result<()> {
     let store = ctx.secret_store()?;
     let entries = store.list(&cmd.service).map_err(|e| anyhow!("{e}"))?;
 
@@ -893,7 +893,7 @@ fn handle_list(ctx: &RuntimeContext, cmd: ListCommand) -> Result<()> {
     Ok(())
 }
 
-fn handle_scan(ctx: &RuntimeContext, cmd: ScanCommand) -> Result<()> {
+fn handle_scan(ctx: &RuntimeContext, cmd: &ScanCommand) -> Result<()> {
     use kyz_core::scan;
 
     let store = ctx.vault_store()?;
@@ -971,7 +971,7 @@ fn parse_secret_ref<'a>(secret: &'a str, default_service: &'a str) -> (&'a str, 
     secret.split_once('/').unwrap_or((default_service, secret))
 }
 
-fn handle_history(ctx: &RuntimeContext, cmd: HistoryCommand) -> Result<()> {
+fn handle_history(ctx: &RuntimeContext, cmd: &HistoryCommand) -> Result<()> {
     let (service, key) = parse_secret_ref(&cmd.secret, &cmd.service);
     let store = ctx.vault_store()?;
     let vault = store.read_vault_file_pub()?;
@@ -1071,7 +1071,7 @@ fn handle_history(ctx: &RuntimeContext, cmd: HistoryCommand) -> Result<()> {
     Ok(())
 }
 
-fn handle_rollback(ctx: &RuntimeContext, cmd: RollbackCommand) -> Result<()> {
+fn handle_rollback(ctx: &RuntimeContext, cmd: &RollbackCommand) -> Result<()> {
     let (service, key) = parse_secret_ref(&cmd.secret, &cmd.service);
 
     if ctx.common.dry_run {
@@ -1132,7 +1132,7 @@ fn handle_env(ctx: &RuntimeContext) -> Result<()> {
     Ok(())
 }
 
-fn handle_export(ctx: &RuntimeContext, cmd: ExportCommand) -> Result<()> {
+fn handle_export(ctx: &RuntimeContext, cmd: &ExportCommand) -> Result<()> {
     if std::env::var("KYZ_NO_READ").is_ok() {
         return Err(anyhow!(
             "export blocked: running in no-read mode (KYZ_NO_READ is set)"
@@ -1175,18 +1175,15 @@ fn handle_export(ctx: &RuntimeContext, cmd: ExportCommand) -> Result<()> {
     Ok(())
 }
 
-fn handle_import(ctx: &RuntimeContext, cmd: ImportCommand) -> Result<()> {
-    let json_str = match cmd.file {
-        Some(ref path) => {
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
-        }
-        None => {
-            let mut buf = String::new();
-            io::stdin()
-                .read_to_string(&mut buf)
-                .context("reading from stdin")?;
-            buf
-        }
+fn handle_import(ctx: &RuntimeContext, cmd: &ImportCommand) -> Result<()> {
+    let json_str = if let Some(ref path) = cmd.file {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading from stdin")?;
+        buf
     };
 
     let data: serde_json::Value = serde_json::from_str(&json_str).context("parsing import JSON")?;
@@ -1555,58 +1552,30 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:3000";
 
 /// Resolve secrets via the remote kyz-api auth flow (headless/no-TTY mode).
 ///
+/// Submit an auth request and wait for approval via WebSocket.
+///
 /// 1. Collects the secret scopes needed from alias/tags/secrets
-/// 2. Creates an auth request via POST /auth/request
-/// 3. Waits via WebSocket /auth/wait/:id for approval
+/// 2. Creates an auth request via POST `/auth/request`
+/// 3. Waits via WebSocket `/auth/wait/:id` for approval
 /// 4. On approval, the secrets are delivered in the response
-fn resolve_exec_env_headless(
-    ctx: &RuntimeContext,
-    cmd: &ExecCommand,
-) -> Result<BTreeMap<String, String>> {
-    let api_url = std::env::var("KYZ_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
-    let api_token = std::env::var("KYZ_API_TOKEN").ok();
-
-    // 1. Collect scopes from alias/tags/secrets/env_maps
-    let mut scopes: Vec<String> = Vec::new();
-
-    if let Some(ref alias_name) = cmd.alias {
-        let alias = ctx
-            .config
-            .aliases
-            .get(alias_name)
-            .ok_or_else(|| anyhow!("alias '{alias_name}' not found in config"))?;
-        scopes.extend(alias.secrets.clone());
-        // env_map values are field refs like "service/key:field"
-        for field_ref in alias.env_map.values() {
-            scopes.push(field_ref.clone());
-        }
-    }
-    scopes.extend(cmd.secrets.clone());
-    for mapping in &cmd.env_maps {
-        if let Some((_, field_ref)) = mapping.split_once('=') {
-            scopes.push(field_ref.to_string());
-        }
-    }
-
-    if scopes.is_empty() {
-        return Err(anyhow!(
-            "headless mode requires explicit secret scopes (--alias, --secret, or --env)"
-        ));
-    }
-
-    // 2. Create auth request
+fn submit_and_wait_auth_request(
+    api_url: &str,
+    api_token: Option<&String>,
+    scopes: &[String],
+    reason: &str,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
     let requester = std::env::var("KYZ_REQUESTER")
         .unwrap_or_else(|_| format!("kyz-exec-{}", std::process::id()));
 
     let create_body = serde_json::json!({
         "requester": requester,
         "scopes": scopes,
-        "reason": format!("kyz exec headless: {:?}", cmd.command),
+        "reason": reason,
         "ttl_seconds": 300
     });
 
     let mut req = ureq::post(&format!("{api_url}/auth/request"));
-    if let Some(ref token) = api_token {
+    if let Some(token) = api_token {
         req = req.header("Authorization", &format!("Bearer {token}"));
     }
 
@@ -1624,7 +1593,7 @@ fn resolve_exec_env_headless(
     eprintln!("⏳ Waiting for approval of auth request: {request_id}");
     eprintln!("   Approve at: {api_url}/auth/approve/{request_id}");
 
-    // 3. Wait via WebSocket
+    // Wait via WebSocket
     let ws_url = format!(
         "{}/auth/wait/{request_id}",
         api_url
@@ -1648,7 +1617,7 @@ fn resolve_exec_env_headless(
             tungstenite::Message::Close(_) => {
                 return Err(anyhow!("WebSocket closed without status update"));
             }
-            _ => continue,
+            _ => {}
         }
     };
 
@@ -1656,9 +1625,9 @@ fn resolve_exec_env_headless(
         return Err(anyhow!("auth request {request_id} was {status}"));
     }
 
-    // 4. Pick up secrets (one-time)
+    // Pick up secrets (one-time)
     let mut pickup_req = ureq::get(&format!("{api_url}/auth/secrets/{request_id}"));
-    if let Some(ref token) = api_token {
+    if let Some(token) = api_token {
         pickup_req = pickup_req.header("Authorization", &format!("Bearer {token}"));
     }
 
@@ -1674,19 +1643,57 @@ fn resolve_exec_env_headless(
         stashed.len()
     );
 
-    // 5. Flatten into env vars
+    Ok(stashed)
+}
+
+fn resolve_exec_env_headless(
+    ctx: &RuntimeContext,
+    cmd: &ExecCommand,
+) -> Result<BTreeMap<String, String>> {
+    let api_url = std::env::var("KYZ_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+    let api_token = std::env::var("KYZ_API_TOKEN").ok();
+
+    // 1. Collect scopes from alias/tags/secrets/env_maps
+    let mut scopes: Vec<String> = Vec::new();
+
+    if let Some(ref alias_name) = cmd.alias {
+        let alias = ctx
+            .config
+            .aliases
+            .get(alias_name)
+            .ok_or_else(|| anyhow!("alias '{alias_name}' not found in config"))?;
+        scopes.extend(alias.secrets.clone());
+        for field_ref in alias.env_map.values() {
+            scopes.push(field_ref.clone());
+        }
+    }
+    scopes.extend(cmd.secrets.clone());
+    for mapping in &cmd.env_maps {
+        if let Some((_, field_ref)) = mapping.split_once('=') {
+            scopes.push(field_ref.to_string());
+        }
+    }
+
+    if scopes.is_empty() {
+        return Err(anyhow!(
+            "headless mode requires explicit secret scopes (--alias, --secret, or --env)"
+        ));
+    }
+
+    let reason = format!("kyz exec headless: {:?}", cmd.command);
+    let stashed = submit_and_wait_auth_request(&api_url, api_token.as_ref(), &scopes, &reason)?;
+
+    // Flatten into env vars
     let mut env = BTreeMap::new();
 
     // Apply alias env_map if present
-    if let Some(ref alias_name) = cmd.alias {
-        if let Some(alias) = ctx.config.aliases.get(alias_name) {
-            for (env_var, field_ref) in &alias.env_map {
-                // Look up field_ref in stashed secrets
-                if let Some(values) = stashed.get(field_ref) {
-                    // field_ref is "service/key:field", values has {field: value}
-                    for v in values.values() {
-                        env.insert(env_var.clone(), v.clone());
-                    }
+    if let Some(ref alias_name) = cmd.alias
+        && let Some(alias) = ctx.config.aliases.get(alias_name)
+    {
+        for (env_var, field_ref) in &alias.env_map {
+            if let Some(values) = stashed.get(field_ref) {
+                for v in values.values() {
+                    env.insert(env_var.clone(), v.clone());
                 }
             }
         }
@@ -1694,17 +1701,17 @@ fn resolve_exec_env_headless(
 
     // Apply explicit --env mappings
     for mapping in &cmd.env_maps {
-        if let Some((var, field_ref)) = mapping.split_once('=') {
-            if let Some(values) = stashed.get(field_ref) {
-                for v in values.values() {
-                    env.insert(var.to_string(), v.clone());
-                }
+        if let Some((var, field_ref)) = mapping.split_once('=')
+            && let Some(values) = stashed.get(field_ref)
+        {
+            for v in values.values() {
+                env.insert(var.to_string(), v.clone());
             }
         }
     }
 
     // Default: uppercase field names for any remaining secrets
-    for (_scope, values) in &stashed {
+    for values in stashed.values() {
         for (field_name, field_value) in values {
             let env_var = field_name.to_uppercase();
             env.entry(env_var).or_insert_with(|| field_value.clone());
@@ -1747,7 +1754,7 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
             program,
             args
         );
-        for (k, _) in &env {
+        for k in env.keys() {
             println!("{k}=***");
         }
         return Ok(());
@@ -1757,7 +1764,7 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
     let pol = kyz_core::resolve_policy(cmd.policy.as_deref(), cmd.no_policy)
         .map_err(|e| anyhow!("{e}"))?;
 
-    let secret_names: Vec<String> = cmd.secrets.clone();
+    let secret_names: Vec<String> = cmd.secrets;
     if let Err(v) = pol.check_all(&program, &args, &secret_names) {
         kyz_core::audit::audit_policy_violation(&program, &v.to_string());
         return Err(anyhow!("{v}"));
@@ -1778,7 +1785,7 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
             .envs(&env)
             .exec();
         // exec() only returns on error
-        return Err(anyhow!("failed to exec '{}': {}", program, err));
+        Err(anyhow!("failed to exec '{program}': {err}"))
     }
 
     #[cfg(not(unix))]
@@ -1800,19 +1807,24 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
 /// 1. `-c 'shell command string'` -> runs via `sh -c "..."`
 /// 2. Trailing positional args (`-- cmd arg1 arg2`)
 fn resolve_exec_command(cmd: &ExecCommand) -> Result<(String, Vec<String>)> {
-    if let Some(ref shell_cmd) = cmd.shell_command {
-        // Determine the shell to use ($SHELL or fallback to sh)
-        let shell = env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-        Ok((shell, vec!["-c".to_string(), shell_cmd.clone()]))
-    } else if cmd.command.is_empty() {
-        Err(anyhow!(
-            "no command specified; use -c 'command' or -- command [args...]"
-        ))
-    } else {
-        let program = cmd.command[0].clone();
-        let args = cmd.command[1..].to_vec();
-        Ok((program, args))
-    }
+    cmd.shell_command.as_ref().map_or_else(
+        || {
+            if cmd.command.is_empty() {
+                Err(anyhow!(
+                    "no command specified; use -c 'command' or -- command [args...]"
+                ))
+            } else {
+                let program = cmd.command[0].clone();
+                let args = cmd.command[1..].to_vec();
+                Ok((program, args))
+            }
+        },
+        |shell_cmd| {
+            // Determine the shell to use ($SHELL or fallback to sh)
+            let shell = env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+            Ok((shell, vec!["-c".to_string(), shell_cmd.clone()]))
+        },
+    )
 }
 
 /// Sensitive env var prefixes/names to strip from child processes.
@@ -1830,7 +1842,7 @@ fn scrubbed_env() -> Vec<(String, String)> {
         .collect()
 }
 
-fn handle_pipe(ctx: &RuntimeContext, cmd: PipeCommand) -> Result<()> {
+fn handle_pipe(ctx: &RuntimeContext, cmd: &PipeCommand) -> Result<()> {
     let store = ctx.secret_store()?;
 
     // Parse secret reference: "service/key" or "service/key:field"
@@ -1917,12 +1929,15 @@ fn handle_pipe(ctx: &RuntimeContext, cmd: PipeCommand) -> Result<()> {
 
     let status = child.wait().context("failed to wait for child process")?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(anyhow!(
+            "child process exited with code {}",
+            status.code().unwrap_or(1)
+        ));
     }
     Ok(())
 }
 
-fn handle_wrap(ctx: &RuntimeContext, cmd: WrapCommand) -> Result<()> {
+fn handle_wrap(ctx: &RuntimeContext, cmd: &WrapCommand) -> Result<()> {
     let store = ctx.secret_store()?;
     let allow_all = cmd.allow.len() == 1 && cmd.allow[0] == "*";
 
@@ -1978,14 +1993,14 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: WrapCommand) -> Result<()> {
     }
 
     // Create a temporary policy file scoping to allowed secrets
-    let temp_policy = if !allow_all {
+    let temp_policy = if allow_all {
+        None
+    } else {
         let policy = build_wrap_policy(&cmd.allow);
         let tmp = tempfile::NamedTempFile::new().context("creating temp policy file")?;
         std::fs::write(tmp.path(), &policy).context("writing temp policy")?;
         child_env.push(("KYZ_POLICY".to_string(), tmp.path().display().to_string()));
         Some(tmp)
-    } else {
-        None
     };
 
     eprintln!(
@@ -2012,7 +2027,10 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: WrapCommand) -> Result<()> {
     drop(temp_policy);
 
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(anyhow!(
+            "wrapped process exited with code {}",
+            status.code().unwrap_or(1)
+        ));
     }
     Ok(())
 }
