@@ -1,114 +1,54 @@
-# Rust Workspace Template
+# kyz
 
-A batteries-included Rust workspace template with CLI, TUI, MCP server, and HTTP API crates sharing a common core library.
+A cross-platform secrets manager with CLI, TUI, API server, and MCP server. Secrets are stored in an age-encrypted vault with timed unlock sessions, policy-controlled injection, and audit logging.
 
-## Quick Start
+## Install
 
 Install the latest stable Rust toolchain (`rustup default stable`), then:
 
 ```bash
-cargo build
-cargo test
+cargo install --path crates/kyz-cli
 ```
 
-Run individual binaries:
+Or build everything:
 
 ```bash
-cargo run -p kyz-cli -- run
-cargo run -p kyz-tui
-cargo run -p kyz-api -- --port 3000
-cargo run -p kyz-mcp
+cargo build --release
 ```
 
-Scaffold a new project:
+## Quick Start
 
 ```bash
-scripts/new-cli.sh my-app
+# Create config directories and default files
+kyz init
+
+# Create a new encrypted vault
+kyz vault create
+
+# Store a secret
+kyz set my-api-key "sk-abc123" --service github
+
+# Store a multi-field secret
+kyz set db-creds --service postgres -f host=localhost -f user=admin -f password=secret
+
+# Retrieve a secret
+kyz get my-api-key --service github
+
+# Retrieve a single field
+kyz get db-creds --service postgres -f password
+
+# List secrets in a namespace
+kyz list --service github
+
+# Tag secrets for group injection
+kyz set deploy-key --service github -f token=ghp_xxx --tag deploy --tag ci
 ```
 
-```powershell
-pwsh scripts/new-cli.ps1 my-app
-```
-
-This creates a new workspace with all crates renamed (e.g., `my-app-core`, `my-app-cli`, etc.).
-
-## Workspace Structure
-
-```
-crates/
-  kyz-core/    # Shared library: config, paths, error types
-  kyz-cli/     # Command-line interface
-  kyz-tui/     # Terminal user interface (ratatui)
-  kyz-mcp/     # Model Context Protocol server
-  kyz-api/     # HTTP API server (axum)
-examples/
-  config.toml   # Example configuration
-scripts/
-  new-cli.sh    # Unix scaffolding script
-  new-cli.ps1   # PowerShell scaffolding script
-```
-
-## Crates
-
-### kyz-core
-
-Shared library providing:
-- `AppConfig` - Configuration loading via `config` crate
-- `AppPaths` - XDG-compliant path resolution
-- Error types and common utilities
-
-### kyz-cli
-
-Command-line interface with:
-- Subcommands: `run`, `init`, `config`, `completions`
-- Global flags: `-q`, `-v`, `--debug`, `--trace`, `--json`, `--yaml`, `--no-color`, `--dry-run`, `--yes`
-- Shell completion generation
-
-```bash
-cargo run -p kyz-cli -- --help
-cargo run -p kyz-cli -- completions bash > target/kyz-cli.bash
-```
-
-### kyz-tui
-
-Terminal UI built with ratatui featuring:
-- Three-pane layout (navigation, list, details)
-- Vim-style navigation (j/k/h/l)
-- Modal help system
-
-```bash
-cargo run -p kyz-tui
-```
-
-### kyz-mcp
-
-MCP (Model Context Protocol) server exposing tools:
-- `get_profile` - Current configuration profile
-- `echo` - Echo messages
-- `get_runtime_config` - Runtime configuration
-
-```bash
-cargo run -p kyz-mcp
-```
-
-### kyz-api
-
-HTTP API server (axum) with endpoints:
-- `GET /` - Service info
-- `GET /health` - Health check
-- `GET /config` - Current configuration
-
-```bash
-cargo run -p kyz-api -- --port 3000
-curl http://localhost:3000/health
-```
-
-Optional API auth:
-- Set `KYZ_API_TOKEN` to require `Authorization: Bearer <token>` on all endpoints except `/health`.
+## Secret Injection
 
 ### kyz exec
 
-Wrap any command with secrets injected as environment variables:
+Wrap a command with secrets injected as environment variables:
 
 ```bash
 # Using a config alias
@@ -127,7 +67,26 @@ kyz exec --tag dev -- cargo test
 kyz exec --pick -- ./my-app
 ```
 
-#### Aliases in config.toml
+### kyz pipe
+
+Pipe a single secret into a command's stdin (never touches env or args):
+
+```bash
+kyz pipe github/deploy-key:token -- docker login --password-stdin
+```
+
+### kyz wrap
+
+Wrap an agent or long-running process with pre-approved secret access and policy enforcement:
+
+```bash
+kyz wrap --allow github/deploy-key,aws/prod -- ./agent.sh
+kyz wrap --allow '*' -- ./trusted-script.sh
+```
+
+### Aliases
+
+Define reusable secret sets in `config.toml`:
 
 ```toml
 [aliases.deploy]
@@ -139,11 +98,133 @@ env_map = { GITHUB_TOKEN = "github/deploy-key:token" }
 tags = ["dev"]
 ```
 
-#### Secret tags
+## Vault
+
+Secrets are stored in an age-encrypted vault file. The vault uses timed unlock sessions so the passphrase is entered once, then cached for a configurable duration.
 
 ```bash
-kyz set deploy-key --service github -f token=ghp_xxx --tag deploy --tag ci
+kyz vault create          # Create a new vault
+kyz vault unlock          # Unlock (default: 30 minutes)
+kyz vault unlock --timeout 3600  # Unlock for 1 hour
+kyz vault lock            # Lock immediately
+kyz vault status          # Show lock state and session info
 ```
+
+## Policy Engine
+
+kyz enforces command policies when injecting secrets. Policies block dangerous commands that could exfiltrate secret values (e.g., `cat`, `echo`, `env`).
+
+Policy files are discovered from:
+1. `.kyz-policy.json` in the current directory
+2. `.kyz-policy.json` in the workspace root
+3. `$XDG_CONFIG_HOME/kyz/policy.json`
+
+```json
+{
+  "deny_commands": ["cat", "echo", "env", "printenv"],
+  "allow_commands": [],
+  "deny_args": ["-c", "eval"],
+  "secrets": {
+    "prod/db-password": {
+      "allow_commands": ["psql", "pg_dump"]
+    }
+  }
+}
+```
+
+Bypass with `--no-policy` (use with caution).
+
+## Audit Logging
+
+All secret access through `exec`, `pipe`, and `wrap` is logged to syslog with operation type, secret names, and target commands.
+
+## Import / Export
+
+```bash
+# Export secrets as JSON
+kyz export --service github > secrets.json
+
+# Import from file or stdin
+kyz import secrets.json
+cat secrets.json | kyz import -
+```
+
+## Workspace Structure
+
+```
+crates/
+  kyz-core/    # Shared library: config, paths, vault, store, policy, audit
+  kyz-cli/     # Command-line interface
+  kyz-tui/     # Terminal user interface (ratatui)
+  kyz-mcp/     # Model Context Protocol server
+  kyz-api/     # HTTP API server (axum)
+```
+
+### kyz-core
+
+Shared library providing:
+- Age-encrypted vault backend with timed sessions
+- OS keyring backend (desktop sessions)
+- `SecretStore` trait abstracting both backends
+- Multi-field secret entries with tags
+- XDG-compliant path resolution
+- Configuration loading via `config` crate
+- Command policy engine
+- Audit logging
+- Auth request flow for headless/remote use
+
+### kyz-cli
+
+Command-line interface with subcommands: `set`, `get`, `delete`, `list`, `export`, `import`, `vault`, `exec`, `pipe`, `wrap`, `init`, `config`, `completions`.
+
+Global flags: `-q`, `-v`, `--debug`, `--trace`, `--json`, `--yaml`, `--no-color`, `--dry-run`, `--yes`.
+
+```bash
+kyz --help
+kyz completions bash > ~/.local/share/bash-completion/completions/kyz
+```
+
+### kyz-tui
+
+Terminal UI built with ratatui:
+- Three-pane layout (navigation, list, details)
+- Vim-style navigation (j/k/h/l)
+- Modal help system
+
+```bash
+kyz-tui
+```
+
+### kyz-mcp
+
+MCP (Model Context Protocol) server for LLM tool integration:
+
+```bash
+kyz-mcp
+```
+
+### kyz-api
+
+HTTP API server (axum) with auth request workflow for headless agents:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` | GET | Service info |
+| `/health` | GET | Health check |
+| `/config` | GET | Current configuration |
+| `/auth/request` | POST | Create an auth request |
+| `/auth/request` | GET | List auth requests |
+| `/auth/request/{id}` | GET | Get auth request status |
+| `/auth/approve/{id}` | POST | Approve an auth request |
+| `/auth/deny/{id}` | POST | Deny an auth request |
+| `/auth/secrets/{id}` | GET | Pick up approved secrets |
+| `/auth/wait/{id}` | GET | WebSocket wait for approval |
+
+```bash
+kyz-api --port 3000
+```
+
+Set `KYZ_API_TOKEN` to require `Authorization: Bearer <token>` on all endpoints except `/health`.
 
 ## Configuration
 
@@ -152,7 +233,17 @@ Default config path: `$XDG_CONFIG_HOME/kyz/config.toml` (fallback: `~/.config/ky
 Override with `--config <path>` or environment variables using the `KYZ__` prefix:
 
 ```bash
-KYZ__LOGGING__LEVEL=debug cargo run -p kyz-cli -- run
+KYZ__LOGGING__LEVEL=debug kyz list
+```
+
+Manage configuration:
+
+```bash
+kyz config show     # Print current config
+kyz config path     # Print config file path
+kyz config paths    # Print all resolved paths
+kyz config schema   # Print JSON schema
+kyz config reset    # Reset to defaults
 ```
 
 See `examples/config.toml` for all options.
@@ -161,23 +252,11 @@ See `examples/config.toml` for all options.
 
 ```bash
 cargo fmt                                    # Format code
-cargo clippy --all-targets --all-features   # Lint
+cargo clippy --all-targets --all-features    # Lint
 cargo test                                   # Run tests
 cargo build --release                        # Release build
 ```
 
-## Scaffolding
+## License
 
-The `scripts/new-cli.sh` (Unix) and `scripts/new-cli.ps1` (PowerShell) scripts create a new project from this template:
-
-```bash
-scripts/new-cli.sh my-app --path ~/projects/my-app
-```
-
-This will:
-1. Copy the template to the destination
-2. Rename all crates from `rust-*` to `my-app-*`
-3. Update all references in Cargo.toml, source files, and documentation
-4. Rename crate directories accordingly
-
-Requirements: `python3` for the shell script, PowerShell 7 for the Windows script.
+MIT
