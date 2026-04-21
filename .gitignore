@@ -1,3 +1,4 @@
+.claude/
 /target
 .env 
 .DS_Store

@@ -2,6 +2,53 @@
 
 ## Open
 
+### [trx-2c3j.5] Formalize headless unlock modes and service-friendly lifecycle semantics (P1, task)
+Formalize headless unlock behavior so applications and operators can reason clearly about workstation, headless service, and remote approval modes.
+
+Problem
+- kyz already has useful pieces (vault sessions, keyring/keyutils-backed unlock state, headless auth request flow), but the operational model is still implicit.
+- Integrators need a documented and supported story for when auto-unlock is acceptable, when interactive unlock is required, and how unlock state behaves over runner/service restarts.
+...
+
+
+### [trx-2c3j.4] Add layered resolver API for workspace-first / personal-fallback lookups (P1, task)
+Add a reusable layered resolver API so applications can resolve refs across multiple vault sources without re-implementing precedence logic themselves.
+
+Problem
+- Integrations like Oqto need a predictable lookup model: workspace vault first, personal/user vault fallback.
+- This pattern is generally useful and should live in a reusable library layer, not be duplicated in every consumer.
+...
+
+
+### [trx-2c3j.3] Add first-class SSH identity metadata and listing helpers (P1, feature)
+Add first-class support for SSH identity discovery/metadata so consumers can safely list and select SSH-capable entries without manually parsing arbitrary secret payloads.
+
+Important boundary
+- Metadata must be optional.
+- kyz must remain useful standalone with generic secrets.
+...
+
+
+### [trx-2c3j.2] Add brokered scoped-session API to avoid vault passphrase in child env (P1, feature)
+Add a brokered/scoped-session access mode so wrapped processes and app integrations do not need `KYZ_VAULT_PASSWORD` or equivalent raw unlock material in their environment.
+
+Problem
+- Current `kyz exec` path injects `KYZ_VAULT_PASSWORD` into the child env.
+- That is acceptable for some CLI workflows but too weak as a trust boundary for agent/harness integrations.
+...
+
+
+### [trx-2c3j.1] Create higher-level library crate for app integrations (over kyz-core) (P1, feature)
+Add a stable higher-level library crate (name TBD: `kyz-runtime`, `kyz-resolver`, or `kyz-integration`) that applications can link against directly instead of shelling out to `kyz-cli`.
+
+Problem
+- `kyz-core` is a good primitive layer but is too low-level for consumers like Oqto.
+- CLI integration is brittle (stdout parsing, process orchestration, awkward unlock/session handling).
+...
+
+
+### [trx-2c3j] Library/runtime integration surface for brokered secret access (P1, epic)
+
 ### [trx-7wnq.3] SSH wrapper mediation contract for alias-compatible agent UX (P1, task)
 Define and implement wrapper/proxy contract so agents can use ssh alias commands while key material stays in kyz-managed trusted path. Include alias resolution, per-host approval checks, and auditing.
 
@@ -29,6 +76,15 @@ Basic secret CRUD using OS keyring (gnome-keyring, macOS Keychain, Windows Crede
 
 ### [trx-092h] Cross-platform secrets manager CLI with P2P sync (P1, epic)
 Lean FOSS secrets manager. keyring crate for OS-native storage, age encryption for portable vaults, iroh/libp2p for serverless P2P sync between devices.
+
+### [trx-2c3j.6] Explore direct SSH signing API for kyz-managed identities (P2, task)
+Research and, if feasible, prototype a direct signing API for SSH-capable identities so applications can request signatures without handling raw private key material beyond the kyz boundary.
+
+Why
+- Longer-term integrations may want a kyz-managed SSH signer instead of depending on the user's ambient ssh-agent.
+- This is especially relevant for service/workspace keys and future brokered SSH mediation.
+...
+
 
 ### [trx-8dbe.5] Design agent-scoped OAuth alias/capability model for surgical token access (P2, feature)
 
