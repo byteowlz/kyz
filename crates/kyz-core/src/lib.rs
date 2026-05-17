@@ -11,6 +11,7 @@
 //! - Vault session management (unlock/lock lifecycle)
 //! - Common types and error handling
 
+pub mod agent_ctx;
 pub mod audit;
 pub mod auth_request;
 pub mod config;
@@ -21,6 +22,7 @@ pub mod scan;
 pub mod schema;
 pub mod store;
 
+pub use agent_ctx::{AgentContext, RunMode};
 pub use auth_request::{
     AuthRequest, AuthRequestEvent, AuthRequestId, AuthRequestStatus, AuthRequestStore,
     CreateAuthRequest, DenyAuthRequest,

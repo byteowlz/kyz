@@ -851,3 +851,45 @@ fn vault_store_multi_field_entry() {
 
     cleanup(&store, &vault_path);
 }
+
+// ---------------------------------------------------------------------------
+// resolve_with_env: AGENT_CTX_WORKSPACE_PATH defaulting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolve_with_env_uses_workspace_hint_when_vault_present() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let kyz_dir = workspace.path().join(".kyz");
+    std::fs::create_dir_all(&kyz_dir).expect("create .kyz");
+    let vault_file = kyz_dir.join("vault.json");
+    std::fs::write(&vault_file, "{}").expect("seed vault file");
+
+    let store = VaultStore::resolve_with_env(None, None, Some(workspace.path()))
+        .expect("resolve_with_env should succeed");
+    assert_eq!(store.vault_path(), vault_file);
+}
+
+#[test]
+fn resolve_with_env_explicit_vault_wins_over_workspace_hint() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    std::fs::create_dir_all(workspace.path().join(".kyz")).expect("create .kyz");
+    std::fs::write(workspace.path().join(".kyz/vault.json"), "{}").expect("seed vault");
+
+    let explicit = temp_vault_path("explicit-wins");
+    let store = VaultStore::resolve_with_env(Some(&explicit), None, Some(workspace.path()))
+        .expect("resolve");
+    assert_eq!(store.vault_path(), explicit);
+}
+
+#[test]
+fn resolve_with_env_ignores_hint_without_workspace_vault() {
+    // Hint points at a directory with no .kyz/vault.json; resolution must fall
+    // through to cwd/central rather than fabricating a path under the hint.
+    let empty = tempfile::tempdir().expect("empty tempdir");
+    let store = VaultStore::resolve_with_env(None, None, Some(empty.path())).expect("resolve");
+    assert_ne!(
+        store.vault_path(),
+        empty.path().join(".kyz/vault.json"),
+        "hint without an existing vault must not be returned as the resolved path",
+    );
+}

@@ -1201,7 +1201,7 @@ impl VaultStore {
     ///
     /// Returns an error if no vault can be found or paths fail to resolve.
     pub fn resolve(explicit: Option<&Path>) -> Result<Self, CoreError> {
-        Self::resolve_with_env(explicit, None)
+        Self::resolve_with_env(explicit, None, None)
     }
 
     /// Resolve vault path with optional named environment.
@@ -1209,12 +1209,20 @@ impl VaultStore {
     /// When `env_name` is `Some`, the vault is stored under
     /// `$XDG_DATA_HOME/kyz/envs/<name>/vault.json`.
     ///
+    /// `workspace_hint`, when set, is consulted before the process cwd as the
+    /// candidate workspace directory. Callers typically derive this from
+    /// `AGENT_CTX_WORKSPACE_PATH` so wrapped agents whose cwd does not match
+    /// the user's workspace still resolve the expected workspace vault.
+    /// The hint is metadata only; explicit args and named environments still
+    /// take precedence.
+    ///
     /// # Errors
     ///
     /// Returns an error if no vault can be found or paths fail to resolve.
     pub fn resolve_with_env(
         explicit: Option<&Path>,
         env_name: Option<&str>,
+        workspace_hint: Option<&Path>,
     ) -> Result<Self, CoreError> {
         if let Some(p) = explicit {
             return Ok(Self::new(p.to_path_buf()));
@@ -1224,6 +1232,15 @@ impl VaultStore {
         if let Some(name) = env_name {
             let env_vault = env_vault_path(name)?;
             return Ok(Self::new(env_vault));
+        }
+
+        // Prefer the explicit workspace hint (e.g. AGENT_CTX_WORKSPACE_PATH)
+        // over cwd-based discovery.
+        if let Some(hint) = workspace_hint {
+            let hinted = hint.join(WORKSPACE_VAULT_DIR).join(VAULT_FILENAME);
+            if hinted.exists() {
+                return Ok(Self::new(hinted));
+            }
         }
 
         // Check for workspace vault in cwd

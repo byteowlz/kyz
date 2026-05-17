@@ -50,6 +50,7 @@ fn try_main() -> Result<()> {
         Command::Exec(cmd) => handle_exec(&ctx, cmd),
         Command::Pipe(cmd) => handle_pipe(&ctx, &cmd),
         Command::Wrap(cmd) => handle_wrap(&ctx, &cmd),
+        Command::Ctx(_) => handle_ctx(&ctx),
         Command::Completions { shell } => {
             handle_completions(shell);
             Ok(())
@@ -186,6 +187,8 @@ enum Command {
     Rollback(RollbackCommand),
     /// Wrap an agent with pre-approved secret access and policy enforcement.
     Wrap(WrapCommand),
+    /// Print effective `AGENT_CTX` runtime metadata observed from the environment.
+    Ctx(CtxCommand),
     /// Generate shell completions.
     Completions {
         /// Target shell.
@@ -193,6 +196,9 @@ enum Command {
         shell: Shell,
     },
 }
+
+#[derive(Debug, Clone, Copy, Args)]
+struct CtxCommand {}
 
 // -- Vault commands -----------------------------------------------------------
 
@@ -529,10 +535,17 @@ impl RuntimeContext {
     }
 
     /// Resolve the vault store from CLI options (--vault, --env, or auto-discover).
+    ///
+    /// When no explicit vault/env is provided, an `AGENT_CTX_WORKSPACE_PATH`
+    /// value (if present) is used as a workspace hint so wrapped agent
+    /// processes whose cwd does not match the user's workspace still find
+    /// the expected workspace vault. CLI flags always take precedence.
     fn vault_store(&self) -> Result<VaultStore> {
+        let agent_ctx = kyz_core::AgentContext::from_env();
         let store = VaultStore::resolve_with_env(
             self.common.vault.as_deref(),
             self.common.env_name.as_deref(),
+            agent_ctx.workspace_path.as_deref(),
         )
         .map_err(|e| anyhow!("{e}"))?;
         Ok(store)
@@ -601,6 +614,37 @@ fn handle_vault_lock(ctx: &RuntimeContext) -> Result<()> {
 
     if !ctx.common.quiet {
         println!("Vault locked");
+    }
+    Ok(())
+}
+
+fn handle_ctx(ctx: &RuntimeContext) -> Result<()> {
+    let agent_ctx = kyz_core::AgentContext::from_env();
+
+    if ctx.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&agent_ctx).context("serializing agent context")?
+        );
+        return Ok(());
+    }
+    if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&agent_ctx).context("serializing agent context")?
+        );
+        return Ok(());
+    }
+
+    if agent_ctx.is_empty() {
+        println!("no AGENT_CTX_* variables observed in the environment");
+        return Ok(());
+    }
+
+    let tags = agent_ctx.audit_tags();
+    let width = tags.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in tags {
+        println!("{k:<width$}  {v}");
     }
     Ok(())
 }
