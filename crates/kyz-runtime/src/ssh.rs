@@ -158,7 +158,11 @@ pub fn identity_from_entry(
         let public_key = private_key.public_key();
         let derived_comment = comment.or_else(|| {
             let c = public_key.comment();
-            if c.is_empty() { None } else { Some(c.to_string()) }
+            if c.is_empty() {
+                None
+            } else {
+                Some(c.to_string())
+            }
         });
         return Ok(Some(build_from_public(
             public_key,

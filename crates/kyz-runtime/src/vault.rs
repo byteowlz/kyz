@@ -15,9 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kyz_core::store::{central_vault_path, workspace_vault_path};
-use kyz_core::{
-    KeyringStore, SecretEntry, SecretStore, SecretSummary, VaultStore, env_vault_path,
-};
+use kyz_core::{KeyringStore, SecretEntry, SecretStore, SecretSummary, VaultStore, env_vault_path};
 use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::error::{Error, Result};

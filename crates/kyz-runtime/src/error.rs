@@ -97,9 +97,9 @@ impl Error {
             CoreError::SecretNotFound(_) => reference.map_or(Self::Core(err), |r| Self::NotFound {
                 reference: r.clone(),
             }),
-            CoreError::Secret(msg) if msg.contains("vault is locked") => {
-                Self::VaultLocked { path: String::new() }
-            }
+            CoreError::Secret(msg) if msg.contains("vault is locked") => Self::VaultLocked {
+                path: String::new(),
+            },
             _ => Self::Core(err),
         }
     }

@@ -8,14 +8,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use secrecy::{SecretString, ExposeSecret as _};
+use secrecy::{ExposeSecret as _, SecretString};
 
-use kyz_runtime::ssh::{
-    SshAlgorithm, identity_from_entry, is_ssh_identity, list_ssh_identities,
-};
+use kyz_runtime::ssh::{SshAlgorithm, identity_from_entry, is_ssh_identity, list_ssh_identities};
 use kyz_runtime::{
-    Error, LayeredVault, SecretEntry, SecretRef, SourceConstraint, UnlockMode, UnlockState,
-    Vault, VaultKind, VaultSource,
+    Error, LayeredVault, SecretEntry, SecretRef, SourceConstraint, UnlockMode, UnlockState, Vault,
+    VaultKind, VaultSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -200,8 +198,8 @@ fn build_layered(label: &str) -> Layered {
         .unlock_interactive(&strong_passphrase(), None)
         .expect("workspace unlock");
 
-    let personal = Vault::open_path(&personal_path)
-        .with_source(VaultSource::personal(personal_path.clone()));
+    let personal =
+        Vault::open_path(&personal_path).with_source(VaultSource::personal(personal_path.clone()));
     personal
         .init(&strong_passphrase(), false)
         .expect("personal init");
@@ -308,10 +306,7 @@ fn layered_resolve_strict_accepts_unique_hit() {
 
     let got = l
         .layered
-        .resolve_strict(
-            &SecretRef::new("api", "user-token"),
-            &SourceConstraint::Any,
-        )
+        .resolve_strict(&SecretRef::new("api", "user-token"), &SourceConstraint::Any)
         .expect("only personal layer has this key");
     assert_eq!(got.source.kind(), &VaultKind::Personal);
     cleanup_paths(&l);
@@ -414,7 +409,11 @@ fn identity_from_untagged_entry_returns_none() {
     let entry = SecretEntry::single("github", "token", "abc");
     let r = SecretRef::new("github", "token");
     let src = VaultSource::personal(PathBuf::from("/tmp/fake.json"));
-    assert!(identity_from_entry(&entry, &r, &src).expect("parse").is_none());
+    assert!(
+        identity_from_entry(&entry, &r, &src)
+            .expect("parse")
+            .is_none()
+    );
 }
 
 #[test]
@@ -500,8 +499,14 @@ fn vault_source_display_includes_kind_and_path() {
 fn secret_string_field_round_trips() {
     let (vault, path) = new_unlocked_vault("field-round-trip");
     let mut fields = BTreeMap::new();
-    fields.insert("username".to_string(), SecretString::from("alice".to_string()));
-    fields.insert("password".to_string(), SecretString::from("s3cret".to_string()));
+    fields.insert(
+        "username".to_string(),
+        SecretString::from("alice".to_string()),
+    );
+    fields.insert(
+        "password".to_string(),
+        SecretString::from("s3cret".to_string()),
+    );
     let entry = SecretEntry::new("svc", "user", fields);
     let r = SecretRef::new("svc", "user");
     vault.set(&r, &entry).expect("set should succeed");

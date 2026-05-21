@@ -5,38 +5,39 @@ use std::io::Write as _;
 
 use secrecy::SecretString;
 
-use kyz_core::store::{SecretEntry, VaultFileV2};
+use kyz_core::store::SecretEntry;
+use kyz_core::vault_v3::VaultFileV3;
 
 #[test]
 fn build_secret_index_creates_entries() {
-    let mut v2 = VaultFileV2::new();
     let passphrase = SecretString::from("a-very-strong-passphrase-123".to_string());
+    let (mut v3, dk) = VaultFileV3::create(&passphrase).expect("create");
 
     let entry = SecretEntry::single("github", "token", "ghp_abcdef123456");
-    v2.set(&entry, &passphrase).expect("set");
+    v3.set(&entry, &*dk).expect("set");
 
-    let index = kyz_core::scan::build_secret_index(&v2, &passphrase).expect("build index");
+    let index = kyz_core::scan::build_secret_index(&v3, &*dk).expect("build index");
     assert!(index.contains_key("ghp_abcdef123456"));
     assert_eq!(index["ghp_abcdef123456"], "github/token:value");
 }
 
 #[test]
 fn build_secret_index_skips_short_values() {
-    let mut v2 = VaultFileV2::new();
     let passphrase = SecretString::from("a-very-strong-passphrase-123".to_string());
+    let (mut v3, dk) = VaultFileV3::create(&passphrase).expect("create");
 
     // Short values (<4 chars) should be excluded to avoid false positives
     let entry = SecretEntry::single("svc", "key", "ab");
-    v2.set(&entry, &passphrase).expect("set");
+    v3.set(&entry, &*dk).expect("set");
 
-    let index = kyz_core::scan::build_secret_index(&v2, &passphrase).expect("build index");
+    let index = kyz_core::scan::build_secret_index(&v3, &*dk).expect("build index");
     assert!(index.is_empty(), "short values should be excluded");
 }
 
 #[test]
 fn build_secret_index_multi_field() {
-    let mut v2 = VaultFileV2::new();
     let passphrase = SecretString::from("a-very-strong-passphrase-123".to_string());
+    let (mut v3, dk) = VaultFileV3::create(&passphrase).expect("create");
 
     let mut fields = BTreeMap::new();
     fields.insert(
@@ -48,9 +49,9 @@ fn build_secret_index_multi_field() {
         SecretString::from("super-secret-pass".to_string()),
     );
     let entry = SecretEntry::new("db", "prod", fields);
-    v2.set(&entry, &passphrase).expect("set");
+    v3.set(&entry, &*dk).expect("set");
 
-    let index = kyz_core::scan::build_secret_index(&v2, &passphrase).expect("build index");
+    let index = kyz_core::scan::build_secret_index(&v3, &*dk).expect("build index");
     assert!(index.contains_key("admin-user"));
     assert!(index.contains_key("super-secret-pass"));
 }

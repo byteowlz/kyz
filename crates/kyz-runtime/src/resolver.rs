@@ -201,11 +201,7 @@ impl LayeredVault {
     ///
     /// - [`Error::NotFound`] if no layer matched.
     /// - [`Error::Ambiguous`] if more than one layer matched.
-    pub fn resolve_strict(
-        &self,
-        r: &SecretRef,
-        constraint: &SourceConstraint,
-    ) -> Result<Resolved> {
+    pub fn resolve_strict(&self, r: &SecretRef, constraint: &SourceConstraint) -> Result<Resolved> {
         let mut hits: Vec<(usize, VaultSource, SecretEntry)> = Vec::new();
         for (idx, vault) in self.layers.iter().enumerate() {
             if !constraint.includes(vault.source()) {

@@ -1,17 +1,23 @@
 //! CLI interface for kyz - a cross-platform secrets manager.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::env;
-use std::io::{self, IsTerminal, Read as _};
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use env_logger::fmt::WriteStyle;
 use log::{LevelFilter, debug, info};
 use secrecy::{ExposeSecret as _, SecretString};
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::io::{self, IsTerminal, Read as _};
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::{
+    io::{BufRead as _, BufReader, Write as _},
+    os::unix::net::UnixStream,
+};
 
+#[cfg(unix)]
+use kyz_core::jit::now_unix;
 use kyz_core::paths::write_default_config;
 use kyz_core::store::{DEFAULT_SERVICE, DEFAULT_SESSION_TIMEOUT_SECS};
 use kyz_core::{AppConfig, AppPaths, SecretEntry, SecretStore, VaultStore, default_cache_dir};
@@ -50,6 +56,7 @@ fn try_main() -> Result<()> {
         Command::Exec(cmd) => handle_exec(&ctx, cmd),
         Command::Pipe(cmd) => handle_pipe(&ctx, &cmd),
         Command::Wrap(cmd) => handle_wrap(&ctx, &cmd),
+        Command::Ipc { command } => handle_ipc(&ctx, command),
         Command::Ctx(_) => handle_ctx(&ctx),
         Command::Completions { shell } => {
             handle_completions(shell);
@@ -187,6 +194,12 @@ enum Command {
     Rollback(RollbackCommand),
     /// Wrap an agent with pre-approved secret access and policy enforcement.
     Wrap(WrapCommand),
+    /// IPC client helpers for local one-time secret submission and JIT grants.
+    Ipc {
+        /// IPC subcommand.
+        #[command(subcommand)]
+        command: IpcCommand,
+    },
     /// Print effective `AGENT_CTX` runtime metadata observed from the environment.
     Ctx(CtxCommand),
     /// Generate shell completions.
@@ -274,9 +287,12 @@ struct DeleteCommand {
 
 #[derive(Debug, Clone, Args)]
 struct ListCommand {
-    /// Service namespace to list secrets from (omit to list all services).
-    #[arg(long, default_value = DEFAULT_SERVICE)]
+    /// Service namespace to list secrets from (default: kyz).
+    #[arg(long, default_value = DEFAULT_SERVICE, conflicts_with = "all")]
     service: String,
+    /// List secrets from all services.
+    #[arg(long, short = 'a')]
+    all: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -447,6 +463,99 @@ struct WrapCommand {
     /// Command and arguments to execute in the wrapped session.
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
+}
+
+// -- IPC command -------------------------------------------------------------
+
+#[derive(Debug, Clone, Subcommand)]
+enum IpcCommand {
+    /// Submit a one-time secret payload to local IPC.
+    Submit(IpcSubmitCommand),
+    /// Issue or update a brokered JIT grant token.
+    Grant(IpcGrantCommand),
+    /// Consume one-time secret or validate a grant usage.
+    Use(IpcUseCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+struct IpcSubmitCommand {
+    /// Caller-provided one-time request id.
+    #[arg(long, value_name = "ID")]
+    request_id: String,
+    /// Secret service namespace.
+    #[arg(long, value_name = "SERVICE")]
+    service: String,
+    /// Secret key.
+    #[arg(long, value_name = "KEY")]
+    key: String,
+    /// Secret value. If omitted, reads from stdin.
+    #[arg(long, value_name = "VALUE")]
+    value: Option<String>,
+    /// TTL in seconds from now.
+    #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+    ttl: u64,
+    /// Optional origin source label.
+    #[arg(long, value_name = "SOURCE")]
+    source: Option<String>,
+    /// Optional origin process id.
+    #[arg(long, value_name = "PID")]
+    process_id: Option<String>,
+    /// Optional origin host.
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+    /// IPC socket path (defaults to state-dir/kyz-ipc.sock).
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct IpcGrantCommand {
+    /// Grant token identifier.
+    #[arg(long, value_name = "TOKEN")]
+    token: String,
+    /// Allowed secret references (repeatable, SERVICE/KEY[:FIELD]).
+    #[arg(long = "secret", short = 's', value_name = "SERVICE/KEY[:FIELD]")]
+    secrets: Vec<String>,
+    /// Allowed command basenames (repeatable).
+    #[arg(long = "command", short = 'c', value_name = "CMD")]
+    commands: Vec<String>,
+    /// Allowed workspaces (repeatable).
+    #[arg(long = "workspace", short = 'w', value_name = "WORKSPACE")]
+    workspaces: Vec<String>,
+    /// TTL in seconds from now.
+    #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+    ttl: u64,
+    /// Allowed use count.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    use_count: u32,
+    /// IPC socket path (defaults to state-dir/kyz-ipc.sock).
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct IpcUseCommand {
+    /// Request id for one-time secret resolve.
+    #[arg(long, value_name = "ID", conflicts_with = "token")]
+    request_id: Option<String>,
+    /// Grant token for validation.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+    /// Secret reference for grant validation.
+    #[arg(long, value_name = "SERVICE/KEY[:FIELD]", requires = "token")]
+    secret: Option<String>,
+    /// Command basename for grant validation.
+    #[arg(long, value_name = "CMD", requires = "token")]
+    command: Option<String>,
+    /// Workspace for grant validation.
+    #[arg(long, value_name = "WORKSPACE", requires = "token")]
+    workspace: Option<String>,
+    /// Reveal secret value in output (default: redacted).
+    #[arg(long, default_value_t = false)]
+    reveal_value: bool,
+    /// IPC socket path (defaults to state-dir/kyz-ipc.sock).
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
 }
 
 // -- Runtime context ----------------------------------------------------------
@@ -903,6 +1012,53 @@ fn handle_delete(ctx: &RuntimeContext, cmd: &DeleteCommand) -> Result<()> {
 
 fn handle_list(ctx: &RuntimeContext, cmd: &ListCommand) -> Result<()> {
     let store = ctx.secret_store()?;
+
+    if cmd.all {
+        let services = store.list_services().map_err(|e| anyhow!("{e}"))?;
+        let mut by_service = BTreeMap::new();
+        for service in services {
+            let entries = store.list(&service).map_err(|e| anyhow!("{e}"))?;
+            by_service.insert(service, entries);
+        }
+
+        if ctx.common.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "all": true,
+                    "services": by_service,
+                }))
+                .context("serializing to JSON")?
+            );
+        } else if ctx.common.yaml {
+            println!(
+                "{}",
+                serde_yaml::to_string(&serde_json::json!({
+                    "all": true,
+                    "services": by_service,
+                }))
+                .context("serializing to YAML")?
+            );
+        } else if by_service.is_empty() {
+            println!(
+                "No secrets found. Tip: set secrets with --service <name> and list with --all."
+            );
+        } else {
+            for (service, entries) in &by_service {
+                println!("[{service}]");
+                for entry in entries {
+                    if entry.field_names.is_empty() {
+                        println!("{}", entry.key);
+                    } else {
+                        println!("{}  [{}]", entry.key, entry.field_names.join(", "));
+                    }
+                }
+                println!();
+            }
+        }
+        return Ok(());
+    }
+
     let entries = store.list(&cmd.service).map_err(|e| anyhow!("{e}"))?;
 
     if ctx.common.json {
@@ -924,8 +1080,21 @@ fn handle_list(ctx: &RuntimeContext, cmd: &ListCommand) -> Result<()> {
             serde_yaml::to_string(&obj).context("serializing to YAML")?
         );
     } else if entries.is_empty() {
-        println!("No secrets found in service '{}'", cmd.service);
+        if cmd.service == DEFAULT_SERVICE {
+            println!(
+                "Listing default service '{}'. No secrets found. Tip: use --service <name> or --all.",
+                cmd.service
+            );
+        } else {
+            println!(
+                "No secrets found in service '{}'. Tip: try --service <name> or --all.",
+                cmd.service
+            );
+        }
     } else {
+        if cmd.service == DEFAULT_SERVICE {
+            println!("Listing default service '{}':", cmd.service);
+        }
         for entry in &entries {
             if entry.field_names.is_empty() {
                 println!("{}", entry.key);
@@ -1381,6 +1550,239 @@ fn handle_config(ctx: &RuntimeContext, command: ConfigCommand) -> Result<()> {
 fn handle_completions(shell: Shell) {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, APP_NAME, &mut io::stdout());
+}
+
+fn handle_ipc(ctx: &RuntimeContext, command: IpcCommand) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (ctx, command);
+        Err(anyhow!(
+            "kyz ipc is currently supported on Unix platforms only"
+        ))
+    }
+
+    #[cfg(unix)]
+    {
+        match command {
+            IpcCommand::Submit(cmd) => handle_ipc_submit(ctx, cmd),
+            IpcCommand::Grant(cmd) => handle_ipc_grant(ctx, cmd),
+            IpcCommand::Use(cmd) => handle_ipc_use(ctx, cmd),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handle_ipc_submit(ctx: &RuntimeContext, cmd: IpcSubmitCommand) -> Result<()> {
+    let value = read_secret_value(cmd.value.as_deref())?;
+    let expires_at = now_unix().saturating_add(cmd.ttl);
+    let payload = serde_json::json!({
+        "type": "submit_secret",
+        "request_id": cmd.request_id,
+        "service": cmd.service,
+        "key": cmd.key,
+        "value": value,
+        "expires_at": expires_at,
+        "origin": {
+            "source": cmd.source,
+            "process_id": cmd.process_id,
+            "host": cmd.host,
+        }
+    });
+
+    let response = ipc_roundtrip(ctx, cmd.socket.as_deref(), &payload)?;
+    print_ipc_response(ctx, &response, false)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn handle_ipc_grant(ctx: &RuntimeContext, cmd: IpcGrantCommand) -> Result<()> {
+    if cmd.secrets.is_empty() {
+        return Err(anyhow!("at least one --secret is required"));
+    }
+
+    let payload = serde_json::json!({
+        "type": "issue_grant",
+        "token": cmd.token,
+        "secret_refs": cmd.secrets,
+        "commands": cmd.commands,
+        "workspaces": cmd.workspaces,
+        "expires_at": now_unix().saturating_add(cmd.ttl),
+        "use_count": cmd.use_count,
+    });
+
+    let response = ipc_roundtrip(ctx, cmd.socket.as_deref(), &payload)?;
+    print_ipc_response(ctx, &response, false)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn handle_ipc_use(ctx: &RuntimeContext, cmd: IpcUseCommand) -> Result<()> {
+    let payload = if let Some(request_id) = &cmd.request_id {
+        serde_json::json!({
+            "type": "resolve_secret",
+            "request_id": request_id,
+        })
+    } else if let Some(token) = &cmd.token {
+        let secret = cmd
+            .secret
+            .as_deref()
+            .ok_or_else(|| anyhow!("--secret is required when using --token"))?;
+        let command = cmd
+            .command
+            .as_deref()
+            .ok_or_else(|| anyhow!("--command is required when using --token"))?;
+        let workspace = cmd
+            .workspace
+            .as_deref()
+            .ok_or_else(|| anyhow!("--workspace is required when using --token"))?;
+        serde_json::json!({
+            "type": "validate_grant",
+            "token": token,
+            "secret_ref": secret,
+            "command": command,
+            "workspace": workspace,
+        })
+    } else {
+        return Err(anyhow!(
+            "provide either --request-id (resolve) or --token (validate grant)"
+        ));
+    };
+
+    let response = ipc_roundtrip(ctx, cmd.socket.as_deref(), &payload)?;
+    print_ipc_response(ctx, &response, cmd.reveal_value)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ipc_roundtrip(
+    ctx: &RuntimeContext,
+    socket_override: Option<&std::path::Path>,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let socket_path = socket_override
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| ctx.paths.state_dir.join("kyz-ipc.sock"));
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .with_context(|| format!("connecting to IPC socket {}", socket_path.display()))?;
+
+    let mut wire = serde_json::to_vec(payload).context("serializing IPC payload")?;
+    wire.push(b'\n');
+    stream.write_all(&wire).context("writing IPC request")?;
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader
+        .read_line(&mut line)
+        .context("reading IPC response")?;
+
+    serde_json::from_str(&line).context("parsing IPC response")
+}
+
+#[cfg(unix)]
+fn print_ipc_response(
+    ctx: &RuntimeContext,
+    response: &serde_json::Value,
+    reveal_value: bool,
+) -> Result<()> {
+    let output = sanitized_ipc_output(response, reveal_value)?;
+    let ok = output
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow!("invalid IPC response: missing bool 'ok'"))?;
+
+    if ctx.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).context("serializing IPC response JSON")?
+        );
+    } else if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&output).context("serializing IPC response YAML")?
+        );
+    } else if ok {
+        let service = output
+            .get("service")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let key = output
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let value = output
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let value_redacted = output
+            .get("value_redacted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        if let (Some(svc), Some(secret_key)) = (service, key) {
+            if value_redacted {
+                println!("IPC ok: resolved {svc}/{secret_key} (value redacted)");
+            } else {
+                println!("IPC ok: resolved {svc}/{secret_key}");
+                if let Some(v) = value {
+                    println!("{v}");
+                }
+            }
+        } else {
+            println!("IPC ok");
+        }
+    } else {
+        let msg = output
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        return Err(anyhow!("IPC denied: {msg}"));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sanitized_ipc_output(
+    response: &serde_json::Value,
+    reveal_value: bool,
+) -> Result<serde_json::Value> {
+    let ok = response
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow!("invalid IPC response: missing bool 'ok'"))?;
+
+    let reason = response
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    let service = response
+        .get("service")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    let key = response
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    let value = response
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    let value_redacted = value.as_ref().is_some_and(|_| !reveal_value);
+    let printable_value = if reveal_value { value } else { None };
+
+    Ok(serde_json::json!({
+        "ok": ok,
+        "reason": reason,
+        "service": service,
+        "key": key,
+        "value": printable_value,
+        "value_redacted": value_redacted,
+    }))
 }
 
 // -- Exec command handler -----------------------------------------------------
@@ -2094,4 +2496,43 @@ fn build_wrap_policy(allowed_secrets: &[String]) -> String {
     }
 
     serde_json::to_string_pretty(&json).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use super::sanitized_ipc_output;
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_output_redacts_value_by_default() {
+        let raw = serde_json::json!({
+            "ok": true,
+            "service": "svc",
+            "key": "k",
+            "value": "super-secret",
+        });
+
+        let out = sanitized_ipc_output(&raw, false).expect("sanitize");
+        assert_eq!(out["value"], serde_json::Value::Null);
+        assert_eq!(out["value_redacted"], serde_json::Value::Bool(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_output_reveals_value_only_when_requested() {
+        let raw = serde_json::json!({
+            "ok": true,
+            "service": "svc",
+            "key": "k",
+            "value": "super-secret",
+        });
+
+        let out = sanitized_ipc_output(&raw, true).expect("sanitize");
+        assert_eq!(
+            out["value"],
+            serde_json::Value::String("super-secret".to_string())
+        );
+        assert_eq!(out["value_redacted"], serde_json::Value::Bool(false));
+    }
 }

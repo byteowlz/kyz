@@ -14,10 +14,13 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::error::CoreError;
+use crate::vault_v3::{DK_LEN, VaultFileV3, decrypt_entry_v3, migrate_v2_to_v3};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -795,9 +798,10 @@ struct SessionMeta {
     vault_path: PathBuf,
 }
 
-/// A vault session tracks an unlocked vault's passphrase via the OS keyring.
+/// A vault session tracks an unlocked vault's data key (DK) via the OS keyring.
 ///
-/// The passphrase is stored in the platform-native credential store:
+/// In v3, the session holds the unwrapped 32-byte DK — not the passphrase.
+/// The DK is stored base64-encoded in the platform-native credential store:
 /// - **macOS**: Keychain (file-backed, works over SSH)
 /// - **Linux**: kernel keyutils (in-memory, works headless, cleared on reboot)
 /// - **Windows**: Credential Manager
@@ -809,8 +813,8 @@ struct SessionMeta {
 /// file with a machine-bound key.
 #[derive(Clone)]
 pub struct VaultSession {
-    /// The vault passphrase (in memory only, zeroed on drop).
-    pub passphrase: SecretString,
+    /// The vault data key (in memory only, zeroed on drop).
+    pub dk: Zeroizing<[u8; DK_LEN]>,
     /// Unix timestamp when this session expires.
     pub expires_at: u64,
     /// Path to the vault file this session unlocks.
@@ -820,22 +824,27 @@ pub struct VaultSession {
 impl fmt::Debug for VaultSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VaultSession")
-            .field("passphrase", &"[REDACTED]")
+            .field("dk", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
             .field("vault_path", &self.vault_path)
             .finish()
     }
 }
 
-/// Keyring service name for vault session passphrases.
-const SESSION_KEYRING_SERVICE: &str = "kyz-session";
+/// Keyring service name for vault session data keys.
+///
+/// Bumped to `-v3` so that any leftover v2 entries (which stored a passphrase
+/// string) are never misinterpreted as a base64-encoded DK.
+const SESSION_KEYRING_SERVICE: &str = "kyz-session-v3";
+/// Legacy v2 keyring service name (kept only to clean up old entries).
+const LEGACY_SESSION_KEYRING_SERVICE: &str = "kyz-session";
 
 impl VaultSession {
-    /// Create a new session.
+    /// Create a new session from raw DK bytes.
     #[must_use]
-    pub fn new(passphrase: SecretString, vault_path: &Path, timeout_secs: u64) -> Self {
+    pub fn new(dk: Zeroizing<[u8; DK_LEN]>, vault_path: &Path, timeout_secs: u64) -> Self {
         Self {
-            passphrase,
+            dk,
             expires_at: now_unix() + timeout_secs,
             vault_path: vault_path.to_path_buf(),
         }
@@ -889,42 +898,57 @@ impl VaultSession {
         format!("vault-{hash}")
     }
 
-    /// Store the passphrase in the OS keyring.
-    fn keyring_store(vault_path: &Path, passphrase: &str) -> Result<(), CoreError> {
+    /// Store the DK bytes (base64-encoded) in the OS keyring.
+    fn keyring_store(vault_path: &Path, dk: &[u8; DK_LEN]) -> Result<(), CoreError> {
         let user = Self::keyring_user(vault_path);
         let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
             .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(dk);
         entry
-            .set_password(passphrase)
-            .map_err(|e| CoreError::Secret(format!("storing passphrase in keyring: {e}")))?;
+            .set_password(&encoded)
+            .map_err(|e| CoreError::Secret(format!("storing DK in keyring: {e}")))?;
         Ok(())
     }
 
-    /// Retrieve the passphrase from the OS keyring.
-    fn keyring_load(vault_path: &Path) -> Result<Option<String>, CoreError> {
+    /// Retrieve the DK bytes from the OS keyring.
+    fn keyring_load(vault_path: &Path) -> Result<Option<Zeroizing<[u8; DK_LEN]>>, CoreError> {
         let user = Self::keyring_user(vault_path);
         let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
             .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
         match entry.get_password() {
-            Ok(pass) => Ok(Some(pass)),
+            Ok(encoded) => {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(&encoded)
+                    .map_err(|e| CoreError::Secret(format!("decoding DK from keyring: {e}")))?;
+                if raw.len() != DK_LEN {
+                    return Err(CoreError::Secret(format!(
+                        "keyring DK has unexpected length {} (want {DK_LEN})",
+                        raw.len()
+                    )));
+                }
+                let mut dk = Zeroizing::new([0u8; DK_LEN]);
+                dk.copy_from_slice(&raw);
+                Ok(Some(dk))
+            }
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(CoreError::Secret(format!(
-                "reading passphrase from keyring: {e}"
-            ))),
+            Err(e) => Err(CoreError::Secret(format!("reading DK from keyring: {e}"))),
         }
     }
 
-    /// Remove the passphrase from the OS keyring.
+    /// Remove the DK from the OS keyring (current and legacy entries).
     fn keyring_delete(vault_path: &Path) -> Result<(), CoreError> {
         let user = Self::keyring_user(vault_path);
-        let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, &user)
-            .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(CoreError::Secret(format!(
-                "removing passphrase from keyring: {e}"
-            ))),
+        for service in [SESSION_KEYRING_SERVICE, LEGACY_SESSION_KEYRING_SERVICE] {
+            let entry = keyring::Entry::new(service, &user)
+                .map_err(|e| CoreError::Secret(format!("creating keyring entry: {e}")))?;
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => {
+                    return Err(CoreError::Secret(format!("removing DK from keyring: {e}")));
+                }
+            }
         }
+        Ok(())
     }
 
     /// Derive a machine-bound session encryption key (fallback only).
@@ -952,12 +976,12 @@ impl VaultSession {
         format!("{h1}{h2}")
     }
 
-    /// Write the session to disk and store the passphrase in the OS keyring.
+    /// Write the session to disk and store the DK in the OS keyring.
     ///
-    /// The passphrase is stored in the platform-native credential store. Only
+    /// The DK is stored in the platform-native credential store. Only
     /// non-sensitive metadata (expiry, vault path) is written to the session
     /// file. If the keyring is unavailable, falls back to an age-encrypted
-    /// session file.
+    /// session file holding the base64-encoded DK.
     ///
     /// # Errors
     ///
@@ -974,13 +998,10 @@ impl VaultSession {
             }
         }
 
-        let passphrase_str = self.passphrase.expose_secret();
-
-        // Try OS keyring first (passphrase never touches disk)
-        let keyring_ok = Self::keyring_store(&self.vault_path, passphrase_str).is_ok();
+        // Try OS keyring first (DK never touches disk).
+        let keyring_ok = Self::keyring_store(&self.vault_path, &self.dk).is_ok();
 
         if keyring_ok {
-            // Keyring succeeded: write only metadata to the session file
             let meta = SessionMeta {
                 expires_at: self.expires_at,
                 vault_path: self.vault_path.clone(),
@@ -989,10 +1010,9 @@ impl VaultSession {
                 .map_err(|e| CoreError::Serialization(format!("serializing session meta: {e}")))?;
             fs::write(&path, json.as_bytes()).map_err(CoreError::Io)?;
         } else {
-            // Keyring unavailable: fall back to age-encrypted session file
             log::debug!("OS keyring unavailable, falling back to encrypted session file");
             let full = FallbackSession {
-                passphrase: passphrase_str.to_string(),
+                dk_b64: base64::engine::general_purpose::STANDARD.encode(*self.dk),
                 expires_at: self.expires_at,
                 vault_path: self.vault_path.clone(),
             };
@@ -1061,7 +1081,7 @@ impl VaultSession {
             return Ok(None);
         };
 
-        let Some(passphrase) = Self::keyring_load(vault_path)? else {
+        let Some(dk) = Self::keyring_load(vault_path)? else {
             // Keyring entry gone (reboot on Linux keyutils, manual clear, etc.)
             let path = Self::session_file_for(vault_path)?;
             let _ = fs::remove_file(&path);
@@ -1069,7 +1089,7 @@ impl VaultSession {
         };
 
         Ok(Some(Self {
-            passphrase: SecretString::from(passphrase),
+            dk,
             expires_at: meta.expires_at,
             vault_path: meta.vault_path,
         }))
@@ -1081,8 +1101,16 @@ impl VaultSession {
         let decrypted = decrypt_session_data(raw, &key).ok()?;
         let json = String::from_utf8(decrypted).ok()?;
         let fb: FallbackSession = serde_json::from_str(&json).ok()?;
+        let raw_dk = base64::engine::general_purpose::STANDARD
+            .decode(&fb.dk_b64)
+            .ok()?;
+        if raw_dk.len() != DK_LEN {
+            return None;
+        }
+        let mut dk = Zeroizing::new([0u8; DK_LEN]);
+        dk.copy_from_slice(&raw_dk);
         Some(Self {
-            passphrase: SecretString::from(fb.passphrase),
+            dk,
             expires_at: fb.expires_at,
             vault_path: fb.vault_path,
         })
@@ -1110,33 +1138,78 @@ impl VaultSession {
 /// Full session data for the encrypted-file fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FallbackSession {
-    /// The vault passphrase.
-    passphrase: String,
+    /// Base64-encoded vault data key.
+    dk_b64: String,
     /// Unix timestamp when this session expires.
     expires_at: u64,
     /// Path to the vault file this session unlocks.
     vault_path: PathBuf,
 }
 
-/// Encrypt session data with a passphrase using age.
-fn encrypt_session_data(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>, CoreError> {
-    let encryptor =
-        age::Encryptor::with_user_passphrase(SecretString::from(passphrase.to_string()));
-    let mut encrypted = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut encrypted)
-        .map_err(|e| CoreError::Secret(format!("creating session encryptor: {e}")))?;
-    writer
-        .write_all(plaintext)
-        .map_err(|e| CoreError::Secret(format!("encrypting session data: {e}")))?;
-    writer
-        .finish()
-        .map_err(|e| CoreError::Secret(format!("finalizing session encryption: {e}")))?;
-    Ok(encrypted)
+/// Magic byte prefix for the fast session format (XChaCha20-Poly1305).
+/// Distinguishes from the legacy age-encrypted session format.
+const SESSION_MAGIC_V2: &[u8] = b"KYZS2";
+
+/// Derive a 32-byte symmetric key from a machine-bound material string.
+///
+/// Uses a single SHA-256 round. Unlike a vault passphrase, this material is
+/// derived from observable system properties (vault path, user, hostname),
+/// so a slow KDF (scrypt) would add no security — only latency.
+fn session_kdf(material: &str) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"kyz-session-v2");
+    hasher.update(material.as_bytes());
+    let out = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&out);
+    key
 }
 
-/// Decrypt session data with a passphrase using age.
-fn decrypt_session_data(encrypted: &[u8], passphrase: &str) -> Result<Vec<u8>, CoreError> {
+/// Encrypt session data using XChaCha20-Poly1305 with a SHA-256-derived key.
+///
+/// Layout on disk: `SESSION_MAGIC_V2 || nonce(24) || ciphertext || tag(16)`.
+fn encrypt_session_data(plaintext: &[u8], material: &str) -> Result<Vec<u8>, CoreError> {
+    use chacha20poly1305::{
+        AeadCore as _, KeyInit as _, XChaCha20Poly1305,
+        aead::{Aead, OsRng},
+    };
+
+    let key = session_kdf(material);
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let ct = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| CoreError::Secret(format!("session AEAD encrypt failed: {e}")))?;
+
+    let mut out = Vec::with_capacity(SESSION_MAGIC_V2.len() + nonce.len() + ct.len());
+    out.extend_from_slice(SESSION_MAGIC_V2);
+    out.extend_from_slice(nonce.as_slice());
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Decrypt session data. Supports both the new fast format (magic-prefixed
+/// XChaCha20-Poly1305) and the legacy age-encrypted format for backward
+/// compatibility.
+fn decrypt_session_data(encrypted: &[u8], material: &str) -> Result<Vec<u8>, CoreError> {
+    if encrypted.starts_with(SESSION_MAGIC_V2) {
+        use chacha20poly1305::{KeyInit as _, XChaCha20Poly1305, XNonce, aead::Aead};
+
+        let body = &encrypted[SESSION_MAGIC_V2.len()..];
+        if body.len() < 24 + 16 {
+            return Err(CoreError::Secret("session file truncated".to_string()));
+        }
+        let (nonce_bytes, ct) = body.split_at(24);
+        let key = session_kdf(material);
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let nonce = XNonce::from_slice(nonce_bytes);
+        return cipher
+            .decrypt(nonce, ct)
+            .map_err(|e| CoreError::Secret(format!("session AEAD decrypt failed: {e}")));
+    }
+
+    // Legacy format: age-encrypted with scrypt. Decrypt for migration.
     let decryptor = age::Decryptor::new(encrypted)
         .map_err(|e| CoreError::Secret(format!("reading encrypted session: {e}")))?;
 
@@ -1146,7 +1219,7 @@ fn decrypt_session_data(encrypted: &[u8], passphrase: &str) -> Result<Vec<u8>, C
         ));
     }
 
-    let identity = age::scrypt::Identity::new(SecretString::from(passphrase.to_string()));
+    let identity = age::scrypt::Identity::new(SecretString::from(material.to_string()));
 
     let mut decrypted = Vec::new();
     let mut reader = decryptor
@@ -1258,8 +1331,8 @@ impl VaultStore {
 
     /// Initialize a new vault with a passphrase.
     ///
-    /// Creates an empty encrypted vault file. Fails if one already exists
-    /// (use `force` to overwrite).
+    /// Creates an empty v3 vault file (one-time scrypt + DK-wrapped AEAD).
+    /// Fails if one already exists (use `force` to overwrite).
     ///
     /// # Errors
     ///
@@ -1278,13 +1351,14 @@ impl VaultStore {
             fs::create_dir_all(parent).map_err(CoreError::Io)?;
         }
 
-        // Create empty v2 vault
-        let v2 = VaultFileV2::new();
-        let json = serde_json::to_string_pretty(&v2)
+        let passphrase_secret = SecretString::from(passphrase.to_string());
+        let (mut v3, _dk) = VaultFileV3::create(&passphrase_secret)?;
+        // Strength was already checked above, so flag it.
+        v3.passphrase_policy_checked = true;
+        let json = serde_json::to_string_pretty(&v3)
             .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
         fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
 
-        // Set vault file permissions to 0600
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1295,7 +1369,11 @@ impl VaultStore {
         Ok(())
     }
 
-    /// Unlock the vault: verify passphrase and create a session file.
+    /// Unlock the vault: derive the KEK, unwrap the DK, persist a session.
+    ///
+    /// Auto-migrates v1 (single-blob age) and v2 (per-entry scrypt-age) vaults
+    /// to v3 on first unlock. After this call, hot-path operations
+    /// (`get`/`set`/`list`) pay only AEAD cost — no scrypt.
     ///
     /// # Errors
     ///
@@ -1309,40 +1387,64 @@ impl VaultStore {
             )));
         }
 
-        let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
         let passphrase_secret = SecretString::from(passphrase.to_string());
-
-        // Detect format and auto-migrate v1 → v2
-        let version = detect_vault_version(&raw);
-        if version == 1 {
-            log::info!("migrating vault from v1 to v2 (per-entry encryption)");
-            let mut v2 = migrate_v1_to_v2(&raw, &passphrase_secret)?;
-            // Legacy vaults are treated as already policy-checked.
-            v2.passphrase_policy_checked = true;
-            let json = serde_json::to_string_pretty(&v2)
-                .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
-            fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
-        } else {
-            // v2: verify passphrase by decrypting the first entry (if any)
-            let mut v2: VaultFileV2 = serde_json::from_slice(&raw)
-                .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))?;
-            if let Some(first) = v2.entries.values().next() {
-                let _ = decrypt_entry(first, &passphrase_secret)?;
-            }
-
-            // First unlock for new vaults: enforce passphrase strength once.
-            if !v2.passphrase_policy_checked {
-                ensure_passphrase_strength(passphrase)?;
-                v2.passphrase_policy_checked = true;
-                let json = serde_json::to_string_pretty(&v2)
-                    .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
-                fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
-            }
-        }
-
-        // Create session
-        let session = VaultSession::new(passphrase_secret, &self.vault_path, timeout_secs);
+        let dk = self.unlock_to_dk(&passphrase_secret)?;
+        let session = VaultSession::new(dk, &self.vault_path, timeout_secs);
         session.save()
+    }
+
+    /// Helper: open the vault, migrate if needed, and return the DK.
+    ///
+    /// Writes the migrated/upgraded vault file back to disk if needed.
+    fn unlock_to_dk(
+        &self,
+        passphrase: &SecretString,
+    ) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
+        let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
+        let version = detect_vault_version(&raw);
+
+        match version {
+            1 => {
+                log::info!("migrating vault from v1 to v3");
+                let mut v2 = migrate_v1_to_v2(&raw, passphrase)?;
+                v2.passphrase_policy_checked = true;
+                let (mut v3, dk) = migrate_v2_to_v3(&v2, passphrase)?;
+                v3.passphrase_policy_checked = true;
+                self.write_vault_file(&v3)?;
+                Ok(dk)
+            }
+            2 => {
+                let v2: VaultFileV2 = serde_json::from_slice(&raw)
+                    .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))?;
+                // Verify passphrase against the first v2 entry before migrating
+                // (so we don't write garbage if the password is wrong).
+                if let Some(first) = v2.entries.values().next() {
+                    let _ = decrypt_entry(first, passphrase)?;
+                }
+                if !v2.passphrase_policy_checked {
+                    ensure_passphrase_strength(passphrase.expose_secret())?;
+                }
+                log::info!("migrating vault from v2 to v3");
+                let (mut v3, dk) = migrate_v2_to_v3(&v2, passphrase)?;
+                v3.passphrase_policy_checked = true;
+                self.write_vault_file(&v3)?;
+                Ok(dk)
+            }
+            3 => {
+                let mut v3: VaultFileV3 = serde_json::from_slice(&raw)
+                    .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))?;
+                let dk = v3.unwrap_dk(passphrase)?;
+                if !v3.passphrase_policy_checked {
+                    ensure_passphrase_strength(passphrase.expose_secret())?;
+                    v3.passphrase_policy_checked = true;
+                    self.write_vault_file(&v3)?;
+                }
+                Ok(dk)
+            }
+            other => Err(CoreError::Secret(format!(
+                "unsupported vault format version {other}"
+            ))),
+        }
     }
 
     /// Lock the vault: destroy the session file.
@@ -1376,56 +1478,70 @@ impl VaultStore {
         })
     }
 
-    /// Load the session key, or return an error if locked.
+    /// Load the data key, or return an error if locked.
     ///
     /// # Errors
     ///
     /// Returns an error if the vault is locked.
-    pub fn require_session_pub(&self) -> Result<SecretString, CoreError> {
+    pub fn require_session_pub(&self) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
         self.require_session()
     }
 
-    /// Read the v2 vault file (public wrapper).
+    /// Read the v3 vault file (public wrapper).
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read or parsed.
-    pub fn read_vault_file_pub(&self) -> Result<VaultFileV2, CoreError> {
+    /// Returns an error if the file cannot be read, parsed, or is not v3.
+    /// If the on-disk file is older, the caller must run `unlock` first to
+    /// trigger migration.
+    pub fn read_vault_file_pub(&self) -> Result<VaultFileV3, CoreError> {
         self.read_vault_file()
     }
 
-    /// Write the v2 vault file (public wrapper).
+    /// Write the v3 vault file (public wrapper).
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be written.
-    pub fn write_vault_file_pub(&self, vault: &VaultFileV2) -> Result<(), CoreError> {
+    pub fn write_vault_file_pub(&self, vault: &VaultFileV3) -> Result<(), CoreError> {
         self.write_vault_file(vault)
     }
 
-    /// Load the session key, or return an error if locked.
-    fn require_session(&self) -> Result<SecretString, CoreError> {
+    /// Load the data key from the active session, or error if locked.
+    fn require_session(&self) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
         let session = VaultSession::load(&self.vault_path)?.ok_or_else(|| {
             CoreError::Secret("vault is locked. Run 'kyz unlock' first.".to_string())
         })?;
-        Ok(session.passphrase)
+        Ok(session.dk)
     }
 
-    /// Read the v2 vault file (JSON parse only, no decryption).
+    /// Read the v3 vault file (JSON parse only, no decryption).
     /// Acquires a shared (read) flock for safe concurrent access.
-    fn read_vault_file(&self) -> Result<VaultFileV2, CoreError> {
+    ///
+    /// If the file on disk is v1 or v2, returns an error directing the caller
+    /// to run `kyz unlock` to trigger migration.
+    fn read_vault_file(&self) -> Result<VaultFileV3, CoreError> {
         if !self.vault_path.exists() {
-            return Ok(VaultFileV2::new());
+            return Err(CoreError::Secret(format!(
+                "vault not found at {}",
+                self.vault_path.display()
+            )));
         }
         let _lock = VaultFileLock::shared(&self.vault_path)?;
         let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
+        let version = detect_vault_version(&raw);
+        if version != 3 {
+            return Err(CoreError::Secret(format!(
+                "vault is v{version}; run 'kyz unlock' to migrate to v3"
+            )));
+        }
         serde_json::from_slice(&raw)
             .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))
     }
 
-    /// Write the v2 vault file.
+    /// Write the v3 vault file.
     /// Acquires an exclusive (write) flock to prevent concurrent corruption.
-    fn write_vault_file(&self, vault: &VaultFileV2) -> Result<(), CoreError> {
+    fn write_vault_file(&self, vault: &VaultFileV3) -> Result<(), CoreError> {
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
         let json = serde_json::to_string_pretty(vault)
             .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
@@ -1451,12 +1567,12 @@ pub struct VaultStatus {
 
 impl SecretStore for VaultStore {
     fn get(&self, service: &str, key: &str) -> Result<SecretEntry, CoreError> {
-        let passphrase = self.require_session()?;
+        let dk = self.require_session()?;
         let vault = self.read_vault_file()?;
         let encrypted = vault.get_encrypted(service, key).ok_or_else(|| {
             CoreError::SecretNotFound(format!("secret '{key}' not found in service '{service}'"))
         })?;
-        decrypt_entry(encrypted, &passphrase)
+        decrypt_entry_v3(encrypted, &dk)
     }
 
     fn set(&self, service: &str, key: &str, entry: &SecretEntry) -> Result<(), CoreError> {
@@ -1464,6 +1580,8 @@ impl SecretStore for VaultStore {
     }
 
     fn delete(&self, service: &str, key: &str) -> Result<(), CoreError> {
+        // Need an unlocked session to read/write a v3 file safely.
+        let _ = self.require_session()?;
         let mut vault = self.read_vault_file()?;
         if !vault.remove(service, key) {
             return Err(CoreError::SecretNotFound(format!(
@@ -1474,13 +1592,14 @@ impl SecretStore for VaultStore {
     }
 
     fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
-        // No decryption needed — metadata is plaintext in v2
+        // Metadata is plaintext in v3 — no DK required, just the file.
+        let _ = self.require_session()?;
         let vault = self.read_vault_file()?;
         Ok(vault.summaries(service))
     }
 
     fn list_services(&self) -> Result<Vec<String>, CoreError> {
-        // No decryption needed — metadata is plaintext in v2
+        let _ = self.require_session()?;
         let vault = self.read_vault_file()?;
         Ok(vault.services())
     }
@@ -1499,12 +1618,12 @@ impl VaultStore {
         entry: &SecretEntry,
         max_history: u32,
     ) -> Result<(), CoreError> {
-        let passphrase = self.require_session()?;
+        let dk = self.require_session()?;
         let mut vault = self.read_vault_file()?;
         let mut stored = entry.clone();
         stored.service = service.to_string();
         stored.key = key.to_string();
-        vault.set_with_retention(&stored, &passphrase, max_history)?;
+        vault.set_with_retention(&stored, &dk, max_history)?;
         self.write_vault_file(&vault)
     }
 }
@@ -1846,7 +1965,7 @@ pub fn workspace_vault_path(workspace_dir: &Path) -> PathBuf {
 }
 
 /// Current Unix timestamp in seconds.
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -2050,13 +2169,16 @@ mod tests {
         assert_eq!(fetched.value(), Some("v3"));
 
         // Rollback to version 1
-        let passphrase_secret = SecretString::from(passphrase.to_string());
+        let dk = store
+            .require_session_pub()
+            .map_err(|e| format!("require session: {e}"))
+            .expect("session should be active");
         let mut vault = store
             .read_vault_file_pub()
             .map_err(|e| format!("read failed: {e}"))
             .expect("read should succeed");
         vault
-            .rollback("app", "key", 1, &passphrase_secret)
+            .rollback("app", "key", 1, &dk)
             .map_err(|e| format!("rollback failed: {e}"))
             .expect("rollback should succeed");
         store

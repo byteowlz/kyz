@@ -37,8 +37,11 @@ kyz get my-api-key --service github
 # Retrieve a single field
 kyz get db-creds --service postgres -f password
 
-# List secrets in a namespace
+# List secrets in a namespace (default namespace is --service kyz)
 kyz list --service github
+
+# List across all services
+kyz list --all
 
 # Tag secrets for group injection
 kyz set deploy-key --service github -f token=ghp_xxx --tag deploy --tag ci
@@ -83,6 +86,29 @@ Wrap an agent or long-running process with pre-approved secret access and policy
 kyz wrap --allow github/deploy-key,aws/prod -- ./agent.sh
 kyz wrap --allow '*' -- ./trusted-script.sh
 ```
+
+### kyz ipc
+
+Local IPC helpers for Pi/TUI/runner integrations (Unix socket).
+
+```bash
+# Submit one-time secret payload (reads value from stdin if --value omitted)
+kyz ipc submit --request-id req-123 --service github --key token --ttl 120 --value ghp_xxx
+
+# Issue brokered JIT grant (scoped by secret/command/workspace)
+kyz ipc grant --token grant-1 --secret github/token --command gh --workspace /work/repo --ttl 120 --use-count 1
+
+# Consume one-time secret (value is redacted by default)
+kyz ipc use --request-id req-123 --json
+
+# Reveal value explicitly (opt-in)
+kyz ipc use --request-id req-123 --reveal-value
+
+# Validate one grant usage
+kyz ipc use --token grant-1 --secret github/token --command gh --workspace /work/repo
+```
+
+`kyz ipc use` defaults to strict redaction (`value: null`, `value_redacted: true`) unless `--reveal-value` is set.
 
 ### Aliases
 
@@ -140,6 +166,8 @@ Bypass with `--no-policy` (use with caution).
 
 All secret access through `exec`, `pipe`, and `wrap` is logged to syslog with operation type, secret names, and target commands.
 
+`kyz-api` IPC audit events log metadata only (`request_id`, `service`, `key`, outcome/reason), never secret values.
+
 ## Import / Export
 
 ```bash
@@ -177,7 +205,7 @@ Shared library providing:
 
 ### kyz-cli
 
-Command-line interface with subcommands: `set`, `get`, `delete`, `list`, `export`, `import`, `vault`, `exec`, `pipe`, `wrap`, `init`, `config`, `completions`.
+Command-line interface with subcommands: `set`, `get`, `delete`, `list`, `export`, `import`, `vault`, `exec`, `pipe`, `wrap`, `ipc`, `init`, `config`, `completions`.
 
 Global flags: `-q`, `-v`, `--debug`, `--trace`, `--json`, `--yaml`, `--no-color`, `--dry-run`, `--yes`.
 
@@ -204,7 +232,7 @@ kyz-mcp
 
 ### kyz-api
 
-HTTP API server (axum) with auth request workflow for headless agents:
+HTTP API server (axum) with auth request workflow for headless agents and a local Unix IPC socket (`$XDG_STATE_HOME/kyz/kyz-ipc.sock` by default):
 
 | Endpoint | Method | Description |
 |---|---|---|
@@ -221,6 +249,8 @@ HTTP API server (axum) with auth request workflow for headless agents:
 
 ```bash
 kyz-api --port 3000
+# optional: override IPC socket path
+kyz-api --ipc-socket /tmp/kyz-ipc.sock
 ```
 
 Set `KYZ_API_TOKEN` to require `Authorization: Bearer <token>` on all endpoints except `/health`.
