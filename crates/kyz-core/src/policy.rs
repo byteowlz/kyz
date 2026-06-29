@@ -226,9 +226,9 @@ pub fn find_policy_file() -> Option<PathBuf> {
         return Some(workspace.to_path_buf());
     }
 
-    // XDG config
-    if let Some(config_dir) = dirs::config_dir() {
-        let global = config_dir.join("kyz").join("policy.json");
+    // XDG config (option-B paths helper: XDG_* on any OS, ~/.config on unix incl. macOS)
+    if let Ok(config_dir) = crate::paths::default_config_dir() {
+        let global = config_dir.join("policy.json");
         if global.exists() {
             return Some(global);
         }

@@ -1986,7 +1986,6 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "config",
- "dirs",
  "fs2",
  "getrandom 0.3.4",
  "hostname",
