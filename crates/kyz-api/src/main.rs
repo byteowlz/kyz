@@ -1,7 +1,7 @@
 //! HTTP API server for rust-workspace.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -17,12 +17,14 @@ use clap::{Args, Parser};
 use log::info;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
+use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use kyz_core::{
-    AppConfig, AppPaths, AuthRequestStore, CreateAuthRequest, DenyAuthRequest, SecretStore,
-    VaultStore,
+    AppConfig, AppPaths, AuthRequestStore, CreateAuthRequest, DecisionReason, DenyAuthRequest,
+    GrantScope, GrantStore, GrantUseContext, JitGrant, OneTimeSecretSubmission,
+    OneTimeSubmissionStore, OriginMetadata, SecretStore, VaultStore,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -35,6 +37,7 @@ async fn try_main() -> Result<()> {
 
     let cli = Cli::parse();
     let paths = AppPaths::discover(cli.common.config.as_deref())?;
+    paths.ensure_directories()?;
     let config = AppConfig::load(&paths, false)?;
 
     let vault_store =
@@ -47,7 +50,19 @@ async fn try_main() -> Result<()> {
             .filter(|t| !t.is_empty()),
         auth_requests: AuthRequestStore::new(),
         vault_store: Arc::new(vault_store),
+        one_time_submissions: Arc::new(Mutex::new(OneTimeSubmissionStore::new())),
+        grants: Arc::new(Mutex::new(GrantStore::new())),
     };
+
+    #[cfg(unix)]
+    {
+        let ipc_socket = cli
+            .common
+            .ipc_socket
+            .clone()
+            .unwrap_or_else(|| paths.state_dir.join("kyz-ipc.sock"));
+        start_ipc_server(ipc_socket, state.clone()).await?;
+    }
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -102,6 +117,10 @@ struct CommonOpts {
     /// Port to listen on
     #[arg(short, long, default_value = "3000")]
     port: u16,
+
+    /// Local Unix socket path for one-time secret IPC.
+    #[arg(long, value_name = "PATH")]
+    ipc_socket: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -110,6 +129,8 @@ struct AppState {
     api_token: Option<String>,
     auth_requests: AuthRequestStore,
     vault_store: Arc<VaultStore>,
+    one_time_submissions: Arc<Mutex<OneTimeSubmissionStore>>,
+    grants: Arc<Mutex<GrantStore>>,
 }
 
 #[derive(Serialize)]
@@ -505,5 +526,270 @@ async fn handle_wait_ws(
                 }
             }
         }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum IpcRequest {
+    SubmitSecret {
+        request_id: String,
+        service: String,
+        key: String,
+        value: String,
+        expires_at: u64,
+        #[serde(default)]
+        origin: OriginMetadata,
+    },
+    ResolveSecret {
+        request_id: String,
+    },
+    IssueGrant {
+        token: String,
+        secret_refs: Vec<String>,
+        #[serde(default)]
+        commands: Vec<String>,
+        #[serde(default)]
+        workspaces: Vec<String>,
+        expires_at: u64,
+        #[serde(default = "default_grant_use_count")]
+        use_count: u32,
+    },
+    ValidateGrant {
+        token: String,
+        secret_ref: String,
+        command: String,
+        workspace: String,
+    },
+}
+
+#[cfg(unix)]
+const fn default_grant_use_count() -> u32 {
+    1
+}
+
+#[cfg(unix)]
+#[derive(Debug, Serialize)]
+struct IpcResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
+#[cfg(unix)]
+async fn start_ipc_server(path: PathBuf, state: AppState) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use tokio::net::UnixListener;
+
+    ensure_secure_socket_parent(&path)?;
+
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+
+    info!("Starting IPC server on {}", path.display());
+
+    tokio::spawn(async move {
+        loop {
+            let accepted = listener.accept().await;
+            let Ok((stream, _addr)) = accepted else {
+                break;
+            };
+            let state_cloned = state.clone();
+            tokio::spawn(async move {
+                let _ = handle_ipc_connection(stream, state_cloned).await;
+            });
+        }
+    });
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_secure_socket_parent(path: &FsPath) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some(parent) = path.parent() else {
+        return Err(anyhow::anyhow!("invalid IPC socket path"));
+    };
+
+    std::fs::create_dir_all(parent)?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn handle_ipc_connection(stream: tokio::net::UnixStream, state: AppState) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let _bytes = reader.read_line(&mut line).await?;
+
+    let request = serde_json::from_str::<IpcRequest>(&line);
+    let response = match request {
+        Ok(req) => process_ipc_request(req, &state).await,
+        Err(_) => IpcResponse {
+            ok: false,
+            reason: Some(reason_label(DecisionReason::Malformed)),
+            service: None,
+            key: None,
+            value: None,
+        },
+    };
+
+    let payload = serde_json::to_string(&response)?;
+    let socket = reader.get_mut();
+    socket.write_all(payload.as_bytes()).await?;
+    socket.write_all(b"\n").await?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn process_ipc_request(req: IpcRequest, state: &AppState) -> IpcResponse {
+    match req {
+        IpcRequest::SubmitSecret {
+            request_id,
+            service,
+            key,
+            value,
+            expires_at,
+            origin,
+        } => {
+            let payload = OneTimeSecretSubmission {
+                request_id: request_id.clone(),
+                service: service.clone(),
+                key: key.clone(),
+                value,
+                expires_at,
+                origin,
+            };
+            let mut store = state.one_time_submissions.lock().await;
+            match store.submit(payload, kyz_core::jit::now_unix()) {
+                Ok(()) => {
+                    log::info!(
+                        "ipc_submit accepted request_id={request_id} service={service} key={key}"
+                    );
+                    IpcResponse {
+                        ok: true,
+                        reason: None,
+                        service: None,
+                        key: None,
+                        value: None,
+                    }
+                }
+                Err(reason) => {
+                    log::warn!(
+                        "ipc_submit denied request_id={request_id} service={service} key={key} reason={}",
+                        reason_label(reason)
+                    );
+                    IpcResponse {
+                        ok: false,
+                        reason: Some(reason_label(reason)),
+                        service: None,
+                        key: None,
+                        value: None,
+                    }
+                }
+            }
+        }
+        IpcRequest::ResolveSecret { request_id } => {
+            let mut store = state.one_time_submissions.lock().await;
+            match store.resolve_once(&request_id, kyz_core::jit::now_unix()) {
+                Ok(found) => IpcResponse {
+                    ok: true,
+                    reason: None,
+                    service: Some(found.service),
+                    key: Some(found.key),
+                    value: Some(found.value),
+                },
+                Err(reason) => IpcResponse {
+                    ok: false,
+                    reason: Some(reason_label(reason)),
+                    service: None,
+                    key: None,
+                    value: None,
+                },
+            }
+        }
+        IpcRequest::IssueGrant {
+            token,
+            secret_refs,
+            commands,
+            workspaces,
+            expires_at,
+            use_count,
+        } => {
+            let mut grants = state.grants.lock().await;
+            grants.insert(JitGrant {
+                token,
+                scope: GrantScope {
+                    secret_refs,
+                    commands,
+                    workspaces,
+                },
+                expires_at,
+                use_count,
+            });
+            IpcResponse {
+                ok: true,
+                reason: None,
+                service: None,
+                key: None,
+                value: None,
+            }
+        }
+        IpcRequest::ValidateGrant {
+            token,
+            secret_ref,
+            command,
+            workspace,
+        } => {
+            let mut grants = state.grants.lock().await;
+            let use_ctx = GrantUseContext {
+                secret_ref: &secret_ref,
+                command: &command,
+                workspace: &workspace,
+            };
+            match grants.validate_and_consume(&token, &use_ctx, kyz_core::jit::now_unix()) {
+                Ok(()) => IpcResponse {
+                    ok: true,
+                    reason: None,
+                    service: None,
+                    key: None,
+                    value: None,
+                },
+                Err(reason) => IpcResponse {
+                    ok: false,
+                    reason: Some(reason_label(reason)),
+                    service: None,
+                    key: None,
+                    value: None,
+                },
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+const fn reason_label(reason: DecisionReason) -> &'static str {
+    match reason {
+        DecisionReason::Malformed => "malformed",
+        DecisionReason::Replayed => "replayed",
+        DecisionReason::Expired => "expired",
+        DecisionReason::NotFound => "not_found",
+        DecisionReason::OutOfScope => "out_of_scope",
+        DecisionReason::UseCountExceeded => "use_count_exceeded",
     }
 }

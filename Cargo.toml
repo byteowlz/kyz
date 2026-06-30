@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kyz-core",
+    "crates/kyz-runtime",
     "crates/kyz-cli",
     "crates/kyz-tui",
     "crates/kyz-mcp",
@@ -28,7 +29,6 @@ toml = "0.9"
 log = "0.4"
 env_logger = "0.11"
 config = { version = "0.15", features = ["toml"] }
-dirs = "6.0"
 shellexpand = "3.1"
 
 # CLI
@@ -47,6 +47,8 @@ rand = "0.9"
 subtle = "2.6"
 hex = "0.4"
 base64 = "0.22"
+scrypt = { version = "0.11", default-features = false, features = ["std"] }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
 libc = "0.2"
 fs2 = "0.4"
 getrandom = "0.3"
@@ -77,6 +79,7 @@ schemars = "1.2"
 
 # Internal crates
 kyz-core = { path = "crates/kyz-core" }
+kyz-runtime = { path = "crates/kyz-runtime" }
 
 # ============================================
 # MAXIMUM PRESET - rust-magic-linter

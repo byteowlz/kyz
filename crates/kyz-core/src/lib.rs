@@ -11,22 +11,30 @@
 //! - Vault session management (unlock/lock lifecycle)
 //! - Common types and error handling
 
+pub mod agent_ctx;
 pub mod audit;
 pub mod auth_request;
 pub mod config;
 pub mod error;
+pub mod jit;
 pub mod paths;
 pub mod policy;
 pub mod scan;
 pub mod schema;
 pub mod store;
+pub mod vault_v3;
 
+pub use agent_ctx::{AgentContext, RunMode};
 pub use auth_request::{
     AuthRequest, AuthRequestEvent, AuthRequestId, AuthRequestStatus, AuthRequestStore,
     CreateAuthRequest, DenyAuthRequest,
 };
 pub use config::{AliasConfig, AppConfig, LogLevel, LoggingConfig, PathsConfig, RuntimeConfig};
 pub use error::{CoreError, Result};
+pub use jit::{
+    DecisionReason, GrantScope, GrantStore, GrantUseContext, JitGrant, OneTimeSecretSubmission,
+    OneTimeSubmissionStore, OriginMetadata, StoredSubmission,
+};
 pub use paths::{AppPaths, default_cache_dir};
 pub use policy::{Policy, PolicyViolation, default_policy, resolve_policy};
 pub use schema::{generate_example_config, generate_schema, write_generated_files};
@@ -34,6 +42,10 @@ pub use store::{
     DEFAULT_HISTORY_RETENTION, EncryptedEntry, HistoryEntry, KeyringStore, SecretEntry,
     SecretStore, SecretSummary, VaultData, VaultFileV2, VaultSession, VaultStatus, VaultStore,
     decrypt_entry, encrypt_entry, env_vault_path, list_environments,
+};
+pub use vault_v3::{
+    DK_LEN, EncryptedEntryV3, HistoryEntryV3, KdfParams, VaultFileV3, decrypt_entry_v3, derive_kek,
+    encrypt_entry_v3, migrate_v2_to_v3,
 };
 
 /// Application name used for config directories and environment prefix.

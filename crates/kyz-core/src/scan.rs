@@ -11,7 +11,8 @@ use std::process::Command;
 use secrecy::ExposeSecret as _;
 
 use crate::error::CoreError;
-use crate::store::{SecretEntry, VaultFileV2, decrypt_entry};
+use crate::store::SecretEntry;
+use crate::vault_v3::{DK_LEN, VaultFileV3, decrypt_entry_v3};
 
 /// A match found during scanning.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -48,13 +49,13 @@ pub struct ScanOptions {
 ///
 /// Returns an error if decryption fails.
 pub fn build_secret_index(
-    vault: &VaultFileV2,
-    passphrase: &secrecy::SecretString,
+    vault: &VaultFileV3,
+    dk: &[u8; DK_LEN],
 ) -> Result<BTreeMap<String, String>, CoreError> {
     let mut index: BTreeMap<String, String> = BTreeMap::new();
 
     for encrypted in vault.entries.values() {
-        let entry: SecretEntry = decrypt_entry(encrypted, passphrase)?;
+        let entry: SecretEntry = decrypt_entry_v3(encrypted, dk)?;
         for (field_name, field_value) in &entry.fields {
             let value = field_value.expose_secret();
             // Skip very short values (too many false positives)

@@ -634,16 +634,15 @@ fn vault_store_unlock_wrong_passphrase() {
 
 #[test]
 fn vault_session_expiry() {
-    let passphrase = SecretString::from("test".to_string());
+    let dk = zeroize::Zeroizing::new([7u8; 32]);
     let path = PathBuf::from("/tmp/fake-vault.json");
 
-    let session = VaultSession::new(passphrase.clone(), &path, 3600);
+    let session = VaultSession::new(dk.clone(), &path, 3600);
     assert!(!session.is_expired());
     assert!(session.remaining_secs() > 3500);
 
-    // Create an already-expired session
     let expired = VaultSession {
-        passphrase,
+        dk,
         expires_at: 0,
         vault_path: path,
     };
@@ -652,14 +651,11 @@ fn vault_session_expiry() {
 }
 
 #[test]
-fn vault_session_debug_redacts_passphrase() {
-    let session = VaultSession::new(
-        SecretString::from("super-secret".to_string()),
-        &PathBuf::from("/tmp/vault.json"),
-        3600,
-    );
+fn vault_session_debug_redacts_dk() {
+    let dk = zeroize::Zeroizing::new([0xABu8; 32]);
+    let session = VaultSession::new(dk, &PathBuf::from("/tmp/vault.json"), 3600);
     let debug = format!("{session:?}");
-    assert!(!debug.contains("super-secret"));
+    assert!(!debug.contains("171"));
     assert!(debug.contains("[REDACTED]"));
 }
 
@@ -848,6 +844,101 @@ fn vault_store_multi_field_entry() {
     assert_eq!(fetched.field("host"), Some("db.prod"));
     assert_eq!(fetched.field("port"), Some("5432"));
     assert_eq!(fetched.field("password"), Some("s3cr3t"));
+
+    cleanup(&store, &vault_path);
+}
+
+// ---------------------------------------------------------------------------
+// resolve_with_env: AGENT_CTX_WORKSPACE_PATH defaulting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolve_with_env_uses_workspace_hint_when_vault_present() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let kyz_dir = workspace.path().join(".kyz");
+    std::fs::create_dir_all(&kyz_dir).expect("create .kyz");
+    let vault_file = kyz_dir.join("vault.json");
+    std::fs::write(&vault_file, "{}").expect("seed vault file");
+
+    let store = VaultStore::resolve_with_env(None, None, Some(workspace.path()))
+        .expect("resolve_with_env should succeed");
+    assert_eq!(store.vault_path(), vault_file);
+}
+
+#[test]
+fn resolve_with_env_explicit_vault_wins_over_workspace_hint() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    std::fs::create_dir_all(workspace.path().join(".kyz")).expect("create .kyz");
+    std::fs::write(workspace.path().join(".kyz/vault.json"), "{}").expect("seed vault");
+
+    let explicit = temp_vault_path("explicit-wins");
+    let store = VaultStore::resolve_with_env(Some(&explicit), None, Some(workspace.path()))
+        .expect("resolve");
+    assert_eq!(store.vault_path(), explicit);
+}
+
+#[test]
+fn resolve_with_env_ignores_hint_without_workspace_vault() {
+    // Hint points at a directory with no .kyz/vault.json; resolution must fall
+    // through to cwd/central rather than fabricating a path under the hint.
+    let empty = tempfile::tempdir().expect("empty tempdir");
+    let store = VaultStore::resolve_with_env(None, None, Some(empty.path())).expect("resolve");
+    assert_ne!(
+        store.vault_path(),
+        empty.path().join(".kyz/vault.json"),
+        "hint without an existing vault must not be returned as the resolved path",
+    );
+}
+
+// =========================================================================
+// V3 vault format tests
+// =========================================================================
+
+#[test]
+fn vault_store_init_writes_v3_on_disk() {
+    let vault_path = temp_vault_path("v3-on-disk");
+    let store = VaultStore::new(vault_path.clone());
+    store.init(strong_passphrase(), false).expect("init");
+
+    let bytes = std::fs::read(&vault_path).expect("read vault file");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+    assert_eq!(value["version"], 3, "newly-initialized vault should be v3");
+    assert!(
+        value.get("kdf").is_some(),
+        "v3 vault must contain kdf header"
+    );
+    assert!(
+        value.get("wrapped_dk").is_some(),
+        "v3 vault must contain wrapped_dk header"
+    );
+
+    let _ = std::fs::remove_file(&vault_path);
+}
+
+#[test]
+fn vault_store_unlock_migrates_v2_to_v3() {
+    let vault_path = temp_vault_path("migrate-v2");
+    let pass = SecretString::from(strong_passphrase().to_string());
+
+    // Seed a V2 vault on disk with one entry.
+    let mut v2 = VaultFileV2::new();
+    let entry = SecretEntry::single("svc", "key", "secret-value-abc");
+    v2.set(&entry, &pass).expect("v2 set");
+    let json = serde_json::to_vec_pretty(&v2).expect("serialize v2");
+    std::fs::write(&vault_path, &json).expect("write v2 file");
+
+    // Unlock should auto-migrate V2 → V3.
+    let store = VaultStore::new(vault_path.clone());
+    store.unlock(strong_passphrase(), 60).expect("unlock");
+
+    // Secret survives the migration.
+    let fetched = store.get("svc", "key").expect("get after migrate");
+    assert_eq!(fetched.value(), Some("secret-value-abc"));
+
+    // On-disk vault is now v3.
+    let bytes = std::fs::read(&vault_path).expect("read vault file");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+    assert_eq!(value["version"], 3, "vault should be v3 after migration");
 
     cleanup(&store, &vault_path);
 }

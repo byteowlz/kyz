@@ -1,0 +1,23 @@
+[package]
+name = "kyz-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "High-level library integration surface for kyz - open vaults, resolve refs, inspect SSH identities"
+
+[lints]
+workspace = true
+
+[dependencies]
+kyz-core.workspace = true
+thiserror.workspace = true
+secrecy.workspace = true
+log.workspace = true
+ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "p256", "p384", "p521"] }
+
+[dev-dependencies]
+tempfile.workspace = true
