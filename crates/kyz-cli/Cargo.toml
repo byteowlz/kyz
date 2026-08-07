@@ -16,6 +16,10 @@ workspace = true
 name = "kyz"
 path = "src/main.rs"
 
+[features]
+default = ["mask-output"]
+mask-output = []
+
 [dependencies]
 kyz-core.workspace = true
 anyhow.workspace = true

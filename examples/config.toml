@@ -1,4 +1,4 @@
-"$schema" = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/kyz/kyz.config.schema.json"
+#:schema https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/kyz/kyz.config.schema.json
 
 # Configuration for kyz.
 # Copy this file to $XDG_CONFIG_HOME/kyz/config.toml and adjust as needed.

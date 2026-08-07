@@ -26,7 +26,11 @@ use kyz_core::{AppConfig, AppPaths, SecretEntry, SecretStore, VaultStore, defaul
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
 /// Fields that should use hidden input when prompting interactively.
+#[cfg(feature = "mask-output")]
 const SENSITIVE_FIELDS: &[&str] = &["password", "token", "secret", "key", "api_key", "value"];
+
+#[cfg(not(feature = "mask-output"))]
+const SENSITIVE_FIELDS: &[&str] = &[];
 
 fn main() -> anyhow::Result<()> {
     try_main()
@@ -868,11 +872,16 @@ fn is_sensitive_field(name: &str) -> bool {
     SENSITIVE_FIELDS.iter().any(|s| lower.contains(s))
 }
 
-fn fields_to_plain(fields: &BTreeMap<String, SecretString>) -> BTreeMap<String, String> {
-    fields
-        .iter()
-        .map(|(name, value)| (name.clone(), value.expose_secret().to_string()))
-        .collect()
+fn mask_sensitive_fields(fields: &BTreeMap<String, SecretString>) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (name, value) in fields {
+        if is_sensitive_field(name) {
+            out.insert(name.clone(), serde_json::Value::String("****".to_string()));
+        } else {
+            out.insert(name.clone(), serde_json::Value::String(value.expose_secret().to_string()));
+        }
+    }
+    out
 }
 
 fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
@@ -940,7 +949,11 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
         let value = entry
             .field(field_name)
             .ok_or_else(|| anyhow!("field '{field_name}' not found in entry '{}'", cmd.key))?;
-        println!("{value}");
+        if is_sensitive_field(field_name) {
+            println!("****");
+        } else {
+            println!("{value}");
+        }
         return Ok(());
     }
 
@@ -949,7 +962,7 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
         let obj = serde_json::json!({
             "service": entry.service,
             "key": entry.key,
-            "fields": fields_to_plain(&entry.fields),
+            "fields": mask_sensitive_fields(&entry.fields),
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
         });
@@ -961,7 +974,7 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
         let obj = serde_json::json!({
             "service": entry.service,
             "key": entry.key,
-            "fields": fields_to_plain(&entry.fields),
+            "fields": mask_sensitive_fields(&entry.fields),
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
         });
@@ -970,8 +983,10 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
             serde_yaml::to_string(&obj).context("serializing to YAML")?
         );
     } else if entry.fields.len() == 1 && entry.fields.contains_key("value") {
-        // Single-value entry: just print the value
-        if let Some(v) = entry.value() {
+        // Single-value entry: check if the field is sensitive
+        if is_sensitive_field("value") {
+            println!("****");
+        } else if let Some(v) = entry.value() {
             println!("{v}");
         }
     } else {
