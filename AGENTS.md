@@ -87,7 +87,7 @@ trx close <id> --reason "Done" --json         # Complete work
 
 Priorities: 0=critical, 1=high, 2=medium (default), 3=low, 4=backlog
 
-Always commit `.beads/issues.jsonl` with code changes.
+Always commit `.trx/issues.jsonl` with code changes.
 
 ## Memory System (agntz memory)
 
