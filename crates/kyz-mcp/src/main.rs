@@ -111,6 +111,11 @@ impl McpServer {
 }
 
 #[tool_handler]
+// The rmcp macro expands async trait fns; this stub's fns never await.
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "rmcp macro-generated async fns have no awaits in this stub"
+)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {

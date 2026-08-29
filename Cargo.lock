@@ -1943,6 +1943,7 @@ dependencies = [
  "axum",
  "clap",
  "env_logger",
+ "getrandom 0.3.4",
  "kyz-core",
  "log",
  "secrecy",
