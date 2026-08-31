@@ -226,3 +226,19 @@ release-tag VERSION:
 # Set up GitHub secrets for automated releases (requires byt)
 setup-secrets:
     byt secrets setup kyz
+
+# Publish kyz's agent skill to the canonical byteowlz skills repository.
+sync-skills:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="${SKILLISSUES:-$HOME/byteowlz/skillissues}"
+    test -d "$target/skills" || { echo "skillissues repo not found: $target" >&2; exit 1; }
+    rm -rf "$target/skills/kyz"
+    cp -a skill/kyz "$target/skills/"
+    just --justfile "$target/Justfile" update-readme
+    git -C "$target" add skills/kyz README.md
+    if [[ -n "$(git -C "$target" status --porcelain -- skills/kyz README.md)" ]]; then
+        git -C "$target" commit -m "skills/kyz: sync from kyz" -- skills/kyz README.md
+    else
+        echo "kyz is already up to date"
+    fi
