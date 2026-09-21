@@ -30,3 +30,4 @@ tower.workspace = true
 tower-http.workspace = true
 subtle.workspace = true
 secrecy.workspace = true
+getrandom.workspace = true

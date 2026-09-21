@@ -111,11 +111,10 @@ impl McpServer {
 }
 
 #[tool_handler]
-// The async trait signature is fixed by rmcp's ServerHandler; the macro
-// generates an impl body without a direct `.await`.
+// The rmcp macro expands async trait fns; this stub's fns never await.
 #[expect(
     clippy::unused_async_trait_impl,
-    reason = "async signature is required by rmcp's ServerHandler trait"
+    reason = "rmcp macro-generated async fns have no awaits in this stub"
 )]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {

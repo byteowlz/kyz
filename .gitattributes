@@ -3,3 +3,6 @@
 # behave identically on every platform including Windows runners with
 # core.autocrlf=true.
 * text=auto eol=lf
+.trx/issues.jsonl text eol=lf merge=union
+.trx/events.jsonl text eol=lf merge=union
+.trx/verifications.jsonl text eol=lf merge=union

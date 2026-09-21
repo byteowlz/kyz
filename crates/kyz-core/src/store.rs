@@ -22,6 +22,10 @@ use zeroize::Zeroizing;
 use crate::error::CoreError;
 use crate::vault_v3::{DK_LEN, VaultFileV3, decrypt_entry_v3, migrate_v2_to_v3};
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
 /// Default service name used when none is specified.
 pub const DEFAULT_SERVICE: &str = "kyz";
 
@@ -33,6 +37,10 @@ pub const VAULT_FILENAME: &str = "vault.json";
 
 /// Workspace vault directory name.
 pub const WORKSPACE_VAULT_DIR: &str = ".kyz";
+
+// ---------------------------------------------------------------------------
+// Data model
+// ---------------------------------------------------------------------------
 
 /// A stored secret entry with multiple named fields.
 ///
@@ -170,6 +178,10 @@ impl From<&SecretEntry> for SecretSummary {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SecretStore trait
+// ---------------------------------------------------------------------------
+
 /// Trait for secret store backends.
 ///
 /// Implementations provide CRUD operations for multi-field secret entries
@@ -213,6 +225,10 @@ pub trait SecretStore: fmt::Debug + Send + Sync {
     /// Returns an error if the backend fails.
     fn list_services(&self) -> Result<Vec<String>, CoreError>;
 }
+
+// ---------------------------------------------------------------------------
+// Vault file format
+// ---------------------------------------------------------------------------
 
 /// In-memory representation of the vault's plaintext contents.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -293,6 +309,10 @@ impl VaultData {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vault encryption / decryption (age passphrase-based)
+// ---------------------------------------------------------------------------
+
 /// Encrypt vault data with a passphrase using age (scrypt KDF + ChaCha20-Poly1305).
 ///
 /// # Errors
@@ -347,6 +367,10 @@ pub fn decrypt_vault(encrypted: &[u8], passphrase: &SecretString) -> Result<Vaul
 
     Ok(data)
 }
+
+// ---------------------------------------------------------------------------
+// Vault v2: per-entry encryption
+// ---------------------------------------------------------------------------
 
 /// Vault file format v2: per-entry encrypted fields with plaintext metadata.
 ///
@@ -757,6 +781,10 @@ pub fn migrate_v1_to_v2(
     Ok(v2)
 }
 
+// ---------------------------------------------------------------------------
+// Session file management
+// ---------------------------------------------------------------------------
+
 /// Metadata stored in the session file (no secrets).
 ///
 /// The session file holds only non-sensitive data: expiry time and vault path.
@@ -1103,6 +1131,10 @@ impl VaultSession {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fallback session (age-encrypted file when keyring is unavailable)
+// ---------------------------------------------------------------------------
+
 /// Full session data for the encrypted-file fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FallbackSession {
@@ -1199,6 +1231,10 @@ fn decrypt_session_data(encrypted: &[u8], material: &str) -> Result<Vec<u8>, Cor
 
     Ok(decrypted)
 }
+
+// ---------------------------------------------------------------------------
+// VaultStore backend
+// ---------------------------------------------------------------------------
 
 /// File-based vault backend using age encryption.
 ///
@@ -1524,7 +1560,10 @@ impl VaultStore {
     /// Load the data key from the active session, or error if locked.
     fn require_session(&self) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
         let session = VaultSession::load(&self.vault_path)?.ok_or_else(|| {
-            CoreError::Secret("vault is locked. Run 'kyz vault unlock' first.".to_string())
+            CoreError::Secret(format!(
+                "vault is locked ({}). Run 'kyz vault unlock' first.",
+                self.vault_path.display()
+            ))
         })?;
         Ok(session.dk)
     }
@@ -1773,6 +1812,10 @@ impl VaultStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KeyringStore backend (kept for desktop use)
+// ---------------------------------------------------------------------------
+
 /// OS keyring backend using the `keyring` crate.
 ///
 /// Stores each secret entry as a JSON blob in the platform-native credential
@@ -1942,6 +1985,10 @@ mod secret_fields_serde {
     }
 }
 
+// ---------------------------------------------------------------------------
+// File locking
+// ---------------------------------------------------------------------------
+
 /// Advisory file lock for vault operations.
 ///
 /// Uses platform-native locking: `flock` on Unix, `LockFileEx` on Windows.
@@ -1998,6 +2045,10 @@ impl VaultFileLock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Passphrase policy
+// ---------------------------------------------------------------------------
+
 const MIN_PASSPHRASE_LEN: usize = 16;
 const PASS_PHRASE_POLICY_ENV_BYPASS: &str = "KYZ_VAULT_PASSWORD";
 
@@ -2035,6 +2086,10 @@ fn ensure_passphrase_strength(passphrase: &str) -> Result<(), CoreError> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /// Get the vault file path for a named environment.
 ///

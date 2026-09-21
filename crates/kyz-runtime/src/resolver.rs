@@ -164,17 +164,29 @@ impl LayeredVault {
     /// Returns [`Error::NotFound`] if no layer matched, or a backend
     /// error if one of the consulted layers failed.
     pub fn resolve_in(&self, r: &SecretRef, constraint: &SourceConstraint) -> Result<Resolved> {
+        let mut locked: Vec<VaultSource> = Vec::new();
         for (idx, vault) in self.layers.iter().enumerate() {
             if !constraint.includes(vault.source()) {
                 continue;
             }
-            if let Some(entry) = vault.try_get(r)? {
-                return Ok(Resolved {
-                    entry,
-                    source: vault.source().clone(),
-                    layer_index: idx,
-                });
+            match vault.try_get(r) {
+                Ok(Some(entry)) => {
+                    return Ok(Resolved {
+                        entry,
+                        source: vault.source().clone(),
+                        layer_index: idx,
+                    });
+                }
+                Ok(None) => {}
+                // A locked layer must not poison resolution of later layers:
+                // a repo-supplied `.kyz/vault.json` the user never unlocked
+                // would otherwise break lookups of unrelated, unlocked layers.
+                Err(Error::VaultLocked { .. }) => locked.push(vault.source().clone()),
+                Err(e) => return Err(e),
             }
+        }
+        if let Some(source) = locked.first() {
+            return Err(Error::vault_locked(source));
         }
         Err(Error::NotFound {
             reference: r.clone(),
@@ -203,15 +215,24 @@ impl LayeredVault {
     /// - [`Error::Ambiguous`] if more than one layer matched.
     pub fn resolve_strict(&self, r: &SecretRef, constraint: &SourceConstraint) -> Result<Resolved> {
         let mut hits: Vec<(usize, VaultSource, SecretEntry)> = Vec::new();
+        let mut locked: Vec<VaultSource> = Vec::new();
         for (idx, vault) in self.layers.iter().enumerate() {
             if !constraint.includes(vault.source()) {
                 continue;
             }
-            if let Some(entry) = vault.try_get(r)? {
-                hits.push((idx, vault.source().clone(), entry));
+            match vault.try_get(r) {
+                Ok(Some(entry)) => hits.push((idx, vault.source().clone(), entry)),
+                Ok(None) => {}
+                // Skip locked layers; see `resolve_in`.
+                Err(Error::VaultLocked { .. }) => locked.push(vault.source().clone()),
+                Err(e) => return Err(e),
             }
         }
         match hits.len() {
+            0 if !locked.is_empty() => {
+                let source = &locked[0];
+                Err(Error::vault_locked(source))
+            }
             0 => Err(Error::NotFound {
                 reference: r.clone(),
             }),

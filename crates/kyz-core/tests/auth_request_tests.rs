@@ -14,12 +14,16 @@ use kyz_core::auth_request::{
     AuthRequestStatus, AuthRequestStore, CreateAuthRequest, DenyAuthRequest,
 };
 
+/// Client-generated pickup capability used across tests (>= 32 chars).
+const TEST_CAPABILITY: &str = "0123456789abcdef0123456789abcdef";
+
 fn test_params() -> CreateAuthRequest {
     CreateAuthRequest {
         requester: "test-agent".to_string(),
         scopes: vec!["github/token".to_string()],
         reason: Some("testing".to_string()),
         ttl_seconds: 300,
+        pickup_capability: TEST_CAPABILITY.to_string(),
     }
 }
 
@@ -208,15 +212,62 @@ fn stash_and_pickup_secrets() {
 
     store.stash_secrets(&req.id, secrets).expect("stash");
 
-    // First pickup succeeds
-    let picked = store.pickup_secrets(&req.id).expect("pickup");
+    // First pickup with the correct capability succeeds
+    let picked = store
+        .pickup_secrets(&req.id, TEST_CAPABILITY)
+        .expect("pickup");
     assert!(picked.is_some());
     let picked = picked.expect("some");
     assert!(picked.contains_key("github/token"));
 
     // Second pickup returns None (one-time)
-    let second = store.pickup_secrets(&req.id).expect("pickup again");
+    let second = store
+        .pickup_secrets(&req.id, TEST_CAPABILITY)
+        .expect("pickup again");
     assert!(second.is_none());
+}
+
+#[test]
+fn pickup_requires_correct_capability() {
+    let store = AuthRequestStore::new();
+    let req = store.create(&test_params()).expect("create");
+    store.approve(&req.id).expect("approve");
+
+    let mut secrets = std::collections::BTreeMap::new();
+    let mut scope_secrets = std::collections::BTreeMap::new();
+    scope_secrets.insert("value".to_string(), "ghp_abc123".to_string());
+    secrets.insert("github/token".to_string(), scope_secrets);
+    store.stash_secrets(&req.id, secrets).expect("stash");
+
+    // Wrong capability is indistinguishable from "nothing to pick up" ...
+    let wrong = store
+        .pickup_secrets(&req.id, "9999999999999999999999999999999a")
+        .expect("pickup with wrong capability");
+    assert!(wrong.is_none());
+
+    // ... and the stash remains redeemable by the legitimate requester.
+    let picked = store
+        .pickup_secrets(&req.id, TEST_CAPABILITY)
+        .expect("pickup");
+    assert!(picked.is_some());
+}
+
+#[test]
+fn capability_is_never_serialized() {
+    let store = AuthRequestStore::new();
+    let req = store.create(&test_params()).expect("create");
+    let json = serde_json::to_string(&req).expect("serialize");
+    assert!(
+        !json.contains(TEST_CAPABILITY),
+        "capability leaked in JSON: {json}"
+    );
+
+    // Creation without a capability is refused.
+    let mut params = test_params();
+    params.pickup_capability = "short".to_string();
+    assert!(store.create(&params).is_err());
+    params.pickup_capability = "   ".to_string();
+    assert!(store.create(&params).is_err());
 }
 
 #[test]
@@ -242,6 +293,7 @@ fn auto_expire_on_get() {
         scopes: vec!["scope".to_string()],
         reason: None,
         ttl_seconds: 0,
+        pickup_capability: TEST_CAPABILITY.to_string(),
     };
     let req = store.create(&params).expect("create");
 
@@ -283,6 +335,7 @@ fn request_scopes_preserved() {
         ],
         reason: Some("deploy".to_string()),
         ttl_seconds: 300,
+        pickup_capability: TEST_CAPABILITY.to_string(),
     };
     let req = store.create(&params).expect("create");
     assert_eq!(req.scopes.len(), 3);

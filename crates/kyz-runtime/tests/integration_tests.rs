@@ -26,6 +26,10 @@ use kyz_runtime::{
     VaultKind, VaultSource,
 };
 
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
 // Real Ed25519 test key generated with ssh-keygen; used to exercise
 // metadata derivation. The corresponding public key and SHA-256
 // fingerprint are embedded below for assertion.
@@ -77,6 +81,14 @@ fn cleanup(vault: &Vault, path: &PathBuf) {
     let _ = vault.lock();
     let _ = std::fs::remove_file(path);
 }
+
+// ---------------------------------------------------------------------------
+// Error mapping
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Vault facade
+// ---------------------------------------------------------------------------
 
 #[test]
 fn open_explicit_path_infers_custom_source() {
@@ -176,6 +188,10 @@ fn list_all_returns_every_entry() {
     assert_eq!(all.len(), 3);
     cleanup(&vault, &path);
 }
+
+// ---------------------------------------------------------------------------
+// Layered resolver
+// ---------------------------------------------------------------------------
 
 struct Layered {
     vault: LayeredVault,
@@ -317,6 +333,10 @@ fn cleanup_paths(l: &Layered) {
     let _ = std::fs::remove_file(&l.workspace_path);
     let _ = std::fs::remove_file(&l.personal_path);
 }
+
+// ---------------------------------------------------------------------------
+// SSH identity helpers
+// ---------------------------------------------------------------------------
 
 fn ssh_entry_with_private_key(service: &str, key: &str) -> SecretEntry {
     let mut fields = BTreeMap::new();
@@ -504,4 +524,59 @@ fn secret_string_field_round_trips() {
     let pw = vault.get_field(&r, "password").expect("get_field");
     assert_eq!(pw.expose_secret(), "s3cret");
     cleanup(&vault, &path);
+}
+
+#[test]
+fn locked_workspace_layer_does_not_poison_resolution() {
+    // Hostile-repo shape: a workspace vault EXISTS but is never unlocked.
+    // It must not break resolution of refs that live in later, unlocked
+    // layers (run-2 finding F9), and failures must carry real provenance.
+    let workspace_path = temp_vault_path("locked-ws");
+    let personal_path = temp_vault_path("locked-ws-personal");
+
+    let workspace = Vault::open_path(&workspace_path)
+        .with_source(VaultSource::workspace(workspace_path.clone()));
+    workspace
+        .init(&strong_passphrase(), false)
+        .expect("workspace init (stays locked)");
+
+    let personal =
+        Vault::open_path(&personal_path).with_source(VaultSource::personal(personal_path.clone()));
+    personal
+        .init(&strong_passphrase(), false)
+        .expect("personal init");
+    personal
+        .unlock_interactive(&strong_passphrase(), None)
+        .expect("personal unlock");
+    set_simple(&personal, "api", "user-token", "personal-token");
+
+    let layered = LayeredVault::builder()
+        .push(workspace)
+        .push(personal)
+        .build();
+
+    // Personal-only ref resolves despite the locked earlier layer.
+    let got = layered
+        .resolve(&SecretRef::new("api", "user-token"))
+        .expect("resolve must skip the locked layer");
+    assert_eq!(got.layer_index, 1);
+    assert_eq!(got.entry.value(), Some("personal-token"));
+
+    // Miss everywhere + locked layer: actionable VaultLocked with real path.
+    let err = layered
+        .resolve(&SecretRef::new("svc", "missing"))
+        .expect_err("missing ref with locked layer must error");
+    match err {
+        Error::VaultLocked { path } => {
+            assert!(
+                path.contains(workspace_path.to_string_lossy().as_ref())
+                    || path.contains("workspace"),
+                "expected real layer provenance, got: {path}"
+            );
+        }
+        other => panic!("expected VaultLocked, got: {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&workspace_path);
+    let _ = std::fs::remove_file(&personal_path);
 }

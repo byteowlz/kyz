@@ -55,6 +55,19 @@ pub const DEFAULT_KDF_R: u32 = 8;
 /// Default scrypt parallelism parameter.
 pub const DEFAULT_KDF_P: u32 = 1;
 
+/// Minimum supported scrypt cost exponent (`N = 2^15`). Vault files outside
+/// the supported ranges are rejected before any key derivation.
+pub const MIN_KDF_LOG_N: u8 = 15;
+
+/// Maximum supported scrypt cost exponent (`N = 2^20`, 1 `GiB` of working area).
+pub const MAX_KDF_LOG_N: u8 = 20;
+
+/// Maximum supported scrypt block size parameter.
+pub const MAX_KDF_R: u32 = 64;
+
+/// Maximum supported scrypt parallelism parameter.
+pub const MAX_KDF_P: u32 = 8;
+
 // ---------------------------------------------------------------------------
 // KDF parameters (stored in vault file header)
 // ---------------------------------------------------------------------------
@@ -102,13 +115,45 @@ impl KdfParams {
             .map_err(|e| CoreError::Serialization(format!("invalid KDF salt base64: {e}")))
     }
 
-    fn scrypt_params(&self) -> Result<ScryptParams, CoreError> {
+    /// Validate stored KDF parameters against supported bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the algorithm is unsupported or any parameter is
+    /// outside its supported range (vault file corrupt or hostile).
+    pub fn validate_params(&self) -> Result<(), CoreError> {
         if self.algo != "scrypt" {
             return Err(CoreError::Secret(format!(
                 "unsupported KDF algorithm '{}'",
                 self.algo
             )));
         }
+        // Clamp attacker-controlled parameters from the vault file: scrypt
+        // allocates 128*r*N working memory, so unbounded log_n/r/p from a
+        // hostile vault would abort the process on allocation.
+        if !(MIN_KDF_LOG_N..=MAX_KDF_LOG_N).contains(&self.log_n) {
+            return Err(CoreError::Secret(format!(
+                "kdf log_n {} outside supported range {MIN_KDF_LOG_N}..={MAX_KDF_LOG_N}; refusing to derive key (vault file may be corrupt or hostile)",
+                self.log_n
+            )));
+        }
+        if self.r == 0 || self.r > MAX_KDF_R {
+            return Err(CoreError::Secret(format!(
+                "kdf r {} outside supported range 1..={MAX_KDF_R}; refusing to derive key",
+                self.r
+            )));
+        }
+        if self.p == 0 || self.p > MAX_KDF_P {
+            return Err(CoreError::Secret(format!(
+                "kdf p {} outside supported range 1..={MAX_KDF_P}; refusing to derive key",
+                self.p
+            )));
+        }
+        Ok(())
+    }
+
+    fn scrypt_params(&self) -> Result<ScryptParams, CoreError> {
+        self.validate_params()?;
         ScryptParams::new(self.log_n, self.r, self.p, DK_LEN)
             .map_err(|e| CoreError::Secret(format!("invalid scrypt params: {e}")))
     }

@@ -261,11 +261,77 @@ pub fn resolve_policy(explicit_path: Option<&Path>, no_policy: bool) -> Result<P
         return load_policy(path);
     }
 
+    // Auto-discovered files (repo/workspace) may only TIGHTEN the built-in
+    // defaults: deny-lists are unioned with the default deny-lists so a
+    // hostile repository cannot strip the exfiltration guardrails. Explicit
+    // --policy paths are loaded as-is: that is an explicit user decision.
     if let Some(path) = find_policy_file() {
-        return load_policy(&path);
+        let mut policy = load_policy(&path)?;
+        union_deny_lists(&mut policy, &default_policy());
+        log::info!(
+            "using auto-discovered policy from {} (deny-lists unioned with built-in defaults)",
+            path.display()
+        );
+        return Ok(policy);
     }
 
     Ok(default_policy())
+}
+
+// ---------------------------------------------------------------------------
+// Env-name safety for secret injection
+// ---------------------------------------------------------------------------
+
+/// Environment variable names that alter shell/loader behavior and must never
+/// be populated from secret field names or mappings.
+const UNSAFE_ENV_NAMES: &[&str] = &[
+    "PATH",
+    "BASH_ENV",
+    "ENV",
+    "IFS",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "SHELL",
+    "CDPATH",
+    "GLOBIGNORE",
+    "ZDOTDIR",
+];
+
+/// Whether `name` (already uppercased for field-derived names) is safe to
+/// inject as an environment variable into a child process.
+///
+/// Rejects dynamic-loader hooks (`LD_*`, `DYLD_*`), kyz's own namespace, and
+/// the process-behavior names in [`UNSAFE_ENV_NAMES`]; otherwise requires
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+#[must_use]
+pub fn is_safe_exec_env_name(name: &str) -> bool {
+    if name.starts_with("LD_") || name.starts_with("DYLD_") || name.starts_with("KYZ_") {
+        return false;
+    }
+    if UNSAFE_ENV_NAMES.contains(&name) {
+        return false;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Union `defaults`' deny-lists into `policy` (repo/workspace policies may
+/// only tighten the built-in defaults, never loosen them).
+pub fn union_deny_lists(policy: &mut Policy, defaults: &Policy) {
+    for cmd in &defaults.deny_commands {
+        if !policy.deny_commands.contains(cmd) {
+            policy.deny_commands.push(cmd.clone());
+        }
+    }
+    for arg in &defaults.deny_args {
+        if !policy.deny_args.contains(arg) {
+            policy.deny_args.push(arg.clone());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
