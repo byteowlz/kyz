@@ -16,6 +16,20 @@
         "$ref": "#/definitions/AliasConfig"
       }
     },
+    "daemon": {
+      "description": "Credential daemon configuration.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/DaemonConfig"
+        }
+      ],
+      "default": {
+        "max_in_flight": 32,
+        "request_body_limit_bytes": 10485760,
+        "response_body_limit_bytes": 20971520,
+        "timeout_secs": 0
+      }
+    },
     "history_retention": {
       "description": "Maximum number of history versions to retain per secret entry.\nOlder versions are discarded on each update. Set to 0 to disable history.",
       "type": "integer",
@@ -49,6 +63,17 @@
       "type": "string",
       "default": "default"
     },
+    "proxy": {
+      "description": "HTTP credential proxy configuration.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProxyConfig"
+        }
+      ],
+      "default": {
+        "auth": "token"
+      }
+    },
     "runtime": {
       "description": "Runtime behavior configuration.",
       "allOf": [
@@ -59,6 +84,13 @@
       "default": {
         "fail_fast": true,
         "timeout": 60
+      }
+    },
+    "scripts": {
+      "description": "Pinned script grants for `kyz run` (grant name → definition).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/ScriptGrantConfig"
       }
     }
   },
@@ -89,6 +121,48 @@
           }
         }
       }
+    },
+    "DaemonConfig": {
+      "description": "Credential daemon lifecycle and listener configuration",
+      "type": "object",
+      "properties": {
+        "listen": {
+          "description": "Loopback SocketAddr for the HTTP credential proxy listener",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_in_flight": {
+          "description": "Maximum concurrent in-flight proxy requests.",
+          "type": "integer",
+          "format": "uint",
+          "default": 32,
+          "minimum": 1
+        },
+        "request_body_limit_bytes": {
+          "description": "Maximum accepted request body size in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 10485760,
+          "minimum": 1
+        },
+        "response_body_limit_bytes": {
+          "description": "Maximum accepted response body size in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 20971520,
+          "minimum": 1
+        },
+        "timeout_secs": {
+          "description": "Daemon lifetime in seconds. 0 means run until `kyz daemon stop`,\ncrash, or reboot. This is independent of vault session timeouts.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     },
     "LogLevel": {
       "description": "Log level enumeration for schema validation.",
@@ -162,6 +236,143 @@
         }
       }
     },
+    "ProxyAuthMode": {
+      "description": "Credential proxy authentication mode",
+      "oneOf": [
+        {
+          "description": "Require the per-daemon bearer token (default).",
+          "type": "string",
+          "const": "token"
+        },
+        {
+          "description": "No proxy authentication (loopback only; same-user attacks remain).",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "ProxyConfig": {
+      "description": "HTTP credential proxy configuration",
+      "type": "object",
+      "properties": {
+        "auth": {
+          "description": "Proxy authentication mode (default: token).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProxyAuthMode"
+            }
+          ],
+          "default": "token"
+        },
+        "rules": {
+          "description": "Routing rules. Matching semantics and validation live in\n[`crate::proxy_config`].",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProxyRuleConfig"
+          }
+        }
+      }
+    },
+    "ProxyCredentialConfig": {
+      "description": "Credential binding for a proxy rule",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "description": "Unique alias within the rule, used as `{{alias.field}}` in templates.",
+          "type": "string",
+          "default": ""
+        },
+        "fields": {
+          "description": "Fields this credential is allowed to resolve (explicit allowlist).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "key": {
+          "description": "Vault key of the secret entry.",
+          "type": "string",
+          "default": ""
+        },
+        "service": {
+          "description": "Vault service namespace of the secret entry.",
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "ProxyRuleConfig": {
+      "description": "Credential proxy routing rule",
+      "type": "object",
+      "properties": {
+        "credentials": {
+          "description": "Credentials this rule may resolve, referenced by alias from templates.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProxyCredentialConfig"
+          }
+        },
+        "headers": {
+          "description": "Header templates. Values support literal text plus `{{alias.field}}`\nsubstitutions only.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "host": {
+          "description": "Host this rule matches after normalization. Exact hostname or a\nleft-side single-label wildcard (`*.example.com`).",
+          "type": "string",
+          "default": ""
+        },
+        "methods": {
+          "description": "Allowed HTTP methods. Defaults to common API methods. `CONNECT` and\n`TRACE` are rejected regardless of this list.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "Unique rule name (used in audit events).",
+          "type": "string",
+          "default": ""
+        },
+        "path_prefix": {
+          "description": "Path prefix this rule matches (longest prefix wins). Defaults to `/`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "static_headers": {
+          "description": "Static headers added verbatim (no templates allowed here).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "strip": {
+          "description": "Client headers stripped before credential injection.",
+          "type": "array",
+          "default": [
+            "Authorization",
+            "X-Api-Key"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "upstream": {
+          "description": "Upstream base URL. Must be `https://` without userinfo.",
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": false
+    },
     "RuntimeConfig": {
       "description": "Runtime behavior configuration",
       "type": "object",
@@ -191,6 +402,31 @@
           "minimum": 1
         }
       }
+    },
+    "ScriptGrantConfig": {
+      "description": "Pinned script grant for kyz run",
+      "type": "object",
+      "properties": {
+        "env": {
+          "description": "Environment the grant may receive: `ENV_VAR -> \"service/key:field\"`.\nThis map is the entire permission boundary — fields not listed are\nnever exposed to the script.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "path": {
+          "description": "Canonical absolute path of the script.",
+          "type": "string",
+          "default": ""
+        },
+        "sha256": {
+          "description": "Hex SHA-256 of the script contents (64 characters).",
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

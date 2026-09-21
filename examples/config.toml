@@ -14,3 +14,12 @@ timeout = 60
 fail_fast = true
 
 [paths]
+
+[daemon]
+timeout_secs = 0
+max_in_flight = 32
+request_body_limit_bytes = 10485760
+response_body_limit_bytes = 20971520
+
+[proxy]
+auth = "token"

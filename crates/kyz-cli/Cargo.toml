@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 kyz-core.workspace = true
+kyz-daemon.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
@@ -34,3 +35,4 @@ humantime.workspace = true
 ureq.workspace = true
 tungstenite.workspace = true
 tempfile.workspace = true
+zeroize.workspace = true

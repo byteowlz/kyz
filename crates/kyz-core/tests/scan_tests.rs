@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
+    )
+)]
 //! Integration tests for secret scanning.
 
 use std::collections::BTreeMap;
@@ -14,9 +24,9 @@ fn build_secret_index_creates_entries() {
     let (mut v3, dk) = VaultFileV3::create(&passphrase).expect("create");
 
     let entry = SecretEntry::single("github", "token", "ghp_abcdef123456");
-    v3.set(&entry, &*dk).expect("set");
+    v3.set(&entry, &dk).expect("set");
 
-    let index = kyz_core::scan::build_secret_index(&v3, &*dk).expect("build index");
+    let index = kyz_core::scan::build_secret_index(&v3, &dk).expect("build index");
     assert!(index.contains_key("ghp_abcdef123456"));
     assert_eq!(index["ghp_abcdef123456"], "github/token:value");
 }
@@ -28,9 +38,9 @@ fn build_secret_index_skips_short_values() {
 
     // Short values (<4 chars) should be excluded to avoid false positives
     let entry = SecretEntry::single("svc", "key", "ab");
-    v3.set(&entry, &*dk).expect("set");
+    v3.set(&entry, &dk).expect("set");
 
-    let index = kyz_core::scan::build_secret_index(&v3, &*dk).expect("build index");
+    let index = kyz_core::scan::build_secret_index(&v3, &dk).expect("build index");
     assert!(index.is_empty(), "short values should be excluded");
 }
 
@@ -49,9 +59,9 @@ fn build_secret_index_multi_field() {
         SecretString::from("super-secret-pass".to_string()),
     );
     let entry = SecretEntry::new("db", "prod", fields);
-    v3.set(&entry, &*dk).expect("set");
+    v3.set(&entry, &dk).expect("set");
 
-    let index = kyz_core::scan::build_secret_index(&v3, &*dk).expect("build index");
+    let index = kyz_core::scan::build_secret_index(&v3, &dk).expect("build index");
     assert!(index.contains_key("admin-user"));
     assert!(index.contains_key("super-secret-pass"));
 }
@@ -131,14 +141,14 @@ fn scan_files_multiple_matches() {
     writeln!(f, "safe line").expect("write");
     writeln!(f, "also has ghp_leaked_token_abc in it").expect("write");
 
-    let files = vec![file1, file2];
+    let paths = vec![file1, file2];
     let mut index = BTreeMap::new();
     index.insert(
         "ghp_leaked_token_abc".to_string(),
         "github/token:value".to_string(),
     );
 
-    let result = kyz_core::scan::scan_files(&files, &index, dir.path()).expect("scan");
+    let result = kyz_core::scan::scan_files(&paths, &index, dir.path()).expect("scan");
     assert_eq!(result.files_scanned, 2);
     assert_eq!(result.matches.len(), 2);
 }

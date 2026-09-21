@@ -111,6 +111,12 @@ impl McpServer {
 }
 
 #[tool_handler]
+// The async trait signature is fixed by rmcp's ServerHandler; the macro
+// generates an impl body without a direct `.await`.
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "async signature is required by rmcp's ServerHandler trait"
+)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {

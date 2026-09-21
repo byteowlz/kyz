@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (full daemon integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: "Tests (Linux is the first full daemon integration environment: Unix sockets, file permissions, /proc assertions)"
+        run: cargo test --workspace
+
+  windows:
+    name: Windows (core units + named pipe protocol + ACL)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Core unit tests
+        run: cargo test -p kyz-core
+      - name: Daemon tests (named pipe protocol, state-dir ACL, lifecycle)
+        run: cargo test -p kyz-daemon
+      - name: CLI daemon process tests
+        run: cargo test -p kyz-cli --test daemon_process
+
+  macos:
+    name: macOS (full daemon integration)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: "Tests (Unix paths on a second platform: Unix sockets, permission modes, kill/restart recovery)"
+        run: cargo test --workspace
+
+  config-schema:
+    name: Generated config/schema consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate and diff
+        run: |
+          cargo run -p kyz-core --example generate_config
+          git diff --exit-code examples/config.toml examples/config.schema.json

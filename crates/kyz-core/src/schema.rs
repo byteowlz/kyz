@@ -216,12 +216,11 @@ mod tests {
 
         let examples_dir = workspace_root.join("examples");
 
-        if !examples_dir.exists() {
-            panic!(
-                "examples/ directory not found at {}. Create it and run 'just generate-config'.",
-                examples_dir.display()
-            );
-        }
+        assert!(
+            examples_dir.exists(),
+            "examples/ directory not found at {}. Create it and run 'just generate-config'.",
+            examples_dir.display()
+        );
 
         validate_against_examples(&examples_dir, APP_NAME, REPO_URL)
             .expect("examples/ files are out of date");

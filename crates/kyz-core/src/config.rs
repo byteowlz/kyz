@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use config::{Config, Environment, File, FileFormat};
+use config::{Config, Environment, File, FileFormat, Source};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,18 @@ pub struct AppConfig {
     /// to inject as environment variables when wrapping a process.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, AliasConfig>,
+
+    /// Credential daemon configuration.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
+
+    /// HTTP credential proxy configuration.
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+
+    /// Pinned script grants for `kyz run` (grant name → definition).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scripts: BTreeMap<String, ScriptGrantConfig>,
 }
 
 fn default_profile() -> String {
@@ -89,6 +101,29 @@ impl AppConfig {
     ///
     /// Returns an error if the config file cannot be read or parsed.
     pub fn load_from_path(config_file: &Path) -> Result<Self> {
+        Self::load_with_file_source(
+            File::from(config_file)
+                .format(FileFormat::Toml)
+                .required(false),
+        )
+    }
+
+    /// Load configuration from raw TOML bytes plus environment overrides.
+    ///
+    /// Callers that already read the file (e.g. to hash it) use this to
+    /// parse exactly those bytes, without a second read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes are not valid UTF-8 or parsing fails.
+    pub fn load_from_bytes(raw: &[u8]) -> Result<Self> {
+        let text = std::str::from_utf8(raw)
+            .map_err(|e| anyhow::anyhow!("config is not valid UTF-8: {e}"))?;
+        Self::load_with_file_source(File::from_str(text, FileFormat::Toml))
+    }
+
+    /// Build the configuration from a TOML file source plus environment.
+    fn load_with_file_source(file: impl Source + Send + Sync + 'static) -> Result<Self> {
         let env_prefix = env_prefix();
         let built = Config::builder()
             .set_default("profile", "default")?
@@ -96,11 +131,7 @@ impl AppConfig {
             .set_default("runtime.parallelism", default_parallelism() as i64)?
             .set_default("runtime.timeout", 60_i64)?
             .set_default("runtime.fail_fast", true)?
-            .add_source(
-                File::from(config_file)
-                    .format(FileFormat::Toml)
-                    .required(false),
-            )
+            .add_source(file)
             .add_source(Environment::with_prefix(env_prefix.as_str()).separator("__"))
             .build()?;
 
@@ -129,6 +160,9 @@ impl Default for AppConfig {
             paths: PathsConfig::default(),
             history_retention: default_history_retention(),
             aliases: BTreeMap::new(),
+            daemon: DaemonConfig::default(),
+            proxy: ProxyConfig::default(),
+            scripts: BTreeMap::new(),
         }
     }
 }
@@ -258,4 +292,201 @@ pub struct PathsConfig {
     /// Directory for state files. Supports ~ and environment variables.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_dir: Option<String>,
+}
+
+/// Default request body limit for the credential proxy (10 `MiB`).
+pub const DEFAULT_REQUEST_BODY_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Default response body limit for the credential proxy (20 `MiB`).
+pub const DEFAULT_RESPONSE_BODY_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Default maximum number of in-flight proxy requests.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 32;
+
+/// Maximum accepted `daemon.timeout_secs` / `--timeout` value (366 days).
+///
+/// Anything larger is indistinguishable from "run until stopped" and is
+/// rejected at load time rather than risking an `Instant + Duration`
+/// overflow when the deadline is computed.
+pub const MAX_TIMEOUT_SECS: u64 = 366 * 24 * 60 * 60;
+
+/// Credential daemon lifecycle and listener configuration.
+///
+/// Unknown keys are rejected so that multi-vault declarations fail loudly
+/// instead of being silently ignored (single-vault is the only supported
+/// mode in this version).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+#[schemars(description = "Credential daemon lifecycle and listener configuration")]
+pub struct DaemonConfig {
+    /// Loopback address the credential proxy binds to (e.g. "127.0.0.1:8477").
+    /// Must be a loopback socket address; the management IPC endpoint is not
+    /// affected by this setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Loopback SocketAddr for the HTTP credential proxy listener")]
+    pub listen: Option<String>,
+
+    /// Daemon lifetime in seconds. 0 means run until `kyz daemon stop`,
+    /// crash, or reboot. This is independent of vault session timeouts.
+    #[schemars(range(min = 0))]
+    pub timeout_secs: u64,
+
+    /// Maximum concurrent in-flight proxy requests.
+    #[schemars(range(min = 1))]
+    pub max_in_flight: usize,
+
+    /// Maximum accepted request body size in bytes.
+    #[schemars(range(min = 1))]
+    pub request_body_limit_bytes: u64,
+
+    /// Maximum accepted response body size in bytes.
+    #[schemars(range(min = 1))]
+    pub response_body_limit_bytes: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            timeout_secs: 0,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            request_body_limit_bytes: DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+            response_body_limit_bytes: DEFAULT_RESPONSE_BODY_LIMIT_BYTES,
+        }
+    }
+}
+
+/// Authentication mode for the HTTP credential proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+#[schemars(description = "Credential proxy authentication mode")]
+pub enum ProxyAuthMode {
+    /// Require the per-daemon bearer token (default).
+    #[default]
+    Token,
+    /// No proxy authentication (loopback only; same-user attacks remain).
+    None,
+}
+
+/// HTTP credential proxy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(default)]
+#[schemars(description = "HTTP credential proxy configuration")]
+pub struct ProxyConfig {
+    /// Proxy authentication mode (default: token).
+    pub auth: ProxyAuthMode,
+
+    /// Routing rules. Matching semantics and validation live in
+    /// [`crate::proxy_config`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<ProxyRuleConfig>,
+}
+
+/// Headers stripped from client requests before credentials are injected.
+pub const DEFAULT_STRIP_HEADERS: &[&str] = &["Authorization", "X-Api-Key"];
+
+fn default_strip() -> Vec<String> {
+    DEFAULT_STRIP_HEADERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// One credential proxy routing rule.
+///
+/// Unknown keys are rejected so per-rule vault declarations fail loudly
+/// (single-vault only in this version).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+#[schemars(description = "Credential proxy routing rule")]
+pub struct ProxyRuleConfig {
+    /// Unique rule name (used in audit events).
+    pub name: String,
+
+    /// Host this rule matches after normalization. Exact hostname or a
+    /// left-side single-label wildcard (`*.example.com`).
+    pub host: String,
+
+    /// Path prefix this rule matches (longest prefix wins). Defaults to `/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+
+    /// Allowed HTTP methods. Defaults to common API methods. `CONNECT` and
+    /// `TRACE` are rejected regardless of this list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<String>>,
+
+    /// Upstream base URL. Must be `https://` without userinfo.
+    pub upstream: String,
+
+    /// Client headers stripped before credential injection.
+    #[serde(default = "default_strip")]
+    pub strip: Vec<String>,
+
+    /// Credentials this rule may resolve, referenced by alias from templates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<ProxyCredentialConfig>,
+
+    /// Header templates. Values support literal text plus `{{alias.field}}`
+    /// substitutions only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+
+    /// Static headers added verbatim (no templates allowed here).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub static_headers: BTreeMap<String, String>,
+}
+
+impl Default for ProxyRuleConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            host: String::new(),
+            path_prefix: None,
+            methods: None,
+            upstream: String::new(),
+            strip: default_strip(),
+            credentials: Vec::new(),
+            headers: BTreeMap::new(),
+            static_headers: BTreeMap::new(),
+        }
+    }
+}
+
+/// A credential binding referenced by alias from header templates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+#[schemars(description = "Credential binding for a proxy rule")]
+pub struct ProxyCredentialConfig {
+    /// Unique alias within the rule, used as `{{alias.field}}` in templates.
+    pub alias: String,
+
+    /// Vault service namespace of the secret entry.
+    pub service: String,
+
+    /// Vault key of the secret entry.
+    pub key: String,
+
+    /// Fields this credential is allowed to resolve (explicit allowlist).
+    pub fields: Vec<String>,
+}
+
+/// A pinned script grant for `kyz run`.
+///
+/// Unknown keys are rejected so per-script vault declarations fail loudly
+/// (single-vault only in this version).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+#[schemars(description = "Pinned script grant for kyz run")]
+pub struct ScriptGrantConfig {
+    /// Canonical absolute path of the script.
+    pub path: String,
+
+    /// Hex SHA-256 of the script contents (64 characters).
+    pub sha256: String,
+
+    /// Environment the grant may receive: `ENV_VAR -> "service/key:field"`.
+    /// This map is the entire permission boundary — fields not listed are
+    /// never exposed to the script.
+    pub env: BTreeMap<String, String>,
 }

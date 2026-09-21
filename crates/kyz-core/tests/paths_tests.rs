@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
+    )
+)]
 //! Integration tests for XDG path resolution.
 
 use std::path::PathBuf;

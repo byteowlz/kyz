@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
+    )
+)]
 //! Integration tests for `kyz-runtime`.
 //!
 //! Covers the runtime facade (open/unlock/lock/get/set/delete), the
@@ -15,10 +25,6 @@ use kyz_runtime::{
     Error, LayeredVault, SecretEntry, SecretRef, SourceConstraint, UnlockMode, UnlockState, Vault,
     VaultKind, VaultSource,
 };
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 // Real Ed25519 test key generated with ssh-keygen; used to exercise
 // metadata derivation. The corresponding public key and SHA-256
@@ -71,10 +77,6 @@ fn cleanup(vault: &Vault, path: &PathBuf) {
     let _ = vault.lock();
     let _ = std::fs::remove_file(path);
 }
-
-// ---------------------------------------------------------------------------
-// Vault facade
-// ---------------------------------------------------------------------------
 
 #[test]
 fn open_explicit_path_infers_custom_source() {
@@ -175,12 +177,8 @@ fn list_all_returns_every_entry() {
     cleanup(&vault, &path);
 }
 
-// ---------------------------------------------------------------------------
-// Layered resolver
-// ---------------------------------------------------------------------------
-
 struct Layered {
-    layered: LayeredVault,
+    vault: LayeredVault,
     workspace_path: PathBuf,
     personal_path: PathBuf,
 }
@@ -214,13 +212,13 @@ fn build_layered(label: &str) -> Layered {
     set_simple(&personal, "api", "user-token", "personal-token");
     set_simple(&personal, "svc", "shared", "personal-shared");
 
-    let layered = LayeredVault::builder()
+    let vault = LayeredVault::builder()
         .push(workspace)
         .push(personal)
         .build();
 
     Layered {
-        layered,
+        vault,
         workspace_path,
         personal_path,
     }
@@ -231,7 +229,7 @@ fn layered_resolve_first_hit_wins() {
     let l = build_layered("first-hit");
 
     let got = l
-        .layered
+        .vault
         .resolve(&SecretRef::new("svc", "shared"))
         .expect("resolve");
     assert_eq!(got.layer_index, 0);
@@ -240,7 +238,7 @@ fn layered_resolve_first_hit_wins() {
 
     // Personal-only key falls through to layer 1.
     let got = l
-        .layered
+        .vault
         .resolve(&SecretRef::new("api", "user-token"))
         .expect("fallback resolve");
     assert_eq!(got.layer_index, 1);
@@ -254,7 +252,7 @@ fn layered_constraint_workspace_only_blocks_personal_fallback() {
     let l = build_layered("ws-only");
 
     let err = l
-        .layered
+        .vault
         .resolve_in(
             &SecretRef::new("api", "user-token"),
             &SourceConstraint::workspace_only(),
@@ -269,7 +267,7 @@ fn layered_constraint_workspace_only_blocks_personal_fallback() {
 fn layered_constraint_no_personal_is_equivalent_for_service_mode() {
     let l = build_layered("no-personal");
     let err = l
-        .layered
+        .vault
         .resolve_in(
             &SecretRef::new("api", "user-token"),
             &SourceConstraint::no_personal(),
@@ -284,7 +282,7 @@ fn layered_resolve_strict_detects_ambiguity() {
     let l = build_layered("ambiguous");
 
     let err = l
-        .layered
+        .vault
         .resolve_strict(&SecretRef::new("svc", "shared"), &SourceConstraint::Any)
         .expect_err("two layers hold this key; strict must report ambiguity");
 
@@ -305,7 +303,7 @@ fn layered_resolve_strict_accepts_unique_hit() {
     let l = build_layered("strict-unique");
 
     let got = l
-        .layered
+        .vault
         .resolve_strict(&SecretRef::new("api", "user-token"), &SourceConstraint::Any)
         .expect("only personal layer has this key");
     assert_eq!(got.source.kind(), &VaultKind::Personal);
@@ -313,16 +311,12 @@ fn layered_resolve_strict_accepts_unique_hit() {
 }
 
 fn cleanup_paths(l: &Layered) {
-    for v in l.layered.layers() {
+    for v in l.vault.layers() {
         let _ = v.lock();
     }
     let _ = std::fs::remove_file(&l.workspace_path);
     let _ = std::fs::remove_file(&l.personal_path);
 }
-
-// ---------------------------------------------------------------------------
-// SSH identity helpers
-// ---------------------------------------------------------------------------
 
 fn ssh_entry_with_private_key(service: &str, key: &str) -> SecretEntry {
     let mut fields = BTreeMap::new();
@@ -457,10 +451,6 @@ fn identity_tagged_without_any_key_material_errors() {
         other => panic!("expected Ssh, got {other:?}"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Error mapping
-// ---------------------------------------------------------------------------
 
 #[test]
 fn locked_vault_returns_vault_locked_error() {

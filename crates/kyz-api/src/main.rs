@@ -1,8 +1,11 @@
 //! HTTP API server for rust-workspace.
 
 use std::net::SocketAddr;
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(unix)]
+use std::path::Path as FsPath;
 
 use anyhow::Result;
 use axum::{
@@ -17,14 +20,21 @@ use clap::{Args, Parser};
 use log::info;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
+#[cfg(unix)]
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use kyz_core::{
-    AppConfig, AppPaths, AuthRequestStore, CreateAuthRequest, DecisionReason, DenyAuthRequest,
-    GrantScope, GrantStore, GrantUseContext, JitGrant, OneTimeSecretSubmission,
-    OneTimeSubmissionStore, OriginMetadata, SecretStore, VaultStore,
+    AppConfig, AppPaths, AuthRequestStore, CreateAuthRequest, DenyAuthRequest, SecretStore,
+    VaultStore,
+};
+// One-time secret submissions and JIT grants are served over the Unix
+// socket IPC channel only.
+#[cfg(unix)]
+use kyz_core::{
+    DecisionReason, GrantScope, GrantStore, GrantUseContext, JitGrant, OneTimeSecretSubmission,
+    OneTimeSubmissionStore, OriginMetadata,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -50,7 +60,9 @@ async fn try_main() -> Result<()> {
             .filter(|t| !t.is_empty()),
         auth_requests: AuthRequestStore::new(),
         vault_store: Arc::new(vault_store),
+        #[cfg(unix)]
         one_time_submissions: Arc::new(Mutex::new(OneTimeSubmissionStore::new())),
+        #[cfg(unix)]
         grants: Arc::new(Mutex::new(GrantStore::new())),
     };
 
@@ -61,7 +73,7 @@ async fn try_main() -> Result<()> {
             .ipc_socket
             .clone()
             .unwrap_or_else(|| paths.state_dir.join("kyz-ipc.sock"));
-        start_ipc_server(ipc_socket, state.clone()).await?;
+        start_ipc_server(&ipc_socket, state.clone())?;
     }
 
     let cors = CorsLayer::new()
@@ -129,7 +141,10 @@ struct AppState {
     api_token: Option<String>,
     auth_requests: AuthRequestStore,
     vault_store: Arc<VaultStore>,
+    /// One-time submissions / JIT grants, served over the Unix IPC channel.
+    #[cfg(unix)]
     one_time_submissions: Arc<Mutex<OneTimeSubmissionStore>>,
+    #[cfg(unix)]
     grants: Arc<Mutex<GrantStore>>,
 }
 
@@ -186,10 +201,6 @@ async fn health() -> Json<HealthResponse> {
 async fn get_config(State(state): State<AppState>) -> Result<Json<AppConfig>, StatusCode> {
     Ok(Json((*state.config).clone()))
 }
-
-// ---------------------------------------------------------------------------
-// Auth request handlers
-// ---------------------------------------------------------------------------
 
 /// `POST /auth/request` — create a new auth request from a headless agent.
 async fn create_auth_request(
@@ -271,10 +282,6 @@ async fn deny_auth_request(
 
     Ok(Json(request))
 }
-
-// ---------------------------------------------------------------------------
-// Auth approval handler
-// ---------------------------------------------------------------------------
 
 /// Request body for approving an auth request.
 #[derive(Debug, Deserialize)]
@@ -421,10 +428,6 @@ fn resolve_scope(
     })
 }
 
-// ---------------------------------------------------------------------------
-// One-time secret pickup endpoint
-// ---------------------------------------------------------------------------
-
 /// `GET /auth/secrets/:id` — one-time pickup of stashed secrets after approval.
 async fn pickup_secrets(
     State(state): State<AppState>,
@@ -443,10 +446,6 @@ async fn pickup_secrets(
 
     Ok(Json(secrets))
 }
-
-// ---------------------------------------------------------------------------
-// WebSocket wait endpoint
-// ---------------------------------------------------------------------------
 
 /// `GET /auth/wait/:id` — WebSocket upgrade. Sends a JSON message when the
 /// request is approved, denied, or expires, then closes.
@@ -584,18 +583,18 @@ struct IpcResponse {
 }
 
 #[cfg(unix)]
-async fn start_ipc_server(path: PathBuf, state: AppState) -> Result<()> {
+fn start_ipc_server(path: &FsPath, state: AppState) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     use tokio::net::UnixListener;
 
-    ensure_secure_socket_parent(&path)?;
+    ensure_secure_socket_parent(path)?;
 
     if path.exists() {
-        std::fs::remove_file(&path)?;
+        std::fs::remove_file(path)?;
     }
 
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
     info!("Starting IPC server on {}", path.display());
 
@@ -675,54 +674,9 @@ async fn process_ipc_request(req: IpcRequest, state: &AppState) -> IpcResponse {
                 expires_at,
                 origin,
             };
-            let mut store = state.one_time_submissions.lock().await;
-            match store.submit(payload, kyz_core::jit::now_unix()) {
-                Ok(()) => {
-                    log::info!(
-                        "ipc_submit accepted request_id={request_id} service={service} key={key}"
-                    );
-                    IpcResponse {
-                        ok: true,
-                        reason: None,
-                        service: None,
-                        key: None,
-                        value: None,
-                    }
-                }
-                Err(reason) => {
-                    log::warn!(
-                        "ipc_submit denied request_id={request_id} service={service} key={key} reason={}",
-                        reason_label(reason)
-                    );
-                    IpcResponse {
-                        ok: false,
-                        reason: Some(reason_label(reason)),
-                        service: None,
-                        key: None,
-                        value: None,
-                    }
-                }
-            }
+            ipc_submit_secret(state, payload, &request_id, &service, &key).await
         }
-        IpcRequest::ResolveSecret { request_id } => {
-            let mut store = state.one_time_submissions.lock().await;
-            match store.resolve_once(&request_id, kyz_core::jit::now_unix()) {
-                Ok(found) => IpcResponse {
-                    ok: true,
-                    reason: None,
-                    service: Some(found.service),
-                    key: Some(found.key),
-                    value: Some(found.value),
-                },
-                Err(reason) => IpcResponse {
-                    ok: false,
-                    reason: Some(reason_label(reason)),
-                    service: None,
-                    key: None,
-                    value: None,
-                },
-            }
-        }
+        IpcRequest::ResolveSecret { request_id } => ipc_resolve_secret(state, &request_id).await,
         IpcRequest::IssueGrant {
             token,
             secret_refs,
@@ -731,8 +685,7 @@ async fn process_ipc_request(req: IpcRequest, state: &AppState) -> IpcResponse {
             expires_at,
             use_count,
         } => {
-            let mut grants = state.grants.lock().await;
-            grants.insert(JitGrant {
+            let grant = JitGrant {
                 token,
                 scope: GrantScope {
                     secret_refs,
@@ -741,44 +694,104 @@ async fn process_ipc_request(req: IpcRequest, state: &AppState) -> IpcResponse {
                 },
                 expires_at,
                 use_count,
-            });
-            IpcResponse {
-                ok: true,
-                reason: None,
-                service: None,
-                key: None,
-                value: None,
-            }
+            };
+            ipc_issue_grant(state, grant).await
         }
         IpcRequest::ValidateGrant {
             token,
             secret_ref,
             command,
             workspace,
-        } => {
-            let mut grants = state.grants.lock().await;
-            let use_ctx = GrantUseContext {
-                secret_ref: &secret_ref,
-                command: &command,
-                workspace: &workspace,
-            };
-            match grants.validate_and_consume(&token, &use_ctx, kyz_core::jit::now_unix()) {
-                Ok(()) => IpcResponse {
-                    ok: true,
-                    reason: None,
-                    service: None,
-                    key: None,
-                    value: None,
-                },
-                Err(reason) => IpcResponse {
-                    ok: false,
-                    reason: Some(reason_label(reason)),
-                    service: None,
-                    key: None,
-                    value: None,
-                },
-            }
+        } => ipc_validate_grant(state, &token, &secret_ref, &command, &workspace).await,
+    }
+}
+
+/// Store a submitted secret; `request_id`/`service`/`key` are kept for
+/// logging after `payload` is moved into the store.
+#[cfg(unix)]
+async fn ipc_submit_secret(
+    state: &AppState,
+    payload: OneTimeSecretSubmission,
+    request_id: &str,
+    service: &str,
+    key: &str,
+) -> IpcResponse {
+    let mut store = state.one_time_submissions.lock().await;
+    match store.submit(payload, kyz_core::jit::now_unix()) {
+        Ok(()) => {
+            log::info!("ipc_submit accepted request_id={request_id} service={service} key={key}");
+            ipc_ok()
         }
+        Err(reason) => {
+            log::warn!(
+                "ipc_submit denied request_id={request_id} service={service} key={key} reason={}",
+                reason_label(reason)
+            );
+            ipc_deny(reason_label(reason))
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn ipc_resolve_secret(state: &AppState, request_id: &str) -> IpcResponse {
+    let mut store = state.one_time_submissions.lock().await;
+    match store.resolve_once(request_id, kyz_core::jit::now_unix()) {
+        Ok(found) => IpcResponse {
+            ok: true,
+            reason: None,
+            service: Some(found.service),
+            key: Some(found.key),
+            value: Some(found.value),
+        },
+        Err(reason) => ipc_deny(reason_label(reason)),
+    }
+}
+
+#[cfg(unix)]
+async fn ipc_issue_grant(state: &AppState, grant: JitGrant) -> IpcResponse {
+    state.grants.lock().await.insert(grant);
+    ipc_ok()
+}
+
+#[cfg(unix)]
+async fn ipc_validate_grant(
+    state: &AppState,
+    token: &str,
+    secret_ref: &str,
+    command: &str,
+    workspace: &str,
+) -> IpcResponse {
+    let use_ctx = GrantUseContext {
+        secret_ref,
+        command,
+        workspace,
+    };
+    let mut grants = state.grants.lock().await;
+    match grants.validate_and_consume(token, &use_ctx, kyz_core::jit::now_unix()) {
+        Ok(()) => ipc_ok(),
+        Err(reason) => ipc_deny(reason_label(reason)),
+    }
+}
+
+#[cfg(unix)]
+const fn ipc_ok() -> IpcResponse {
+    IpcResponse {
+        ok: true,
+        reason: None,
+        service: None,
+        key: None,
+        value: None,
+    }
+}
+
+#[cfg(unix)]
+const fn ipc_deny(reason: &'static str) -> IpcResponse {
+    IpcResponse {
+        ok: false,
+        reason: Some(reason),
+        service: None,
+        key: None,
+        value: None,
     }
 }
 
