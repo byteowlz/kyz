@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-api"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-cli"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-core"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "age",
  "anyhow",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-mcp"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-runtime"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "kyz-core",
  "log",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-tui"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
