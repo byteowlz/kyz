@@ -1524,7 +1524,7 @@ impl VaultStore {
     /// Load the data key from the active session, or error if locked.
     fn require_session(&self) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
         let session = VaultSession::load(&self.vault_path)?.ok_or_else(|| {
-            CoreError::Secret("vault is locked. Run 'kyz unlock' first.".to_string())
+            CoreError::Secret("vault is locked. Run 'kyz vault unlock' first.".to_string())
         })?;
         Ok(session.dk)
     }
@@ -1532,7 +1532,7 @@ impl VaultStore {
     /// Read the v3 vault file (JSON parse only, no decryption).
     ///
     /// If the file on disk is v1 or v2, returns an error directing the caller
-    /// to run `kyz unlock` to trigger migration.
+    /// to run `kyz vault unlock` to trigger migration.
     fn read_vault_file(&self) -> Result<VaultFileV3, CoreError> {
         read_vault_file_at(&self.vault_path)
     }
@@ -1661,7 +1661,7 @@ impl UnlockedVault {
 /// under a shared (read) flock for safe concurrent access with CLI writers.
 ///
 /// If the file on disk is v1 or v2, returns an error directing the caller
-/// to run `kyz unlock` to trigger migration.
+/// to run `kyz vault unlock` to trigger migration.
 fn read_vault_file_at(vault_path: &Path) -> Result<VaultFileV3, CoreError> {
     if !vault_path.exists() {
         return Err(CoreError::Secret(format!(
@@ -1674,7 +1674,7 @@ fn read_vault_file_at(vault_path: &Path) -> Result<VaultFileV3, CoreError> {
     let version = detect_vault_version(&raw);
     if version != 3 {
         return Err(CoreError::Secret(format!(
-            "vault is v{version}; run 'kyz unlock' to migrate to v3"
+            "vault is v{version}; run 'kyz vault unlock' to migrate to v3"
         )));
     }
     serde_json::from_slice(&raw)
