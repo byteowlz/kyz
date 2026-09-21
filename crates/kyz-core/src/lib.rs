@@ -23,11 +23,12 @@ pub mod scan;
 pub mod schema;
 pub mod store;
 pub mod vault_v3;
+pub mod workspace_trust;
 
 pub use agent_ctx::{AgentContext, RunMode};
 pub use auth_request::{
     AuthRequest, AuthRequestEvent, AuthRequestId, AuthRequestStatus, AuthRequestStore,
-    CreateAuthRequest, DenyAuthRequest,
+    CreateAuthRequest, DenyAuthRequest, generate_pickup_capability,
 };
 pub use config::{AliasConfig, AppConfig, LogLevel, LoggingConfig, PathsConfig, RuntimeConfig};
 pub use error::{CoreError, Result};
@@ -36,7 +37,7 @@ pub use jit::{
     OneTimeSubmissionStore, OriginMetadata, StoredSubmission,
 };
 pub use paths::{AppPaths, default_cache_dir};
-pub use policy::{Policy, PolicyViolation, default_policy, resolve_policy};
+pub use policy::{Policy, PolicyViolation, default_policy, is_safe_exec_env_name, resolve_policy};
 pub use schema::{generate_example_config, generate_schema, write_generated_files};
 pub use store::{
     DEFAULT_HISTORY_RETENTION, EncryptedEntry, HistoryEntry, KeyringStore, SecretEntry,
@@ -44,8 +45,12 @@ pub use store::{
     decrypt_entry, encrypt_entry, env_vault_path, list_environments,
 };
 pub use vault_v3::{
-    DK_LEN, EncryptedEntryV3, HistoryEntryV3, KdfParams, VaultFileV3, decrypt_entry_v3, derive_kek,
-    encrypt_entry_v3, migrate_v2_to_v3,
+    DK_LEN, EncryptedEntryV3, HistoryEntryV3, KdfParams, MAX_KDF_LOG_N, MAX_KDF_P, MAX_KDF_R,
+    MIN_KDF_LOG_N, VaultFileV3, decrypt_entry_v3, derive_kek, encrypt_entry_v3, migrate_v2_to_v3,
+};
+pub use workspace_trust::{
+    fingerprint as workspace_vault_fingerprint, is_trusted as workspace_vault_is_trusted,
+    is_workspace_vault_path, record_trust as workspace_vault_record_trust,
 };
 
 /// Application name used for config directories and environment prefix.

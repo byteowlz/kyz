@@ -1510,7 +1510,10 @@ impl VaultStore {
     /// Load the data key from the active session, or error if locked.
     fn require_session(&self) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
         let session = VaultSession::load(&self.vault_path)?.ok_or_else(|| {
-            CoreError::Secret("vault is locked. Run 'kyz unlock' first.".to_string())
+            CoreError::Secret(format!(
+                "vault is locked ({}). Run 'kyz vault unlock' first.",
+                self.vault_path.display()
+            ))
         })?;
         Ok(session.dk)
     }

@@ -10,12 +10,63 @@ default:
 install:
     cargo install --path .
 
-# Install all binaries from workspace
+# Install all binaries with interactive confirmation
 install-all:
-    @for crate in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.targets[] | .kind[] == "bin") | .manifest_path | split("/") | .[-2]'); do \
-        echo "Installing $crate..."; \
-        cargo install --path crates/$crate; \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    echo "kyz Installation"
+    echo "================"
+    echo ""
+    
+    # Show toolchain info
+    if command -v rustup &>/dev/null; then
+        rustup show active-toolchain
+    else
+        cargo --version || { echo "Error: cargo not found"; exit 1; }
+    fi
+    echo ""
+    
+    # List binaries to install
+    echo "Binaries to install:"
+    cargo metadata --no-deps --format-version 1 |\
+        jq -r '.packages[] | select(.targets[] | .kind[] == "bin") | "  - \(.name) (\(.manifest_path | split("/") | .[-2]))"'
+    echo ""
+    
+    # Check if we should enable mask-output feature
+    echo "Features:"
+    echo "  mask-output  (default: ON)  - redacts sensitive fields in console output"
+    echo "  --no-default-features       - disable masking (prints raw values)"
+    echo ""
+    
+    read -rp "Proceed? [Y=default/n=skip/1=default/2=no-mask]: " choice
+    FEATURE_FLAG=""
+    case "${choice:-y}" in
+        [Yy]|""|1)
+            FEATURE_FLAG=""
+            ;;
+        2)
+            FEATURE_FLAG="--no-default-features"
+            echo "Using --no-default-features (no masking)"
+            ;;
+        [Nn]*)
+            echo "Installation cancelled"
+            exit 0
+            ;;
+        *)
+            echo "Invalid choice, installing with default features"
+            FEATURE_FLAG=""
+            ;;
+    esac
+    
+    echo "Installing with: $FEATURE_FLAG"
+    for crate in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.targets[] | .kind[] == "bin") | .manifest_path | split("/") | .[-2]'); do
+        echo "  Installing $crate..."
+        cargo install --path crates/$crate $FEATURE_FLAG
     done
+    
+    echo ""
+    echo "Installation complete!"
 
 # Install a specific crate
 install-crate CRATE:
@@ -175,3 +226,19 @@ release-tag VERSION:
 # Set up GitHub secrets for automated releases (requires byt)
 setup-secrets:
     byt secrets setup kyz
+
+# Publish kyz's agent skill to the canonical byteowlz skills repository.
+sync-skills:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="${SKILLISSUES:-$HOME/byteowlz/skillissues}"
+    test -d "$target/skills" || { echo "skillissues repo not found: $target" >&2; exit 1; }
+    rm -rf "$target/skills/kyz"
+    cp -a skill/kyz "$target/skills/"
+    just --justfile "$target/Justfile" update-readme
+    git -C "$target" add skills/kyz README.md
+    if [[ -n "$(git -C "$target" status --porcelain -- skills/kyz README.md)" ]]; then
+        git -C "$target" commit -m "skills/kyz: sync from kyz" -- skills/kyz README.md
+    else
+        echo "kyz is already up to date"
+    fi

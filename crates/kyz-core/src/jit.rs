@@ -70,6 +70,8 @@ pub enum DecisionReason {
     OutOfScope,
     /// Grant exhausted its use count.
     UseCountExceeded,
+    /// A live grant with this token already exists (create-vs-update refused).
+    AlreadyExists,
 }
 
 /// In-memory replay-protected one-time submission store.
@@ -207,9 +209,28 @@ impl GrantStore {
         Self::default()
     }
 
-    /// Insert/replace a grant token.
-    pub fn insert(&mut self, grant: JitGrant) {
+    /// Insert a grant, refusing to replace a still-live grant with the same
+    /// token.
+    ///
+    /// Grant tokens must not be silently re-scoped by a second issuer: any
+    /// same-UID process can reach the IPC socket, so accepting upserts would
+    /// let one process widen another's pending grant (scope/TTL/use-count
+    /// hijack). Expired grants may be replaced (re-issue after expiry).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecisionReason::AlreadyExists`] when a live grant with the
+    /// same token exists.
+    pub fn insert(&mut self, grant: JitGrant, now_unix: u64) -> Result<(), DecisionReason> {
+        if self
+            .grants
+            .get(&grant.token)
+            .is_some_and(|existing| existing.expires_at > now_unix)
+        {
+            return Err(DecisionReason::AlreadyExists);
+        }
         self.grants.insert(grant.token.clone(), grant);
+        Ok(())
     }
 
     /// Validate and consume one grant usage.
@@ -335,16 +356,21 @@ mod tests {
     #[test]
     fn grant_scope_violation_is_rejected() {
         let mut grants = GrantStore::new();
-        grants.insert(JitGrant {
-            token: "tok".to_string(),
-            scope: GrantScope {
-                secret_refs: vec!["svc/key".to_string()],
-                commands: vec!["curl".to_string()],
-                workspaces: vec!["/ws/project".to_string()],
-            },
-            expires_at: 200,
-            use_count: 1,
-        });
+        grants
+            .insert(
+                JitGrant {
+                    token: "tok".to_string(),
+                    scope: GrantScope {
+                        secret_refs: vec!["svc/key".to_string()],
+                        commands: vec!["curl".to_string()],
+                        workspaces: vec!["/ws/project".to_string()],
+                    },
+                    expires_at: 200,
+                    use_count: 1,
+                },
+                100,
+            )
+            .expect("insert");
 
         let bad_cmd = GrantUseContext {
             secret_ref: "svc/key",

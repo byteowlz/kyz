@@ -26,7 +26,11 @@ use kyz_core::{AppConfig, AppPaths, SecretEntry, SecretStore, VaultStore, defaul
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
 /// Fields that should use hidden input when prompting interactively.
+#[cfg(feature = "mask-output")]
 const SENSITIVE_FIELDS: &[&str] = &["password", "token", "secret", "key", "api_key", "value"];
+
+#[cfg(not(feature = "mask-output"))]
+const SENSITIVE_FIELDS: &[&str] = &[];
 
 fn main() -> anyhow::Result<()> {
     try_main()
@@ -53,7 +57,7 @@ fn try_main() -> Result<()> {
         Command::Scan(cmd) => handle_scan(&ctx, &cmd),
         Command::History(cmd) => handle_history(&ctx, &cmd),
         Command::Rollback(cmd) => handle_rollback(&ctx, &cmd),
-        Command::Exec(cmd) => handle_exec(&ctx, cmd),
+        Command::Exec(cmd) => handle_exec(&ctx, &cmd),
         Command::Pipe(cmd) => handle_pipe(&ctx, &cmd),
         Command::Wrap(cmd) => handle_wrap(&ctx, &cmd),
         Command::Ipc { command } => handle_ipc(&ctx, command),
@@ -456,7 +460,9 @@ struct WrapCommand {
     #[arg(long, value_delimiter = ',', required = true)]
     allow: Vec<String>,
 
-    /// Enforce no-read mode: block kyz get inside the wrapped session.
+    /// Best-effort no-read mode: sets `KYZ_NO_READ` to discourage kyz
+    /// get/export inside the wrapped session (the wrapped process can unset
+    /// environment variables; this is a guardrail, not a security boundary).
     #[arg(long, default_value_t = true)]
     no_read: bool,
 
@@ -471,7 +477,8 @@ struct WrapCommand {
 enum IpcCommand {
     /// Submit a one-time secret payload to local IPC.
     Submit(IpcSubmitCommand),
-    /// Issue or update a brokered JIT grant token.
+    /// Issue a brokered JIT grant token (fails if a live grant with the same
+    /// token exists: grants cannot be overwritten while active).
     Grant(IpcGrantCommand),
     /// Consume one-time secret or validate a grant usage.
     Use(IpcUseCommand),
@@ -479,9 +486,11 @@ enum IpcCommand {
 
 #[derive(Debug, Clone, Args)]
 struct IpcSubmitCommand {
-    /// Caller-provided one-time request id.
+    /// Caller-provided one-time request id. Optional: when omitted, the
+    /// daemon generates a high-entropy id and returns it (recommended over
+    /// predictable ids like "req-123").
     #[arg(long, value_name = "ID")]
-    request_id: String,
+    request_id: Option<String>,
     /// Secret service namespace.
     #[arg(long, value_name = "SERVICE")]
     service: String,
@@ -701,10 +710,64 @@ fn handle_vault_create(ctx: &RuntimeContext, cmd: &VaultCreateCommand) -> Result
     Ok(())
 }
 
+/// Trust-on-first-use gate for workspace vaults (`<dir>/.kyz/vault.json`).
+///
+/// Workspace vaults are repository-supplied: without this gate a hostile repo
+/// could silently substitute secret values for anyone who unlocks it. First
+/// use (and any later content change) requires explicit confirmation; the
+/// fingerprint is pinned in `$XDG_STATE_HOME/kyz/trusted-workspace-vaults.json`.
+fn ensure_workspace_vault_trusted(
+    ctx: &RuntimeContext,
+    vault_store: &kyz_core::VaultStore,
+    assume_yes: bool,
+) -> Result<()> {
+    let path = vault_store.vault_path();
+    if !kyz_core::is_workspace_vault_path(path) {
+        return Ok(());
+    }
+    if kyz_core::workspace_vault_is_trusted(&ctx.paths, path) {
+        return Ok(());
+    }
+    let fingerprint = kyz_core::workspace_vault_fingerprint(path).map_err(|e| anyhow!("{e}"))?;
+    let short: String = fingerprint.chars().take(12).collect();
+    if !assume_yes {
+        if !io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "workspace vault {} was never trusted. Re-run interactively to confirm, or pass --yes",
+                path.display()
+            ));
+        }
+        print!(
+            "First use of workspace vault {} (fingerprint {short}…). Trust it? [y/N] ",
+            path.display()
+        );
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            return Err(anyhow!("workspace vault not trusted; aborting"));
+        }
+    }
+    kyz_core::workspace_vault_record_trust(&ctx.paths, path).map_err(|e| anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Base `service/key` of a `service/key:field` reference.
+fn secret_policy_key(field_ref: &str) -> &str {
+    match field_ref.split_once(':') {
+        Some((base, _)) => base,
+        None => field_ref,
+    }
+}
+
 fn handle_vault_unlock(ctx: &RuntimeContext, cmd: &VaultUnlockCommand) -> Result<()> {
     let store = ctx.vault_store()?;
 
-    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+    ensure_workspace_vault_trusted(ctx, &store, ctx.common.assume_yes)?;
+    let passphrase = prompt_passphrase(&format!(
+        "Vault passphrase ({}): ",
+        store.vault_path().display()
+    ))?;
 
     let session_path = store
         .unlock(&passphrase, cmd.timeout)
@@ -868,11 +931,21 @@ fn is_sensitive_field(name: &str) -> bool {
     SENSITIVE_FIELDS.iter().any(|s| lower.contains(s))
 }
 
-fn fields_to_plain(fields: &BTreeMap<String, SecretString>) -> BTreeMap<String, String> {
-    fields
-        .iter()
-        .map(|(name, value)| (name.clone(), value.expose_secret().to_string()))
-        .collect()
+fn mask_sensitive_fields(
+    fields: &BTreeMap<String, SecretString>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (name, value) in fields {
+        if is_sensitive_field(name) {
+            out.insert(name.clone(), serde_json::Value::String("****".to_string()));
+        } else {
+            out.insert(
+                name.clone(),
+                serde_json::Value::String(value.expose_secret().to_string()),
+            );
+        }
+    }
+    out
 }
 
 fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
@@ -940,7 +1013,11 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
         let value = entry
             .field(field_name)
             .ok_or_else(|| anyhow!("field '{field_name}' not found in entry '{}'", cmd.key))?;
-        println!("{value}");
+        if is_sensitive_field(field_name) {
+            println!("****");
+        } else {
+            println!("{value}");
+        }
         return Ok(());
     }
 
@@ -949,7 +1026,7 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
         let obj = serde_json::json!({
             "service": entry.service,
             "key": entry.key,
-            "fields": fields_to_plain(&entry.fields),
+            "fields": mask_sensitive_fields(&entry.fields),
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
         });
@@ -961,7 +1038,7 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
         let obj = serde_json::json!({
             "service": entry.service,
             "key": entry.key,
-            "fields": fields_to_plain(&entry.fields),
+            "fields": mask_sensitive_fields(&entry.fields),
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
         });
@@ -970,8 +1047,10 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
             serde_yaml::to_string(&obj).context("serializing to YAML")?
         );
     } else if entry.fields.len() == 1 && entry.fields.contains_key("value") {
-        // Single-value entry: just print the value
-        if let Some(v) = entry.value() {
+        // Single-value entry: check if the field is sensitive
+        if is_sensitive_field("value") {
+            println!("****");
+        } else if let Some(v) = entry.value() {
             println!("{v}");
         }
     } else {
@@ -1564,15 +1643,15 @@ fn handle_ipc(ctx: &RuntimeContext, command: IpcCommand) -> Result<()> {
     #[cfg(unix)]
     {
         match command {
-            IpcCommand::Submit(cmd) => handle_ipc_submit(ctx, cmd),
-            IpcCommand::Grant(cmd) => handle_ipc_grant(ctx, cmd),
-            IpcCommand::Use(cmd) => handle_ipc_use(ctx, cmd),
+            IpcCommand::Submit(cmd) => handle_ipc_submit(ctx, &cmd),
+            IpcCommand::Grant(cmd) => handle_ipc_grant(ctx, &cmd),
+            IpcCommand::Use(cmd) => handle_ipc_use(ctx, &cmd),
         }
     }
 }
 
 #[cfg(unix)]
-fn handle_ipc_submit(ctx: &RuntimeContext, cmd: IpcSubmitCommand) -> Result<()> {
+fn handle_ipc_submit(ctx: &RuntimeContext, cmd: &IpcSubmitCommand) -> Result<()> {
     let value = read_secret_value(cmd.value.as_deref())?;
     let expires_at = now_unix().saturating_add(cmd.ttl);
     let payload = serde_json::json!({
@@ -1583,9 +1662,9 @@ fn handle_ipc_submit(ctx: &RuntimeContext, cmd: IpcSubmitCommand) -> Result<()> 
         "value": value,
         "expires_at": expires_at,
         "origin": {
-            "source": cmd.source,
+            "source": cmd.source.clone(),
             "process_id": cmd.process_id,
-            "host": cmd.host,
+            "host": cmd.host.clone(),
         }
     });
 
@@ -1595,7 +1674,7 @@ fn handle_ipc_submit(ctx: &RuntimeContext, cmd: IpcSubmitCommand) -> Result<()> 
 }
 
 #[cfg(unix)]
-fn handle_ipc_grant(ctx: &RuntimeContext, cmd: IpcGrantCommand) -> Result<()> {
+fn handle_ipc_grant(ctx: &RuntimeContext, cmd: &IpcGrantCommand) -> Result<()> {
     if cmd.secrets.is_empty() {
         return Err(anyhow!("at least one --secret is required"));
     }
@@ -1611,12 +1690,20 @@ fn handle_ipc_grant(ctx: &RuntimeContext, cmd: IpcGrantCommand) -> Result<()> {
     });
 
     let response = ipc_roundtrip(ctx, cmd.socket.as_deref(), &payload)?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+        && response.get("reason").and_then(serde_json::Value::as_str) == Some("already_exists")
+    {
+        return Err(anyhow!(
+            "a live grant with token '{}' already exists; grants cannot be overwritten while active (wait for expiry or pick a new token)",
+            cmd.token
+        ));
+    }
     print_ipc_response(ctx, &response, false)?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn handle_ipc_use(ctx: &RuntimeContext, cmd: IpcUseCommand) -> Result<()> {
+fn handle_ipc_use(ctx: &RuntimeContext, cmd: &IpcUseCommand) -> Result<()> {
     let payload = if let Some(request_id) = &cmd.request_id {
         serde_json::json!({
             "type": "resolve_secret",
@@ -1659,9 +1746,10 @@ fn ipc_roundtrip(
     socket_override: Option<&std::path::Path>,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let socket_path = socket_override
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| ctx.paths.state_dir.join("kyz-ipc.sock"));
+    let socket_path = socket_override.map_or_else(
+        || ctx.paths.state_dir.join("kyz-ipc.sock"),
+        std::path::Path::to_path_buf,
+    );
 
     let mut stream = UnixStream::connect(&socket_path)
         .with_context(|| format!("connecting to IPC socket {}", socket_path.display()))?;
@@ -1719,6 +1807,10 @@ fn print_ipc_response(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
+        if let Some(id) = output.get("request_id").and_then(serde_json::Value::as_str) {
+            println!("request id: {id}");
+            println!("share this id with the process that should redeem the secret");
+        }
         if let (Some(svc), Some(secret_key)) = (service, key) {
             if value_redacted {
                 println!("IPC ok: resolved {svc}/{secret_key} (value redacted)");
@@ -1775,9 +1867,15 @@ fn sanitized_ipc_output(
     let value_redacted = value.as_ref().is_some_and(|_| !reveal_value);
     let printable_value = if reveal_value { value } else { None };
 
+    let request_id = response
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
     Ok(serde_json::json!({
         "ok": ok,
         "reason": reason,
+        "request_id": request_id,
         "service": service,
         "key": key,
         "value": printable_value,
@@ -1787,14 +1885,20 @@ fn sanitized_ipc_output(
 
 // -- Exec command handler -----------------------------------------------------
 
-/// Resolve all secrets for an exec invocation into a flat env map.
+/// Environment map plus the `service/key` refs of every secret that fed it.
+pub type ExecEnv = (BTreeMap<String, String>, Vec<String>);
+
+/// Resolve all secrets for an exec invocation into a flat env map, plus the
+/// `service/key` references of every secret that was resolved (used for
+/// policy checks and audit, regardless of which flag supplied the secret).
 fn resolve_exec_env(
     store: &dyn SecretStore,
     ctx: &RuntimeContext,
     cmd: &ExecCommand,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<ExecEnv> {
     let mut env = BTreeMap::new();
     let mut entries: Vec<kyz_core::SecretEntry> = Vec::new();
+    let mut resolved_refs: Vec<String> = Vec::new();
 
     // 1. Resolve from alias
     if let Some(ref alias_name) = cmd.alias {
@@ -1808,18 +1912,26 @@ fn resolve_exec_env(
         for secret_ref in &alias.secrets {
             if let Some(entry) = resolve_secret_ref(store, secret_ref)? {
                 entries.push(entry);
+                resolved_refs.push(secret_policy_key(secret_ref).to_string());
             }
         }
 
         // Tag-based resolution from alias
         for entry in resolve_by_tags(store, &alias.tags)? {
+            resolved_refs.push(format!("{}/{}", entry.service, entry.key));
             entries.push(entry);
         }
 
         // Explicit env mappings from alias
         for (env_var, field_ref) in &alias.env_map {
+            if !kyz_core::is_safe_exec_env_name(env_var) {
+                return Err(anyhow!(
+                    "refusing to inject unsafe env var name '{env_var}' from alias '{alias_name}'"
+                ));
+            }
             let value = resolve_field_ref(store, field_ref)?;
             env.insert(env_var.clone(), value);
+            resolved_refs.push(secret_policy_key(field_ref).to_string());
         }
     }
 
@@ -1827,18 +1939,22 @@ fn resolve_exec_env(
     for secret_ref in &cmd.secrets {
         if let Some(entry) = resolve_secret_ref(store, secret_ref)? {
             entries.push(entry);
+            resolved_refs.push(secret_policy_key(secret_ref).to_string());
         }
     }
 
     // 3. Tag-based --tag refs
     for entry in resolve_by_tags(store, &cmd.tags)? {
+        resolved_refs.push(format!("{}/{}", entry.service, entry.key));
         entries.push(entry);
     }
 
     // 4. Interactive picker
     if cmd.pick {
-        let picked = fzf_pick_secrets(store)?;
-        entries.extend(picked);
+        for entry in fzf_pick_secrets(store)? {
+            resolved_refs.push(format!("{}/{}", entry.service, entry.key));
+            entries.push(entry);
+        }
     }
 
     // 5. Explicit --env mappings (highest priority)
@@ -1846,21 +1962,37 @@ fn resolve_exec_env(
         let (var, field_ref) = mapping.split_once('=').ok_or_else(|| {
             anyhow!("invalid --env format '{mapping}', expected ENV=service/key:field")
         })?;
+        if !kyz_core::is_safe_exec_env_name(var) {
+            return Err(anyhow!(
+                "refusing to inject unsafe env var name '{var}' via --env"
+            ));
+        }
         let value = resolve_field_ref(store, field_ref)?;
         env.insert(var.to_string(), value);
+        resolved_refs.push(secret_policy_key(field_ref).to_string());
     }
 
-    // Convert collected entries to env vars (default: uppercase field names)
+    // Convert collected entries to env vars (default: uppercase field names).
+    // Field names come from secret metadata and must never introduce
+    // process-behavior variables (LD_PRELOAD, PATH, ...).
     for entry in &entries {
         for (field_name, field_value) in &entry.fields {
             let env_var = field_name.to_uppercase();
+            if !kyz_core::is_safe_exec_env_name(&env_var) {
+                log::warn!(
+                    "refusing to inject secret field '{field_name}' as env var '{env_var}' (unsafe name)"
+                );
+                continue;
+            }
             // Don't overwrite explicit mappings
             env.entry(env_var)
                 .or_insert_with(|| field_value.expose_secret().to_string());
         }
     }
 
-    Ok(env)
+    resolved_refs.sort();
+    resolved_refs.dedup();
+    Ok((env, resolved_refs))
 }
 
 /// Parse `"service/key"` and fetch the entry.
@@ -2013,11 +2145,15 @@ fn submit_and_wait_auth_request(
     let requester = std::env::var("KYZ_REQUESTER")
         .unwrap_or_else(|_| format!("kyz-exec-{}", std::process::id()));
 
+    // Client-generated pickup capability: the request id alone must never be
+    // enough to redeem the approved secrets.
+    let capability = kyz_core::generate_pickup_capability().map_err(|e| anyhow!("{e}"))?;
     let create_body = serde_json::json!({
         "requester": requester,
         "scopes": scopes,
         "reason": reason,
-        "ttl_seconds": 300
+        "ttl_seconds": 300,
+        "pickup_capability": capability,
     });
 
     let mut req = ureq::post(&format!("{api_url}/auth/request"));
@@ -2071,8 +2207,10 @@ fn submit_and_wait_auth_request(
         return Err(anyhow!("auth request {request_id} was {status}"));
     }
 
-    // Pick up secrets (one-time)
-    let mut pickup_req = ureq::get(&format!("{api_url}/auth/secrets/{request_id}"));
+    // Pick up secrets (one-time; requires the capability generated above)
+    let mut pickup_req = ureq::get(&format!(
+        "{api_url}/auth/secrets/{request_id}?capability={capability}"
+    ));
     if let Some(token) = api_token {
         pickup_req = pickup_req.header("Authorization", &format!("Bearer {token}"));
     }
@@ -2092,10 +2230,7 @@ fn submit_and_wait_auth_request(
     Ok(stashed)
 }
 
-fn resolve_exec_env_headless(
-    ctx: &RuntimeContext,
-    cmd: &ExecCommand,
-) -> Result<BTreeMap<String, String>> {
+fn resolve_exec_env_headless(ctx: &RuntimeContext, cmd: &ExecCommand) -> Result<ExecEnv> {
     let api_url = std::env::var("KYZ_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
     let api_token = std::env::var("KYZ_API_TOKEN").ok();
 
@@ -2127,7 +2262,8 @@ fn resolve_exec_env_headless(
     }
 
     let reason = format!("kyz exec headless: {:?}", cmd.command);
-    let stashed = submit_and_wait_auth_request(&api_url, api_token.as_ref(), &scopes, &reason)?;
+    let stashed = submit_and_wait_auth_request(&api_url, api_token.as_ref(), &scopes, &reason)
+        .map_err(|e| anyhow!("{e}"))?;
 
     // Flatten into env vars
     let mut env = BTreeMap::new();
@@ -2137,6 +2273,11 @@ fn resolve_exec_env_headless(
         && let Some(alias) = ctx.config.aliases.get(alias_name)
     {
         for (env_var, field_ref) in &alias.env_map {
+            if !kyz_core::is_safe_exec_env_name(env_var) {
+                return Err(anyhow!(
+                    "refusing to inject unsafe env var name '{env_var}' from alias '{alias_name}'"
+                ));
+            }
             if let Some(values) = stashed.get(field_ref) {
                 for v in values.values() {
                     env.insert(env_var.clone(), v.clone());
@@ -2147,47 +2288,69 @@ fn resolve_exec_env_headless(
 
     // Apply explicit --env mappings
     for mapping in &cmd.env_maps {
-        if let Some((var, field_ref)) = mapping.split_once('=')
-            && let Some(values) = stashed.get(field_ref)
-        {
-            for v in values.values() {
-                env.insert(var.to_string(), v.clone());
+        if let Some((var, field_ref)) = mapping.split_once('=') {
+            if !kyz_core::is_safe_exec_env_name(var) {
+                return Err(anyhow!(
+                    "refusing to inject unsafe env var name '{var}' via --env"
+                ));
+            }
+            if let Some(values) = stashed.get(field_ref) {
+                for v in values.values() {
+                    env.insert(var.to_string(), v.clone());
+                }
             }
         }
     }
 
-    // Default: uppercase field names for any remaining secrets
+    // Default: uppercase field names for any remaining secrets. Field names
+    // are secret metadata and must never introduce process-behavior variables.
     for values in stashed.values() {
         for (field_name, field_value) in values {
             let env_var = field_name.to_uppercase();
+            if !kyz_core::is_safe_exec_env_name(&env_var) {
+                log::warn!(
+                    "refusing to inject secret field '{field_name}' as env var '{env_var}' (unsafe name)"
+                );
+                continue;
+            }
             env.entry(env_var).or_insert_with(|| field_value.clone());
         }
     }
 
-    Ok(env)
+    let mut refs: Vec<String> = scopes
+        .iter()
+        .map(|scope| secret_policy_key(scope).to_string())
+        .collect();
+    refs.sort();
+    refs.dedup();
+    Ok((env, refs))
 }
 
-fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
+fn handle_exec(ctx: &RuntimeContext, cmd: &ExecCommand) -> Result<()> {
     // Resolve the effective command: -c takes priority, then trailing args
-    let (program, args) = resolve_exec_command(&cmd)?;
+    let (program, args) = resolve_exec_command(cmd)?;
 
     let store = ctx.secret_store()?;
 
     // Try resolving secrets; if vault is locked, handle interactively or headless
-    let env = match resolve_exec_env(store.as_ref(), ctx, &cmd) {
-        Ok(env) => env,
+    let (env, secret_refs) = match resolve_exec_env(store.as_ref(), ctx, cmd) {
+        Ok(result) => result,
         Err(e) if e.to_string().contains("vault is locked") => {
             if io::stdin().is_terminal() {
                 // Interactive: prompt passphrase inline
                 let vault_store = ctx.vault_store()?;
-                let passphrase = prompt_passphrase("Vault passphrase: ")?;
+                ensure_workspace_vault_trusted(ctx, &vault_store, ctx.common.assume_yes)?;
+                let passphrase = prompt_passphrase(&format!(
+                    "Vault passphrase ({}): ",
+                    vault_store.vault_path().display()
+                ))?;
                 vault_store
                     .unlock(&passphrase, kyz_core::store::DEFAULT_SESSION_TIMEOUT_SECS)
                     .map_err(|e| anyhow!("{e}"))?;
-                resolve_exec_env(store.as_ref(), ctx, &cmd)?
+                resolve_exec_env(store.as_ref(), ctx, cmd)?
             } else {
                 // Headless: use remote auth flow via kyz-api
-                resolve_exec_env_headless(ctx, &cmd)?
+                resolve_exec_env_headless(ctx, cmd)?
             }
         }
         Err(e) => return Err(e),
@@ -2210,13 +2373,14 @@ fn handle_exec(ctx: &RuntimeContext, cmd: ExecCommand) -> Result<()> {
     let pol = kyz_core::resolve_policy(cmd.policy.as_deref(), cmd.no_policy)
         .map_err(|e| anyhow!("{e}"))?;
 
-    let secret_names: Vec<String> = cmd.secrets;
-    if let Err(v) = pol.check_all(&program, &args, &secret_names) {
+    // Policy sees EVERY secret resolved for this invocation, whatever flag
+    // supplied it (--secret/--tag/--alias/--env/--pick).
+    if let Err(v) = pol.check_all(&program, &args, &secret_refs) {
         kyz_core::audit::audit_policy_violation(&program, &v.to_string());
         return Err(anyhow!("{v}"));
     }
 
-    kyz_core::audit::audit_exec(&secret_names, &program);
+    kyz_core::audit::audit_exec(&secret_refs, &program);
 
     let clean_env = scrubbed_env();
 
@@ -2400,17 +2564,31 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: &WrapCommand) -> Result<()> {
 
     // Get or prompt for passphrase
     let vault_store = ctx.vault_store()?;
-    let passphrase = if io::stdin().is_terminal() {
-        prompt_passphrase("Vault passphrase: ")?
+    ensure_workspace_vault_trusted(ctx, &vault_store, ctx.common.assume_yes)?;
+
+    // A valid session (e.g. inside an outer wrap or a prior unlock) makes the
+    // passphrase unnecessary — and it must never be exported to the child.
+    let already_unlocked = vault_store.status().is_ok_and(|s| s.unlocked);
+    let passphrase = if already_unlocked {
+        None
+    } else if io::stdin().is_terminal() {
+        Some(prompt_passphrase(&format!(
+            "Vault passphrase ({}): ",
+            vault_store.vault_path().display()
+        ))?)
     } else {
-        std::env::var("KYZ_VAULT_PASSWORD")
-            .map_err(|_| anyhow!("no TTY and KYZ_VAULT_PASSWORD not set"))?
+        Some(
+            std::env::var("KYZ_VAULT_PASSWORD")
+                .map_err(|_| anyhow!("no TTY and KYZ_VAULT_PASSWORD not set"))?,
+        )
     };
 
     // Ensure vault is unlocked
-    let _ = vault_store
-        .unlock(&passphrase, kyz_core::store::DEFAULT_SESSION_TIMEOUT_SECS)
-        .map_err(|e| anyhow!("{e}"))?;
+    if let Some(passphrase) = passphrase.as_ref() {
+        let _ = vault_store
+            .unlock(passphrase, kyz_core::store::DEFAULT_SESSION_TIMEOUT_SECS)
+            .map_err(|e| anyhow!("{e}"))?;
+    }
 
     if ctx.common.dry_run {
         info!(
@@ -2427,31 +2605,22 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: &WrapCommand) -> Result<()> {
 
     kyz_core::audit::audit_wrap(&cmd.allow, &cmd.command[0]);
 
-    // Build child environment
+    // Build child environment. The master passphrase is deliberately NOT
+    // exported to the child: the session created above (data key in the OS
+    // keyring) already covers nested kyz usage, and exporting the passphrase
+    // would hand the whole vault to the wrapped process.
     let mut child_env: Vec<(String, String)> = scrubbed_env();
 
-    // Set vault path + passphrase for the wrapped session
-    child_env.push(("KYZ_VAULT_PASSWORD".to_string(), passphrase));
-
-    // Signal no-read mode to kyz inside the wrapped session
+    // Signal no-read mode to kyz inside the wrapped session (best-effort: the
+    // child controls its own environment).
     if cmd.no_read {
         child_env.push(("KYZ_NO_READ".to_string(), "1".to_string()));
     }
 
-    // Create a temporary policy file scoping to allowed secrets
-    let temp_policy = if allow_all {
-        None
-    } else {
-        let policy = build_wrap_policy(&cmd.allow);
-        let tmp = tempfile::NamedTempFile::new().context("creating temp policy file")?;
-        std::fs::write(tmp.path(), &policy).context("writing temp policy")?;
-        child_env.push(("KYZ_POLICY".to_string(), tmp.path().display().to_string()));
-        Some(tmp)
-    };
-
     eprintln!(
-        "[kyz] wrapping {:?} with access to {} secret(s)",
+        "[kyz] wrapping {} (best-effort scoping: no-read={}, allowed={} secret(s))",
         cmd.command[0],
+        cmd.no_read,
         if allow_all {
             "all".to_string()
         } else {
@@ -2469,9 +2638,6 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: &WrapCommand) -> Result<()> {
         .status()
         .context(format!("failed to run '{program}'"))?;
 
-    // Clean up temp policy
-    drop(temp_policy);
-
     if !status.success() {
         return Err(anyhow!(
             "wrapped process exited with code {}",
@@ -2479,23 +2645,6 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: &WrapCommand) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Build a JSON policy for a wrapped session.
-fn build_wrap_policy(allowed_secrets: &[String]) -> String {
-    let policy = kyz_core::default_policy();
-    let mut json = serde_json::to_value(&policy).unwrap_or_default();
-
-    // Add per-secret rules (no command restriction — just documenting which secrets exist)
-    if let Some(obj) = json.as_object_mut() {
-        let mut secrets = serde_json::Map::new();
-        for name in allowed_secrets {
-            secrets.insert(name.clone(), serde_json::json!({}));
-        }
-        obj.insert("secrets".to_string(), serde_json::Value::Object(secrets));
-    }
-
-    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 #[cfg(test)]
