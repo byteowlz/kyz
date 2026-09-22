@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
+    )
+)]
 //! Regression tests for audit run-2 fixes: grant upsert hijack (F3), env-name
 //! safety filter (run-1 F3), KDF parameter clamping (run-1 F5), policy
 //! unioning (F2).
@@ -6,7 +16,7 @@ use kyz_core::jit::{DecisionReason, GrantScope, GrantStore, GrantUseContext, Jit
 use kyz_core::policy::{Policy, default_policy, is_safe_exec_env_name, union_deny_lists};
 use kyz_core::vault_v3::KdfParams;
 
-fn grant(token: &str, expires_at: u64, use_count: u32, commands: Vec<&str>) -> JitGrant {
+fn grant(token: &str, expires_at: u64, use_count: u32, commands: &[&str]) -> JitGrant {
     JitGrant {
         token: token.to_string(),
         scope: GrantScope {
@@ -25,11 +35,11 @@ fn live_grant_cannot_be_overwritten() {
     let now = 1_000_u64;
 
     store
-        .insert(grant("grant-1", 2_000, 1, vec!["gh"]), now)
+        .insert(grant("grant-1", 2_000, 1, &["gh"]), now)
         .expect("initial insert");
 
     // A second issuer must not silently widen the pending grant.
-    let hijack = store.insert(grant("grant-1", 9_999, 999, Vec::new()), now);
+    let hijack = store.insert(grant("grant-1", 9_999, 999, &[]), now);
     assert_eq!(hijack, Err(DecisionReason::AlreadyExists));
 
     // The original narrow scope is still in force.
@@ -48,10 +58,10 @@ fn live_grant_cannot_be_overwritten() {
 fn expired_grant_may_be_replaced() {
     let mut store = GrantStore::new();
     store
-        .insert(grant("grant-1", 1_000, 1, vec!["gh"]), 500)
+        .insert(grant("grant-1", 1_000, 1, &["gh"]), 500)
         .expect("initial insert");
     store
-        .insert(grant("grant-1", 3_000, 5, Vec::new()), 2_000)
+        .insert(grant("grant-1", 3_000, 5, &[]), 2_000)
         .expect("replace after expiry");
 }
 
