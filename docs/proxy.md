@@ -14,9 +14,11 @@ the API key: it exists only in the encrypted vault and daemon memory.
   (`*.example.com`); longer path prefix wins.
 - The forwarded URL is the rule's fixed `upstream` (must be `https://`,
   no userinfo) joined with the client path and query.
-- Client `Authorization` / `X-Api-Key` headers are stripped before
-  injection (adjust `strip`); header values are templates of literal text
-  plus `{{alias.field}}` substitutions — no functions, no encoding.
+- Client `Authorization`, `Cookie`, `Proxy-Authorization`, and every header
+  named in the rule's injected `headers` are always stripped before injection,
+  even with `strip = []`. `strip` adds further names (default: `X-Api-Key`).
+  Header values are templates of literal text plus `{{alias.field}}`
+  substitutions — no functions, no encoding.
 - `CONNECT` and `TRACE` are always rejected.
 - Every request is audited to `state_dir/daemon/audit.log` (rule name,
   host, outcome; never secret values).

@@ -1339,6 +1339,10 @@ impl VaultStore {
     /// Returns an error if the file exists and force is false, or on I/O failure.
     pub fn init(&self, passphrase: &str, force: bool) -> Result<(), CoreError> {
         ensure_passphrase_strength(passphrase)?;
+        if let Some(parent) = self.vault_path.parent() {
+            fs::create_dir_all(parent).map_err(CoreError::Io)?;
+        }
+        let _lock = VaultFileLock::exclusive(&self.vault_path)?;
 
         if self.vault_path.exists() && !force {
             return Err(CoreError::Secret(format!(
@@ -1347,26 +1351,11 @@ impl VaultStore {
             )));
         }
 
-        if let Some(parent) = self.vault_path.parent() {
-            fs::create_dir_all(parent).map_err(CoreError::Io)?;
-        }
-
         let passphrase_secret = SecretString::from(passphrase.to_string());
         let (mut v3, _dk) = VaultFileV3::create(&passphrase_secret)?;
         // Strength was already checked above, so flag it.
         v3.passphrase_policy_checked = true;
-        let json = serde_json::to_string_pretty(&v3)
-            .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
-        fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&self.vault_path, fs::Permissions::from_mode(0o600))
-                .map_err(CoreError::Io)?;
-        }
-
-        Ok(())
+        self.write_vault_file_unlocked(&v3)
     }
 
     /// Unlock the vault: derive the KEK, unwrap the DK, persist a session.
@@ -1591,8 +1580,7 @@ impl VaultStore {
     fn write_vault_file_unlocked(&self, vault: &VaultFileV3) -> Result<(), CoreError> {
         let json = serde_json::to_string_pretty(vault)
             .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))?;
-        fs::write(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)?;
-        Ok(())
+        atomic_write_vault(&self.vault_path, json.as_bytes()).map_err(CoreError::Io)
     }
 
     /// Unlock the vault into memory without persisting any session state.
@@ -1694,6 +1682,41 @@ impl UnlockedVault {
         }
         Ok(resolved)
     }
+}
+
+/// Replace a vault without ever exposing a truncated destination. The
+/// temporary file is private, lives on the same filesystem, and is removed
+/// automatically if any step before the rename fails.
+fn atomic_write_vault(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_vault_with(path, contents, || Ok(()))
+}
+
+fn atomic_write_vault_with(
+    path: &Path,
+    contents: &[u8],
+    before_rename: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".kyz-vault-")
+        .tempfile_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temp.write_all(contents)?;
+    temp.as_file_mut().flush()?;
+    temp.as_file().sync_all()?;
+    before_rename()?;
+    temp.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Read the v3 vault file at `vault_path` (JSON parse only, no decryption),
@@ -2694,6 +2717,27 @@ mod tests {
         assert!(resolved.is_empty());
 
         let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[test]
+    fn failed_atomic_vault_write_preserves_original_and_cleans_temp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault.json");
+        fs::write(&vault, b"original vault bytes").expect("original vault");
+        let error = atomic_write_vault_with(&vault, b"replacement", || {
+            Err(std::io::Error::other("injected failure before rename"))
+        })
+        .expect_err("fault must fail the write");
+        assert_eq!(error.to_string(), "injected failure before rename");
+        assert_eq!(
+            fs::read(&vault).expect("read vault"),
+            b"original vault bytes"
+        );
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .expect("list directory")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("vault.json")]);
     }
 
     #[test]

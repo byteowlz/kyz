@@ -2524,6 +2524,7 @@ const SCRUB_ENV_PREFIXES: &[&str] = &["KYZ_VAULT_PASS", "KYZ_SESSION_"];
 /// follows the platform's rules there — a lowercase `kyz_vault_password`
 /// must be scrubbed just like the canonical spelling or the secret would
 /// leak through `GetEnvironmentVariable`-style lookups in the child.
+#[cfg(test)]
 fn env_key_is_sensitive(key: &str) -> bool {
     let is_name = |candidate: &str| {
         if cfg!(windows) {
@@ -2554,18 +2555,50 @@ fn scrubbed_env() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Strip sensitive kyz vars (exact names and prefixes) from a child
-/// command.
-///
-/// Iterates `vars_os` (not `vars`, which panics on non-Unicode entries)
-/// and removes the exact key spelling it found, so case-insensitive
-/// matches still remove the real variable.
-fn scrub_command_env(command: &mut std::process::Command) {
-    for (key, _) in std::env::vars_os() {
-        if env_key_is_sensitive(&key.to_string_lossy()) {
-            command.env_remove(&key);
+/// Minimal environment inherited by the detached daemon. Config/state
+/// path expansion needs HOME/XDG_* (APPDATA on Windows); icacls needs
+/// USERNAME and Windows process creation needs `SystemRoot`. Everything else,
+/// including arbitrary application secrets, is excluded by default.
+fn daemon_env_allowed(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy();
+    let normalized = if cfg!(windows) {
+        key.to_ascii_uppercase()
+    } else {
+        key.to_string()
+    };
+    matches!(
+        normalized.as_str(),
+        "PATH"
+            | "HOME"
+            | "USERPROFILE"
+            | "USERNAME"
+            | "TMP"
+            | "TEMP"
+            | "TMPDIR"
+            | "LANG"
+            | "LANGUAGE"
+            | "APPDATA"
+            | "LOCALAPPDATA"
+            | "SYSTEMROOT"
+            | "WINDIR"
+    ) || normalized.starts_with("LC_")
+        || normalized.starts_with("XDG_")
+}
+
+fn allowlist_daemon_env_from(
+    command: &mut std::process::Command,
+    env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) {
+    command.env_clear();
+    for (key, value) in env {
+        if daemon_env_allowed(&key) {
+            command.env(key, value);
         }
     }
+}
+
+fn allowlist_daemon_env(command: &mut std::process::Command) {
+    allowlist_daemon_env_from(command, std::env::vars_os());
 }
 
 fn handle_daemon(ctx: &RuntimeContext, command: DaemonCommand) -> Result<()> {
@@ -2687,7 +2720,7 @@ fn spawn_background_daemon(
     if let Some(timeout) = cmd.timeout {
         command.arg("--timeout").arg(timeout.to_string());
     }
-    scrub_command_env(&mut command);
+    allowlist_daemon_env(&mut command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::from(
@@ -2819,24 +2852,26 @@ fn daemon_log_tail(paths: &kyz_daemon::DaemonPaths) -> String {
 fn read_bootstrap_passphrase() -> Result<SecretString> {
     use std::io::Read as _;
 
-    let buffer = {
-        let mut handle = io::stdin().lock();
-        let mut length_bytes = [0u8; 4];
-        handle
-            .read_exact(&mut length_bytes)
-            .context("reading the bootstrap pipe header")?;
-        let length = u32::from_le_bytes(length_bytes) as usize;
-        if length == 0 || length > 4096 {
-            return Err(anyhow!("invalid bootstrap passphrase frame"));
-        }
-        let mut buffer = vec![0u8; length];
-        handle
-            .read_exact(&mut buffer)
-            .context("reading the bootstrap pipe payload")?;
-        buffer
-    };
-    let passphrase = String::from_utf8(buffer).context("bootstrap passphrase is not UTF-8")?;
-    Ok(SecretString::from(passphrase))
+    let mut handle = io::stdin().lock();
+    let mut length_bytes = [0u8; 4];
+    handle
+        .read_exact(&mut length_bytes)
+        .context("reading the bootstrap pipe header")?;
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    if length == 0 || length > 4096 {
+        return Err(anyhow!("invalid bootstrap passphrase frame"));
+    }
+    let mut buffer = zeroize::Zeroizing::new(vec![0u8; length]);
+    handle
+        .read_exact(&mut buffer)
+        .context("reading the bootstrap pipe payload")?;
+    drop(handle);
+    // stdin() owns a process-global handle, so dropping its lock alone does
+    // not close fd 0. Close it explicitly once the one-shot frame is read.
+    #[cfg(unix)]
+    nix::unistd::close(0).context("closing bootstrap stdin")?;
+    let passphrase = std::str::from_utf8(&buffer).context("bootstrap passphrase is not UTF-8")?;
+    Ok(SecretString::from(passphrase.to_owned()))
 }
 
 /// Obtain the vault passphrase: TTY prompt, askpass command, then the
@@ -3235,7 +3270,7 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: &WrapCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::env_key_is_sensitive;
+    use super::{allowlist_daemon_env_from, env_key_is_sensitive};
 
     #[cfg(unix)]
     use super::sanitized_ipc_output;
@@ -3256,6 +3291,33 @@ mod tests {
         assert!(env_key_is_sensitive("kyz_vault_password"));
         #[cfg(unix)]
         assert!(!env_key_is_sensitive("kyz_vault_password"));
+    }
+
+    #[test]
+    fn detached_daemon_env_excludes_unknown_launcher_secrets() {
+        use std::ffi::OsString;
+        use std::process::Command;
+
+        let mut child = Command::new("kyz");
+        allowlist_daemon_env_from(
+            &mut child,
+            [
+                (OsString::from("PATH"), OsString::from("/bin")),
+                (OsString::from("HOME"), OsString::from("/home/test")),
+                (
+                    OsString::from("UNRELATED_API_SECRET"),
+                    OsString::from("private"),
+                ),
+                (
+                    OsString::from("KYZ_VAULT_PASSWORD"),
+                    OsString::from("passphrase"),
+                ),
+            ],
+        );
+        let child_env: Vec<_> = child.get_envs().collect();
+        assert_eq!(child_env.len(), 2);
+        assert!(child_env.iter().any(|(key, _)| *key == "PATH"));
+        assert!(child_env.iter().any(|(key, _)| *key == "HOME"));
     }
 
     #[cfg(unix)]

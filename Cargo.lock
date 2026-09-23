@@ -2024,6 +2024,7 @@ dependencies = [
  "kyz-core",
  "kyz-daemon",
  "log",
+ "nix",
  "rpassword",
  "secrecy",
  "serde",

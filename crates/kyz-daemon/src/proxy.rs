@@ -192,7 +192,8 @@ impl ProxyShared {
         };
 
         // Fixed order: sanitize → strip → static → inject.
-        let mut forward_headers = sanitize_request_headers(&parts.headers, &rule.strip);
+        let mut forward_headers =
+            sanitize_request_headers(&parts.headers, &rule.strip, &rule.headers);
         for (name, value) in &rule.static_headers {
             replace_header(&mut forward_headers, name, value);
         }
@@ -607,10 +608,14 @@ fn connection_nominated(headers: &HeaderMap) -> Vec<String> {
 /// Drops hop-by-hop headers (including `Connection`-nominated ones), the
 /// proxy token, `Host` (the upstream URL's fixed authority decides the
 /// destination), `Content-Length` (kyz re-frames the request), and
-/// every occurrence of the rule's credential strip set. Non-UTF-8 header
-/// values cannot be represented in the sanitized pipeline and are
-/// dropped.
-fn sanitize_request_headers(headers: &HeaderMap, strip: &[String]) -> Vec<(String, String)> {
+/// every mandatory credential header, every header configured for injection,
+/// and every occurrence of the rule's additional strip set. Non-UTF-8 header
+/// values cannot be represented in the sanitized pipeline and are dropped.
+fn sanitize_request_headers(
+    headers: &HeaderMap,
+    strip: &[String],
+    injected: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
     let strip: Vec<String> = strip.iter().map(|s| s.to_ascii_lowercase()).collect();
     let connection_nominated = connection_nominated(headers);
     let mut out = Vec::new();
@@ -621,6 +626,8 @@ fn sanitize_request_headers(headers: &HeaderMap, strip: &[String]) -> Vec<(Strin
             || name == PROXY_TOKEN_HEADER
             || name == "host"
             || name == "content-length"
+            || matches!(name, "authorization" | "cookie" | "proxy-authorization")
+            || injected.keys().any(|key| key.eq_ignore_ascii_case(name))
             || strip.iter().any(|s| s == name)
         {
             continue;
@@ -754,10 +761,30 @@ mod tests {
         headers.append("x-keep", HeaderValue::from_static("yes"));
 
         let strip = vec!["Authorization".to_string(), "X-Api-Key".to_string()];
-        let out = sanitize_request_headers(&headers, &strip);
+        let out = sanitize_request_headers(&headers, &strip, &BTreeMap::new());
         let names: Vec<&str> = out.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["content-type", "x-keep"]);
         assert_eq!(out[0].1, "application/json");
+    }
+
+    #[test]
+    fn mandatory_credentials_and_injection_targets_are_stripped_without_rule_strip() {
+        let mut headers = HeaderMap::new();
+        headers.append("authorization", HeaderValue::from_static("Bearer client"));
+        headers.append("cookie", HeaderValue::from_static("session=client"));
+        headers.append("x-api-key", HeaderValue::from_static("client-key"));
+        headers.append("x-safe", HeaderValue::from_static("kept"));
+        let injected = BTreeMap::from([("X-Api-Key".to_string(), "{{cred.key}}".to_string())]);
+        let mut forwarded = sanitize_request_headers(&headers, &[], &injected);
+        assert_eq!(forwarded, vec![("x-safe".to_string(), "kept".to_string())]);
+        replace_header(&mut forwarded, "X-Api-Key", "vault-key");
+        assert_eq!(
+            forwarded,
+            vec![
+                ("x-safe".to_string(), "kept".to_string()),
+                ("X-Api-Key".to_string(), "vault-key".to_string()),
+            ]
+        );
     }
 
     #[test]

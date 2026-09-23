@@ -355,7 +355,7 @@
           }
         },
         "strip": {
-          "description": "Client headers stripped before credential injection.",
+          "description": "Additional client headers stripped before credential injection.\nAuthorization, Cookie, Proxy-Authorization, and all injected header\nnames are always stripped, even if this list is empty.",
           "type": "array",
           "default": [
             "Authorization",

@@ -191,20 +191,55 @@ fn restrict_dir_acl_to_user(dir: &Path) -> Result<()> {
         ));
     }
     let grant = format!("{user}:(OI)(CI)F");
-    let output = std::process::Command::new("icacls")
+    // Reset first to discard *all* pre-existing explicit grants, including
+    // grants to accounts other than the well-known groups below.
+    for args in [
+        vec!["/reset".to_string()],
+        vec!["/inheritance:r".to_string(), "/grant:r".to_string(), grant],
+        vec![
+            "/remove:g".to_string(),
+            "*S-1-1-0".to_string(),      // Everyone
+            "*S-1-5-32-545".to_string(), // BUILTIN\\Users
+            "*S-1-5-11".to_string(),     // Authenticated Users
+        ],
+    ] {
+        let output = std::process::Command::new("icacls")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg(dir)
+            .args(&args)
+            .output()
+            .map_err(|e| {
+                DaemonError::Internal(format!("running icacls to secure state dir: {e}"))
+            })?;
+        if !output.status.success() {
+            return Err(DaemonError::Internal(format!(
+                "icacls failed to restrict state dir ACL (exit {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+    }
+    let acl = std::process::Command::new("icacls")
         .creation_flags(CREATE_NO_WINDOW)
         .arg(dir)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(&grant)
         .output()
-        .map_err(|e| DaemonError::Internal(format!("running icacls to secure state dir: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(DaemonError::Internal(format!(
-            "icacls failed to restrict state dir ACL (exit {:?}): {}",
-            output.status.code(),
-            stderr.trim()
-        )));
+        .map_err(|e| DaemonError::Internal(format!("verifying state dir ACL: {e}")))?;
+    let text = String::from_utf8_lossy(&acl.stdout).to_ascii_lowercase();
+    if !acl.status.success()
+        || [
+            "everyone:",
+            "users:",
+            "authenticated users:",
+            "s-1-1-0:",
+            "s-1-5-32-545:",
+            "s-1-5-11:",
+        ]
+        .iter()
+        .any(|principal| text.contains(principal))
+    {
+        return Err(DaemonError::Internal(
+            "state dir ACL verification failed".to_string(),
+        ));
     }
     Ok(())
 }
@@ -249,20 +284,30 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn ensure_state_dir_acl_excludes_everyone() {
+    fn ensure_removes_preexisting_explicit_group_grants() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = DaemonPaths::new(tmp.path());
-        paths.ensure().expect("ensure state dir");
-
-        let output = std::process::Command::new("icacls")
+        fs::create_dir(&paths.dir).expect("state dir");
+        let granted = std::process::Command::new("icacls")
             .arg(&paths.dir)
-            .output()
-            .expect("icacls query");
-        let text = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !text.to_lowercase().contains("everyone"),
-            "state dir ACL must not contain Everyone: {text}"
-        );
+            .args(["/grant", "*S-1-1-0:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)F"])
+            .status()
+            .expect("grant explicit foreign-user groups");
+        assert!(granted.success());
+        paths.ensure().expect("secure preexisting state dir");
+        write_secure_file(&paths.ipc_token_path(), b"test-token").expect("token file");
+        for path in [&paths.dir, &paths.ipc_token_path()] {
+            let output = std::process::Command::new("icacls")
+                .arg(path)
+                .output()
+                .expect("query ACL");
+            let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            assert!(output.status.success());
+            assert!(
+                !text.contains("everyone:") && !text.contains("users:"),
+                "{text}"
+            );
+        }
     }
 
     #[test]
