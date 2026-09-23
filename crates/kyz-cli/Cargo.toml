@@ -40,3 +40,6 @@ ureq.workspace = true
 tungstenite.workspace = true
 tempfile.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", default-features = false }

@@ -419,7 +419,9 @@ pub struct ProxyRuleConfig {
     /// Upstream base URL. Must be `https://` without userinfo.
     pub upstream: String,
 
-    /// Client headers stripped before credential injection.
+    /// Additional client headers stripped before credential injection.
+    /// Authorization, Cookie, Proxy-Authorization, and all injected header
+    /// names are always stripped, even if this list is empty.
     #[serde(default = "default_strip")]
     pub strip: Vec<String>,
 
