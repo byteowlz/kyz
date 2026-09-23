@@ -1,8 +1,12 @@
 //! HTTP API server for rust-workspace.
 
 use std::net::SocketAddr;
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(unix)]
+use std::path::Path as FsPath;
+#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,13 +22,20 @@ use clap::{Args, Parser};
 use log::info;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
+#[cfg(unix)]
 use tokio::sync::{Mutex, Semaphore};
 use tower_http::trace::TraceLayer;
 
 use kyz_core::{
-    AppConfig, AppPaths, AuthRequestStore, CreateAuthRequest, DecisionReason, DenyAuthRequest,
-    GrantScope, GrantStore, GrantUseContext, JitGrant, OneTimeSecretSubmission,
-    OneTimeSubmissionStore, OriginMetadata, SecretStore, VaultStore,
+    AppConfig, AppPaths, AuthRequestStore, CreateAuthRequest, DenyAuthRequest, SecretStore,
+    VaultStore,
+};
+// One-time secret submissions and JIT grants are served over the Unix
+// socket IPC channel only.
+#[cfg(unix)]
+use kyz_core::{
+    DecisionReason, GrantScope, GrantStore, GrantUseContext, JitGrant, OneTimeSecretSubmission,
+    OneTimeSubmissionStore, OriginMetadata,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -50,7 +61,9 @@ async fn try_main() -> Result<()> {
             .filter(|t| !t.is_empty()),
         auth_requests: AuthRequestStore::new(),
         vault_store: Arc::new(vault_store),
+        #[cfg(unix)]
         one_time_submissions: Arc::new(Mutex::new(OneTimeSubmissionStore::new())),
+        #[cfg(unix)]
         grants: Arc::new(Mutex::new(GrantStore::new())),
     };
 
@@ -136,7 +149,10 @@ struct AppState {
     api_token: Option<String>,
     auth_requests: AuthRequestStore,
     vault_store: Arc<VaultStore>,
+    /// One-time submissions / JIT grants, served over the Unix IPC channel.
+    #[cfg(unix)]
     one_time_submissions: Arc<Mutex<OneTimeSubmissionStore>>,
+    #[cfg(unix)]
     grants: Arc<Mutex<GrantStore>>,
 }
 

@@ -1,0 +1,40 @@
+[package]
+name = "kyz-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Credential daemon for kyz - lifecycle, management IPC, audit"
+
+[lints]
+workspace = true
+
+[dependencies]
+kyz-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log = { workspace = true, features = ["std"] }
+fs2.workspace = true
+secrecy.workspace = true
+sha2.workspace = true
+hex.workspace = true
+subtle.workspace = true
+getrandom.workspace = true
+humantime.workspace = true
+tokio.workspace = true
+axum.workspace = true
+ureq.workspace = true
+bytes = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = "0.26"
+# `start_paused` integration test (deadline firing without wall-clock waits).
+tokio = { workspace = true, features = ["test-util"] }

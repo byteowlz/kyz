@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
+    )
+)]
 //! Integration tests for configuration loading, defaults, and overrides.
 
 use std::collections::BTreeMap;
@@ -48,10 +58,11 @@ fn alias_config_default_is_empty() {
 
 #[test]
 fn alias_config_serialization_roundtrip() {
-    let mut alias = AliasConfig::default();
-    alias.secrets = vec!["github/token".to_string()];
-    alias.tags = vec!["prod".to_string()];
-    alias.env_map = BTreeMap::from([("GH_TOKEN".to_string(), "github/token:value".to_string())]);
+    let alias = AliasConfig {
+        secrets: vec!["github/token".to_string()],
+        tags: vec!["prod".to_string()],
+        env_map: BTreeMap::from([("GH_TOKEN".to_string(), "github/token:value".to_string())]),
+    };
 
     let json = serde_json::to_string(&alias).expect("serialize alias");
     let parsed: AliasConfig = serde_json::from_str(&json).expect("parse alias");

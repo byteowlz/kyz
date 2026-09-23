@@ -696,10 +696,10 @@ mod tests {
         let pass = SecretString::from("correct horse battery staple".to_string());
         let (mut file, dk) = VaultFileV3::create(&pass).expect("create");
         let entry = make_entry("svc", "tok", "hunter2");
-        file.set(&entry, &*dk).expect("set");
+        file.set(&entry, &dk).expect("set");
 
         let enc = file.get_encrypted("svc", "tok").expect("present");
-        let dec = decrypt_entry_v3(enc, &*dk).expect("decrypt");
+        let dec = decrypt_entry_v3(enc, &dk).expect("decrypt");
         assert_eq!(dec.value(), Some("hunter2"));
     }
 
@@ -708,7 +708,7 @@ mod tests {
         let pass = SecretString::from("correct horse battery staple".to_string());
         let (mut file, dk) = VaultFileV3::create(&pass).expect("create");
         let entry = make_entry("svc", "tok", "hunter2");
-        file.set(&entry, &*dk).expect("set");
+        file.set(&entry, &dk).expect("set");
 
         let bad_dk = [0u8; DK_LEN];
         let enc = file.get_encrypted("svc", "tok").expect("present");
@@ -719,18 +719,18 @@ mod tests {
     fn history_archived_on_overwrite() {
         let pass = SecretString::from("correct horse battery staple".to_string());
         let (mut file, dk) = VaultFileV3::create(&pass).expect("create");
-        file.set(&make_entry("svc", "tok", "v1"), &*dk)
+        file.set(&make_entry("svc", "tok", "v1"), &dk)
             .expect("set v1");
-        file.set(&make_entry("svc", "tok", "v2"), &*dk)
+        file.set(&make_entry("svc", "tok", "v2"), &dk)
             .expect("set v2");
 
         let enc = file.get_encrypted("svc", "tok").expect("present");
         assert_eq!(enc.history.len(), 1);
-        assert_eq!(decrypt_entry_v3(enc, &*dk).unwrap().value(), Some("v2"));
+        assert_eq!(decrypt_entry_v3(enc, &dk).unwrap().value(), Some("v2"));
 
         // history[0] should still decrypt to v1
         let h0 = &enc.history[0];
-        let plain = aead_decrypt_b64(&*dk, &h0.fields_blob).expect("decrypt history");
+        let plain = aead_decrypt_b64(&dk, &h0.fields_blob).expect("decrypt history");
         let map: BTreeMap<String, String> = serde_json::from_slice(&plain).unwrap();
         assert_eq!(map.get("value"), Some(&"v1".to_string()));
     }
@@ -739,13 +739,13 @@ mod tests {
     fn rollback_restores_version() {
         let pass = SecretString::from("correct horse battery staple".to_string());
         let (mut file, dk) = VaultFileV3::create(&pass).expect("create");
-        file.set(&make_entry("svc", "tok", "v1"), &*dk).unwrap();
-        file.set(&make_entry("svc", "tok", "v2"), &*dk).unwrap();
+        file.set(&make_entry("svc", "tok", "v1"), &dk).unwrap();
+        file.set(&make_entry("svc", "tok", "v2"), &dk).unwrap();
         let prior = file.get_encrypted("svc", "tok").unwrap().history[0].version;
 
-        file.rollback("svc", "tok", prior, &*dk).expect("rollback");
+        file.rollback("svc", "tok", prior, &dk).expect("rollback");
         let enc = file.get_encrypted("svc", "tok").unwrap();
-        let dec = decrypt_entry_v3(enc, &*dk).unwrap();
+        let dec = decrypt_entry_v3(enc, &dk).unwrap();
         assert_eq!(dec.value(), Some("v1"));
     }
 
@@ -764,8 +764,8 @@ mod tests {
         assert_eq!(v3.entries.len(), 2);
 
         let a = v3.get_encrypted("svc", "a").unwrap();
-        assert_eq!(decrypt_entry_v3(a, &*dk).unwrap().value(), Some("alpha"));
+        assert_eq!(decrypt_entry_v3(a, &dk).unwrap().value(), Some("alpha"));
         let b = v3.get_encrypted("svc", "b").unwrap();
-        assert_eq!(decrypt_entry_v3(b, &*dk).unwrap().value(), Some("beta"));
+        assert_eq!(decrypt_entry_v3(b, &dk).unwrap().value(), Some("beta"));
     }
 }

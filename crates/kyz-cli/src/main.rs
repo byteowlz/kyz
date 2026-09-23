@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
+    )
+)]
 //! CLI interface for kyz - a cross-platform secrets manager.
 
 use anyhow::{Context, Result, anyhow};
@@ -8,11 +18,11 @@ use log::{LevelFilter, debug, info};
 use secrecy::{ExposeSecret as _, SecretString};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::io::{self, IsTerminal, Read as _};
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Read as _, Write as _};
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::{
-    io::{BufRead as _, BufReader, Write as _},
+    io::{BufRead as _, BufReader},
     os::unix::net::UnixStream,
 };
 
@@ -40,7 +50,19 @@ fn try_main() -> Result<()> {
     let cli = Cli::parse();
 
     let ctx = RuntimeContext::new(cli.common.clone())?;
-    ctx.init_logging()?;
+    // In-process daemon modes install their own rotating file logger;
+    // wiring env_logger first would send daemon diagnostics to the
+    // redirected stderr stream without rotation. A dry run never starts
+    // the daemon, so the CLI logger (and `-v`) stays active there.
+    let daemon_in_process = matches!(
+        &cli.command,
+        Command::Daemon {
+            command: DaemonCommand::Start(args)
+        } if args.runs_in_process() && !cli.common.dry_run
+    );
+    if !daemon_in_process {
+        ctx.init_logging()?;
+    }
     debug!("resolved paths: {:#?}", ctx.paths);
 
     match cli.command {
@@ -61,6 +83,7 @@ fn try_main() -> Result<()> {
         Command::Pipe(cmd) => handle_pipe(&ctx, &cmd),
         Command::Wrap(cmd) => handle_wrap(&ctx, &cmd),
         Command::Ipc { command } => handle_ipc(&ctx, command),
+        Command::Daemon { command } => handle_daemon(&ctx, command),
         Command::Ctx(_) => handle_ctx(&ctx),
         Command::Completions { shell } => {
             handle_completions(shell);
@@ -203,6 +226,12 @@ enum Command {
         /// IPC subcommand.
         #[command(subcommand)]
         command: IpcCommand,
+    },
+    /// Start, inspect, reload, or stop the credential daemon.
+    Daemon {
+        /// Daemon subcommand.
+        #[command(subcommand)]
+        command: DaemonCommand,
     },
     /// Print effective `AGENT_CTX` runtime metadata observed from the environment.
     Ctx(CtxCommand),
@@ -565,6 +594,46 @@ struct IpcUseCommand {
     /// IPC socket path (defaults to state-dir/kyz-ipc.sock).
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum DaemonCommand {
+    /// Start the credential daemon (background by default).
+    Start(DaemonStartArgs),
+    /// Report daemon status and the active configuration snapshot.
+    Status,
+    /// Validate and atomically reload the daemon configuration.
+    Reload,
+    /// Gracefully stop the daemon.
+    Stop,
+}
+
+#[derive(Debug, Clone, Args)]
+struct DaemonStartArgs {
+    /// Daemon lifetime in seconds; 0 disables the timeout. Overrides
+    /// `daemon.timeout_secs` from the config file.
+    #[arg(long, value_name = "SECONDS")]
+    timeout: Option<u64>,
+    /// Run the daemon in the foreground (for systemd/launchd/services).
+    #[arg(long)]
+    foreground: bool,
+    /// Command that prints the vault passphrase on its first stdout line
+    /// (used when no TTY is available). Never passed to the daemon child.
+    #[arg(long, value_name = "COMMAND")]
+    askpass: Option<String>,
+    /// Hidden: read a length-prefixed passphrase from stdin. This is the
+    /// one-shot bootstrap pipe used by the background launcher.
+    #[arg(long, hide = true)]
+    bootstrap: bool,
+}
+
+impl DaemonStartArgs {
+    /// Whether this invocation runs the daemon inside the current process
+    /// (and therefore must not install the CLI's `env_logger`: the daemon
+    /// installs its own rotating file logger).
+    const fn runs_in_process(&self) -> bool {
+        self.foreground || self.bootstrap
+    }
 }
 
 // -- Runtime context ----------------------------------------------------------
@@ -2407,7 +2476,13 @@ fn handle_exec(ctx: &RuntimeContext, cmd: &ExecCommand) -> Result<()> {
             .envs(&env)
             .status()
             .context(format!("failed to run '{program}'"))?;
-        std::process::exit(status.code().unwrap_or(1));
+        #[expect(
+            clippy::exit,
+            reason = "propagates the wrapped process exit code; ExitCode plumbing would change every exec call site"
+        )]
+        {
+            std::process::exit(status.code().unwrap_or(1));
+        }
     }
 }
 
@@ -2442,6 +2517,33 @@ const SCRUB_ENV_VARS: &[&str] = &["KYZ_VAULT_PASSWORD", "KYZ_API_TOKEN", "KYZ_PA
 
 const SCRUB_ENV_PREFIXES: &[&str] = &["KYZ_VAULT_PASS", "KYZ_SESSION_"];
 
+/// Whether an environment variable name is sensitive (exact names and
+/// prefixes).
+///
+/// Windows environment variable names are case-insensitive, so matching
+/// follows the platform's rules there — a lowercase `kyz_vault_password`
+/// must be scrubbed just like the canonical spelling or the secret would
+/// leak through `GetEnvironmentVariable`-style lookups in the child.
+fn env_key_is_sensitive(key: &str) -> bool {
+    let is_name = |candidate: &str| {
+        if cfg!(windows) {
+            key.eq_ignore_ascii_case(candidate)
+        } else {
+            key == candidate
+        }
+    };
+    SCRUB_ENV_VARS.iter().any(|name| is_name(name))
+        || SCRUB_ENV_PREFIXES.iter().any(|prefix| {
+            let (key_bytes, prefix_bytes) = (key.as_bytes(), prefix.as_bytes());
+            if cfg!(windows) {
+                key_bytes.len() >= prefix_bytes.len()
+                    && key_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
+            } else {
+                key_bytes.starts_with(prefix_bytes)
+            }
+        })
+}
+
 /// Build a scrubbed copy of the current environment, removing sensitive kyz vars.
 fn scrubbed_env() -> Vec<(String, String)> {
     std::env::vars()
@@ -2450,6 +2552,490 @@ fn scrubbed_env() -> Vec<(String, String)> {
                 && !SCRUB_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
         })
         .collect()
+}
+
+/// Strip sensitive kyz vars (exact names and prefixes) from a child
+/// command.
+///
+/// Iterates `vars_os` (not `vars`, which panics on non-Unicode entries)
+/// and removes the exact key spelling it found, so case-insensitive
+/// matches still remove the real variable.
+fn scrub_command_env(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        if env_key_is_sensitive(&key.to_string_lossy()) {
+            command.env_remove(&key);
+        }
+    }
+}
+
+fn handle_daemon(ctx: &RuntimeContext, command: DaemonCommand) -> Result<()> {
+    match command {
+        DaemonCommand::Start(cmd) => handle_daemon_start(ctx, &cmd),
+        DaemonCommand::Status => handle_daemon_status(ctx),
+        DaemonCommand::Reload => handle_daemon_reload(ctx),
+        DaemonCommand::Stop => handle_daemon_stop(ctx),
+    }
+}
+
+/// Resolve the daemon state paths for this invocation.
+fn daemon_paths(ctx: &RuntimeContext) -> kyz_daemon::DaemonPaths {
+    kyz_daemon::DaemonPaths::new(&ctx.paths.state_dir)
+}
+
+/// Read the management IPC token, if the daemon (or a stale file) left one.
+fn read_daemon_ipc_token(paths: &kyz_daemon::DaemonPaths) -> Option<String> {
+    std::fs::read_to_string(paths.ipc_token_path())
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn handle_daemon_start(ctx: &RuntimeContext, cmd: &DaemonStartArgs) -> Result<()> {
+    let store = ctx.vault_store()?;
+    let vault_path = store.vault_path().to_path_buf();
+
+    if let Some(timeout) = cmd.timeout
+        && timeout > kyz_core::config::MAX_TIMEOUT_SECS
+    {
+        return Err(anyhow!(
+            "--timeout {timeout} exceeds the maximum of {} seconds (use 0 to disable the timeout)",
+            kyz_core::config::MAX_TIMEOUT_SECS
+        ));
+    }
+
+    // Dry-run applies to both modes and must come before any passphrase
+    // prompt: `daemon start --foreground --dry-run` must not unlock the
+    // vault, write runtime files, or stay resident.
+    if ctx.common.dry_run {
+        let mode = if cmd.runs_in_process() {
+            "foreground"
+        } else {
+            "background"
+        };
+        info!(
+            "dry-run: would start the {mode} credential daemon for vault {}",
+            vault_path.display()
+        );
+        return Ok(());
+    }
+
+    let passphrase = if cmd.bootstrap {
+        read_bootstrap_passphrase()?
+    } else {
+        obtain_daemon_passphrase(cmd.askpass.as_deref())?
+    };
+
+    if cmd.runs_in_process() {
+        return run_foreground_daemon(ctx, cmd, vault_path, passphrase);
+    }
+    spawn_background_daemon(ctx, cmd, &vault_path, passphrase)
+}
+
+/// Run the daemon inside this process (foreground / service mode).
+fn run_foreground_daemon(
+    ctx: &RuntimeContext,
+    cmd: &DaemonStartArgs,
+    vault_path: PathBuf,
+    passphrase: SecretString,
+) -> Result<()> {
+    let opts = kyz_daemon::DaemonOptions {
+        vault_path,
+        passphrase,
+        config_path: ctx.paths.config_file.clone(),
+        state_dir: ctx.paths.state_dir.clone(),
+        timeout_override: cmd.timeout,
+    };
+    kyz_daemon::run_blocking(opts).map_err(|e| anyhow!("{e}"))
+}
+
+/// Spawn the daemon as a detached background child.
+///
+/// The passphrase travels over a one-shot bootstrap pipe (the child's
+/// stdin): length-prefixed bytes, then EOF. The child's environment is
+/// scrubbed of sensitive kyz vars ([`SCRUB_ENV_VARS`] /
+/// [`SCRUB_ENV_PREFIXES`]), its stdio points at `daemon.log`, and the
+/// launcher only exits successfully after the daemon answers a management
+/// `status` request.
+fn spawn_background_daemon(
+    ctx: &RuntimeContext,
+    cmd: &DaemonStartArgs,
+    vault_path: &Path,
+    passphrase: SecretString,
+) -> Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let paths = daemon_paths(ctx);
+    paths.ensure().map_err(|e| anyhow!("{e}"))?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.daemon_log_path())
+        .with_context(|| format!("opening {}", paths.daemon_log_path().display()))?;
+
+    let exe = std::env::current_exe().context("resolving the kyz executable")?;
+    let mut command = Command::new(&exe);
+    command
+        .arg("daemon")
+        .arg("start")
+        .arg("--foreground")
+        .arg("--bootstrap")
+        .arg("--vault")
+        .arg(vault_path)
+        .arg("--config")
+        .arg(&ctx.paths.config_file);
+    if let Some(timeout) = cmd.timeout {
+        command.arg("--timeout").arg(timeout.to_string());
+    }
+    scrub_command_env(&mut command);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(
+            log.try_clone().context("cloning daemon.log handle")?,
+        ))
+        .stderr(Stdio::from(log));
+
+    // Detach: own process group on Unix, no console + new process group on
+    // Windows, so Ctrl-C in the launching shell never reaches the daemon.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let mut child = command
+        .spawn()
+        .context("spawning the daemon child process")?;
+
+    // Bootstrap pipe write, then drop the handle so the child sees EOF.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("daemon child stdin was not piped")?;
+        let bytes = passphrase.expose_secret().as_bytes();
+        let length = u32::try_from(bytes.len()).context("passphrase too large")?;
+        stdin
+            .write_all(&length.to_le_bytes())
+            .and_then(|()| stdin.write_all(bytes))
+            .context("writing the bootstrap pipe")?;
+    }
+    drop(passphrase);
+
+    let pid = wait_for_daemon_ready(&paths, &mut child)?;
+    if !ctx.common.quiet {
+        println!("Daemon started (pid {pid})");
+    }
+    Ok(())
+}
+
+/// Poll the daemon until the **spawned child** answers a management
+/// request, the child exits, or the startup deadline passes.
+///
+/// The answering pid must match `child.id()`: a daemon that was already
+/// running (the child is about to fail on the instance lock) or a stale
+/// IPC token must never be reported as "started".
+fn wait_for_daemon_ready(
+    paths: &kyz_daemon::DaemonPaths,
+    child: &mut std::process::Child,
+) -> Result<u32> {
+    let expected_pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(anyhow!(
+                "daemon exited during startup (status {status}){}",
+                daemon_log_tail(paths)
+            ));
+        }
+        if let Some(token) = read_daemon_ipc_token(paths)
+            && let Ok(response) = kyz_daemon::send_request_blocking(
+                paths,
+                &token,
+                kyz_daemon::ipc::IpcRequestKind::Status,
+            )
+            && response.ok
+            && let Some(result) = response.result
+            && let Ok(report) = serde_json::from_value::<kyz_daemon::ipc::StatusReport>(result)
+            && report.pid == expected_pid
+        {
+            return Ok(report.pid);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            return Err(anyhow!(
+                "daemon did not become ready within 30 seconds{}",
+                daemon_log_tail(paths)
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The last few lines of the daemon run log, for startup failure context
+/// (the child's real error, e.g. "another daemon holds the lock", is only
+/// visible there).
+fn daemon_log_tail(paths: &kyz_daemon::DaemonPaths) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(paths.daemon_log_path()) else {
+        return String::new();
+    };
+    let len = file.metadata().map_or(0, |meta| meta.len());
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(2048)))
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut buffer = Vec::new();
+    if file.read_to_end(&mut buffer).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buffer);
+    let mut lines: Vec<&str> = text.lines().rev().take(5).collect();
+    lines.reverse();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\ndaemon.log (last lines):\n{}",
+        lines
+            .iter()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+/// Read the length-prefixed passphrase from the bootstrap pipe (stdin).
+fn read_bootstrap_passphrase() -> Result<SecretString> {
+    use std::io::Read as _;
+
+    let buffer = {
+        let mut handle = io::stdin().lock();
+        let mut length_bytes = [0u8; 4];
+        handle
+            .read_exact(&mut length_bytes)
+            .context("reading the bootstrap pipe header")?;
+        let length = u32::from_le_bytes(length_bytes) as usize;
+        if length == 0 || length > 4096 {
+            return Err(anyhow!("invalid bootstrap passphrase frame"));
+        }
+        let mut buffer = vec![0u8; length];
+        handle
+            .read_exact(&mut buffer)
+            .context("reading the bootstrap pipe payload")?;
+        buffer
+    };
+    let passphrase = String::from_utf8(buffer).context("bootstrap passphrase is not UTF-8")?;
+    Ok(SecretString::from(passphrase))
+}
+
+/// Obtain the vault passphrase: TTY prompt, askpass command, then the
+/// launcher-only environment variable (never passed to the daemon child).
+fn obtain_daemon_passphrase(askpass: Option<&str>) -> Result<SecretString> {
+    if io::stdin().is_terminal() {
+        return Ok(SecretString::from(prompt_passphrase("Vault passphrase: ")?));
+    }
+    if let Some(command) = askpass {
+        return Ok(SecretString::from(run_askpass(command)?));
+    }
+    if let Ok(value) = env::var("KYZ_VAULT_PASSWORD")
+        && !value.is_empty()
+    {
+        return Ok(SecretString::from(value));
+    }
+    Err(anyhow!(
+        "no TTY available for the vault passphrase; use --askpass COMMAND or KYZ_VAULT_PASSWORD"
+    ))
+}
+
+/// Run an askpass helper and return its first stdout line.
+fn run_askpass(command: &str) -> Result<String> {
+    let output = if cfg!(unix) {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+    } else {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(command)
+            .output()
+    }
+    .with_context(|| format!("running askpass command '{command}'"))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "askpass command failed with status {}",
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return Err(anyhow!("askpass command printed an empty passphrase"));
+    }
+    Ok(line.to_string())
+}
+
+/// Send one management request; `Ok(None)` means "not running".
+fn daemon_ipc_request(
+    ctx: &RuntimeContext,
+    kind: kyz_daemon::ipc::IpcRequestKind,
+) -> Result<Option<kyz_daemon::ipc::IpcResponse>> {
+    let paths = daemon_paths(ctx);
+    let Some(token) = read_daemon_ipc_token(&paths) else {
+        return report_daemon_not_running(ctx, &paths).map(|()| None);
+    };
+    match kyz_daemon::send_request_blocking(&paths, &token, kind) {
+        Ok(response) => Ok(Some(response)),
+        Err(e) if kyz_daemon::ipc::is_not_running(&e) => {
+            report_daemon_not_running(ctx, &paths).map(|()| None)
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+fn report_daemon_not_running(ctx: &RuntimeContext, paths: &kyz_daemon::DaemonPaths) -> Result<()> {
+    let stale_pid = kyz_daemon::instance::read_pid(&paths.pid_path());
+    let payload = serde_json::json!({
+        "running": false,
+        "stale_pid": stale_pid,
+    });
+    if ctx.common.json {
+        println!("{payload}");
+        return Ok(());
+    }
+    if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&payload).context("serializing status")?
+        );
+        return Ok(());
+    }
+    if !ctx.common.quiet {
+        if let Some(pid) = stale_pid {
+            println!("Daemon is not running (stale pid file references pid {pid})");
+        } else {
+            println!("Daemon is not running");
+        }
+    }
+    Ok(())
+}
+
+fn handle_daemon_status(ctx: &RuntimeContext) -> Result<()> {
+    let Some(response) = daemon_ipc_request(ctx, kyz_daemon::ipc::IpcRequestKind::Status)? else {
+        return Ok(());
+    };
+    if !response.ok {
+        return Err(anyhow!(
+            "status request failed: {}",
+            response.error_message()
+        ));
+    }
+    let result = response.result.unwrap_or_else(|| serde_json::json!({}));
+
+    if ctx.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).context("serializing status")?
+        );
+        return Ok(());
+    }
+    if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&result).context("serializing status")?
+        );
+        return Ok(());
+    }
+    if !ctx.common.quiet {
+        let Ok(report) = serde_json::from_value::<kyz_daemon::ipc::StatusReport>(result) else {
+            return Err(anyhow!("daemon returned a malformed status report"));
+        };
+
+        println!("Daemon pid: {}", report.pid);
+        println!("Uptime: {}s", report.uptime_secs);
+        println!(
+            "Vault: {}",
+            if report.unlocked {
+                "unlocked"
+            } else {
+                "locked/shutting down"
+            }
+        );
+        match report.timeout_remaining_secs {
+            Some(secs) => println!("Timeout: {secs}s remaining"),
+            None => println!("Timeout: none"),
+        }
+        let snapshot = report.snapshot;
+        println!(
+            "Snapshot: rules={} credentials={} scripts={} hash={}",
+            snapshot.rules, snapshot.credentials, snapshot.scripts, snapshot.hash,
+        );
+        // Prefer the actually bound address: the configured listen may be
+        // `127.0.0.1:0`, which no client can connect to.
+        if let Some(listen) = report
+            .proxy_listen
+            .as_deref()
+            .or(snapshot.listen.as_deref())
+        {
+            println!("Proxy listen: {listen}");
+        }
+    }
+    Ok(())
+}
+
+fn handle_daemon_reload(ctx: &RuntimeContext) -> Result<()> {
+    let Some(response) = daemon_ipc_request(ctx, kyz_daemon::ipc::IpcRequestKind::Reload)? else {
+        return Err(anyhow!("daemon is not running; nothing to reload"));
+    };
+    if !response.ok {
+        // Keep the active snapshot; surface the full validation detail.
+        return Err(anyhow!(
+            "daemon rejected reload: {}",
+            response.error_message()
+        ));
+    }
+    let result = response.result.unwrap_or_else(|| serde_json::json!({}));
+    if ctx.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).context("serializing reload result")?
+        );
+    } else if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&result).context("serializing reload result")?
+        );
+    } else if !ctx.common.quiet {
+        let hash = serde_json::from_value::<kyz_daemon::SnapshotSummary>(result)
+            .map_or_else(|_| "-".to_string(), |summary| summary.hash);
+        println!("Configuration reloaded (snapshot {hash})");
+    }
+    Ok(())
+}
+
+fn handle_daemon_stop(ctx: &RuntimeContext) -> Result<()> {
+    let Some(response) = daemon_ipc_request(ctx, kyz_daemon::ipc::IpcRequestKind::Stop)? else {
+        return Ok(());
+    };
+    if !response.ok {
+        return Err(anyhow!("stop request failed: {}", response.error_message()));
+    }
+    if !ctx.common.quiet {
+        println!("Daemon stopped");
+    }
+    Ok(())
 }
 
 fn handle_pipe(ctx: &RuntimeContext, cmd: &PipeCommand) -> Result<()> {
@@ -2649,8 +3235,28 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: &WrapCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::env_key_is_sensitive;
+
     #[cfg(unix)]
     use super::sanitized_ipc_output;
+
+    #[test]
+    fn sensitive_env_names_match_platform_case_rules() {
+        assert!(env_key_is_sensitive("KYZ_VAULT_PASSWORD"));
+        assert!(env_key_is_sensitive("KYZ_API_TOKEN"));
+        assert!(env_key_is_sensitive("KYZ_SESSION_ID"));
+        assert!(env_key_is_sensitive("KYZ_VAULT_PASS_FOO"));
+        assert!(!env_key_is_sensitive("KYZ_ENV"));
+        assert!(!env_key_is_sensitive("HOME"));
+
+        // Windows env names are case-insensitive; a lowercase spelling of
+        // the password variable must be scrubbed there or the child reads
+        // it right back through its own case-insensitive lookup.
+        #[cfg(windows)]
+        assert!(env_key_is_sensitive("kyz_vault_password"));
+        #[cfg(unix)]
+        assert!(!env_key_is_sensitive("kyz_vault_password"));
+    }
 
     #[cfg(unix)]
     #[test]

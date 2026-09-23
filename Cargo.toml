@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kyz-core",
+    "crates/kyz-daemon",
     "crates/kyz-runtime",
     "crates/kyz-cli",
     "crates/kyz-tui",
@@ -79,6 +80,7 @@ schemars = "1.2"
 
 # Internal crates
 kyz-core = { path = "crates/kyz-core" }
+kyz-daemon = { path = "crates/kyz-daemon" }
 kyz-runtime = { path = "crates/kyz-runtime" }
 
 # ============================================
@@ -158,3 +160,12 @@ print_stderr = "allow"              # CLIs/TUIs/APIs need to print to stderr
 
 # CLI option structs inherently have many boolean flags
 struct_excessive_bools = "allow"    # CLI flag structs have many bools
+
+# KDF and entropy-estimation dominate test wall time; optimize them even in
+# debug builds so vault-heavy tests stay fast (scrypt log_n=17 is ~20x
+# slower unoptimized).
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.zxcvbn]
+opt-level = 3

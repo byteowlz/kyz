@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
+    )
+)]
 //! Integration tests for the secret store layer.
 //!
 //! Tests cover `SecretEntry`, `VaultData`, `VaultFileV2`, encryption,
@@ -29,7 +39,7 @@ fn temp_vault_path(label: &str) -> PathBuf {
     ))
 }
 
-fn strong_passphrase() -> &'static str {
+const fn strong_passphrase() -> &'static str {
     "a-very-strong-passphrase-123"
 }
 
@@ -102,7 +112,10 @@ fn secret_entry_tags() {
 
 #[test]
 fn secret_entry_with_tags_builder() {
-    let tags: BTreeSet<String> = ["deploy", "ci"].iter().map(|s| s.to_string()).collect();
+    let tags: BTreeSet<String> = ["deploy", "ci"]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
     let entry = SecretEntry::single("svc", "key", "val").with_tags(tags.clone());
     assert_eq!(entry.tags, tags);
 }

@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
+    )
+)]
 //! Core library for kyz - a cross-platform secrets manager.
 //!
 //! This crate provides:
@@ -19,6 +29,7 @@ pub mod error;
 pub mod jit;
 pub mod paths;
 pub mod policy;
+pub mod proxy_config;
 pub mod scan;
 pub mod schema;
 pub mod store;
@@ -30,7 +41,10 @@ pub use auth_request::{
     AuthRequest, AuthRequestEvent, AuthRequestId, AuthRequestStatus, AuthRequestStore,
     CreateAuthRequest, DenyAuthRequest, generate_pickup_capability,
 };
-pub use config::{AliasConfig, AppConfig, LogLevel, LoggingConfig, PathsConfig, RuntimeConfig};
+pub use config::{
+    AliasConfig, AppConfig, DaemonConfig, LogLevel, LoggingConfig, PathsConfig, ProxyAuthMode,
+    ProxyConfig, ProxyCredentialConfig, ProxyRuleConfig, RuntimeConfig, ScriptGrantConfig,
+};
 pub use error::{CoreError, Result};
 pub use jit::{
     DecisionReason, GrantScope, GrantStore, GrantUseContext, JitGrant, OneTimeSecretSubmission,
@@ -38,11 +52,16 @@ pub use jit::{
 };
 pub use paths::{AppPaths, default_cache_dir};
 pub use policy::{Policy, PolicyViolation, default_policy, is_safe_exec_env_name, resolve_policy};
+pub use proxy_config::{
+    ConfigValidationError, RuleMatch, TemplateRenderError, TemplateVar, host_matches, match_rule,
+    method_allowed, normalize_host, parse_secret_ref, parse_template_vars, render_template,
+    upstream_host, validate_app_config, validate_host_pattern, validate_upstream,
+};
 pub use schema::{generate_example_config, generate_schema, write_generated_files};
 pub use store::{
     DEFAULT_HISTORY_RETENTION, EncryptedEntry, HistoryEntry, KeyringStore, SecretEntry,
-    SecretStore, SecretSummary, VaultData, VaultFileV2, VaultSession, VaultStatus, VaultStore,
-    decrypt_entry, encrypt_entry, env_vault_path, list_environments,
+    SecretStore, SecretSummary, UnlockedVault, VaultData, VaultFileV2, VaultSession, VaultStatus,
+    VaultStore, decrypt_entry, encrypt_entry, env_vault_path, fnv1a_64, list_environments,
 };
 pub use vault_v3::{
     DK_LEN, EncryptedEntryV3, HistoryEntryV3, KdfParams, MAX_KDF_LOG_N, MAX_KDF_P, MAX_KDF_R,

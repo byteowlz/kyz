@@ -231,28 +231,38 @@ mod tests {
     use super::resolve_base;
     use std::path::PathBuf;
 
+    /// Absolute variant of a Unix-style path on the current platform
+    /// (`Path::is_absolute` requires a drive prefix on Windows).
+    fn abs(p: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:\\{p}"))
+        } else {
+            PathBuf::from(format!("/{p}"))
+        }
+    }
+
     #[test]
     fn absolute_xdg_wins_on_unix() {
         let got = resolve_base(
-            Some(PathBuf::from("/xdg/config")),
+            Some(abs("xdg/config")),
             Some(PathBuf::from("/home/user")),
             Some(PathBuf::from("C:\\AppData")),
             false,
             ".config",
         );
-        assert_eq!(got, Some(PathBuf::from("/xdg/config")));
+        assert_eq!(got, Some(abs("xdg/config")));
     }
 
     #[test]
     fn absolute_xdg_wins_on_windows() {
         let got = resolve_base(
-            Some(PathBuf::from("/xdg/config")),
+            Some(abs("xdg/config")),
             Some(PathBuf::from("/home/user")),
             Some(PathBuf::from("C:\\AppData")),
             true,
             ".config",
         );
-        assert_eq!(got, Some(PathBuf::from("/xdg/config")));
+        assert_eq!(got, Some(abs("xdg/config")));
     }
 
     #[test]
