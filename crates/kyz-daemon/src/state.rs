@@ -176,6 +176,12 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// never acceptable.
 #[cfg(windows)]
 fn restrict_dir_acl_to_user(dir: &Path) -> Result<()> {
+    // The daemon runs detached without a console, so a console app spawned
+    // with default flags gets a brand-new (visible) console window; the
+    // flag keeps icacls silent without changing its stdio.
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let user = std::env::var("USERNAME").map_err(|e| {
         DaemonError::Internal(format!("cannot determine current user for ACL setup: {e}"))
     })?;
@@ -185,11 +191,6 @@ fn restrict_dir_acl_to_user(dir: &Path) -> Result<()> {
         ));
     }
     let grant = format!("{user}:(OI)(CI)F");
-    // The daemon runs detached without a console, so a console app spawned
-    // with default flags gets a brand-new (visible) console window; the
-    // flag keeps icacls silent without changing its stdio.
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = std::process::Command::new("icacls")
         .creation_flags(CREATE_NO_WINDOW)
         .arg(dir)

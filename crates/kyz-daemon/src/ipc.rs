@@ -325,16 +325,39 @@ async fn serve_windows(
     Ok(())
 }
 
+/// How long shutdown honors a read that may already hold a complete
+/// request. Windows overlapped reads cannot complete on their first
+/// poll, so a request sitting in the pipe surfaces only on a later
+/// wakeup that races the shutdown signal; Unix sockets complete
+/// immediately and never pay this wait with data present.
+const SHUTDOWN_FINAL_READ: std::time::Duration = std::time::Duration::from_millis(100);
+
 async fn handle_connection<S>(stream: S, state: &DaemonState, shutdown: &mut watch::Receiver<bool>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut stream = stream;
     loop {
-        let line = tokio::select! {
-            biased;
-            _ = shutdown.changed() => break,
-            line = read_line_capped(&mut stream, IPC_MAX_LINE_BYTES) => line,
+        // The read is polled first so a request that already arrived in
+        // full wins over shutdown (in-flight requests must finish before
+        // closing). When shutdown fires first, the bounded re-read still
+        // honors a request whose read completion has not been delivered
+        // yet.
+        let mut raced_shutdown = false;
+        let line = {
+            let read = read_line_capped(&mut stream, IPC_MAX_LINE_BYTES);
+            tokio::pin!(read);
+            tokio::select! {
+                biased;
+                line = &mut read => line,
+                _ = shutdown.changed() => {
+                    raced_shutdown = true;
+                    match tokio::time::timeout(SHUTDOWN_FINAL_READ, &mut read).await {
+                        Ok(line) => line,
+                        Err(_) => break,
+                    }
+                }
+            }
         };
         let raw = match line {
             Ok(raw) => raw,
@@ -355,8 +378,26 @@ where
         {
             break;
         }
+        if raced_shutdown {
+            // Shutdown fired mid-request; having honored the in-flight
+            // request, end here instead of parking for the next one.
+            break;
+        }
     }
 }
+
+/// Attempts per management request. A request that lands exactly as the
+/// daemon shuts down can have its connection dropped before a response
+/// (the handler is torn down mid-request), so a dropped connection is
+/// retried: the retry either reaches the still-serving daemon or cannot
+/// connect at all, which callers report as "not running". The shutdown
+/// race must never surface as a hard IPC error.
+const SEND_ATTEMPTS: u32 = 3;
+
+/// Pause between attempts, long enough for a shutting-down daemon to drop
+/// its listener so the retry connects cleanly or is refused instead of
+/// being dropped again.
+const SEND_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Send one request over a fresh connection and read the response.
 ///
@@ -371,11 +412,6 @@ pub async fn send_request(
     token: &str,
     kind: IpcRequestKind,
 ) -> Result<IpcResponse> {
-    #[cfg(unix)]
-    let mut stream = connect_unix(paths).await?;
-    #[cfg(windows)]
-    let mut stream = connect_windows(paths).await?;
-
     let request = IpcRequest {
         version: IPC_PROTOCOL_VERSION,
         kind,
@@ -383,13 +419,56 @@ pub async fn send_request(
     };
     let serialized = serde_json::to_string(&request)
         .map_err(|e| DaemonError::Ipc(format!("serializing request: {e}")))?;
-    write_line(&mut stream, &serialized).await?;
 
-    let raw = read_line_capped(&mut stream, IPC_MAX_LINE_BYTES)
-        .await
-        .map_err(|e| DaemonError::Ipc(format!("reading IPC response: {e}")))?;
+    let mut attempt = 1;
+    loop {
+        match send_attempt(paths, &serialized).await {
+            Ok(response) => return Ok(response),
+            Err(e) if attempt < SEND_ATTEMPTS && dropped_mid_request(&e) => {}
+            Err(e) => return Err(e),
+        }
+        attempt += 1;
+        tokio::time::sleep(SEND_RETRY_PAUSE).await;
+    }
+}
+
+/// One connect–write–read attempt for [`send_request`].
+async fn send_attempt(paths: &DaemonPaths, serialized: &str) -> Result<IpcResponse> {
+    #[cfg(unix)]
+    let mut stream = connect_unix(paths).await?;
+    #[cfg(windows)]
+    let mut stream = connect_windows(paths).await?;
+
+    write_line(&mut stream, serialized).await?;
+
+    let raw = match read_line_capped(&mut stream, IPC_MAX_LINE_BYTES).await {
+        Ok(raw) => raw,
+        // The OS error kind must survive so `send_request` can tell a
+        // dropped connection (the shutdown race) from other failures.
+        Err(e) if is_connection_drop(e.kind()) => return Err(DaemonError::Io(e)),
+        Err(e) => return Err(DaemonError::Ipc(format!("reading IPC response: {e}"))),
+    };
     let text = String::from_utf8_lossy(&raw).trim().to_string();
     serde_json::from_str(&text).map_err(|e| DaemonError::Ipc(format!("parsing IPC response: {e}")))
+}
+
+/// Whether an error kind means the peer dropped the connection mid-read
+/// (EOF/reset instead of a response line).
+const fn is_connection_drop(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// Whether an attempt failed because the daemon dropped the connection
+/// before answering — the shutdown window described on
+/// [`SEND_ATTEMPTS`].
+fn dropped_mid_request(error: &DaemonError) -> bool {
+    matches!(error, DaemonError::Io(e) if is_connection_drop(e.kind()))
 }
 
 #[cfg(unix)]
@@ -535,5 +614,52 @@ mod tests {
         let mut reader = &data[..];
         let err = read_line_capped(&mut reader, 1024).await.expect_err("eof");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn only_drop_kinds_count_as_a_dropped_connection() {
+        assert!(is_connection_drop(std::io::ErrorKind::UnexpectedEof));
+        assert!(is_connection_drop(std::io::ErrorKind::ConnectionReset));
+        assert!(is_connection_drop(std::io::ErrorKind::ConnectionAborted));
+        assert!(is_connection_drop(std::io::ErrorKind::BrokenPipe));
+        // "Not listening" answers must stay non-retryable so callers map
+        // them to "not running" immediately.
+        assert!(!is_connection_drop(std::io::ErrorKind::NotFound));
+        assert!(!is_connection_drop(std::io::ErrorKind::ConnectionRefused));
+        assert!(!is_connection_drop(std::io::ErrorKind::InvalidData));
+    }
+
+    /// A daemon in its shutdown window drops connections without
+    /// answering: `send_request` must retry them (three attempts, two
+    /// pauses) and then surface the drop instead of a hang or a protocol
+    /// error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_connections_are_retried_then_surfaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = DaemonPaths::new(dir.path());
+        paths.ensure().expect("state dir");
+        let listener = tokio::net::UnixListener::bind(paths.socket_path()).expect("bind socket");
+        let dropper = tokio::spawn(async move {
+            for _ in 0..SEND_ATTEMPTS {
+                let (stream, _) = listener.accept().await.expect("accept");
+                drop(stream);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let error = send_request(&paths, "token", IpcRequestKind::Status)
+            .await
+            .expect_err("every attempt is dropped, so the request must fail");
+        assert!(
+            dropped_mid_request(&error),
+            "surfaced error should be the dropped connection, got: {error}"
+        );
+        assert!(
+            started.elapsed() >= 2 * SEND_RETRY_PAUSE,
+            "all attempts must run, separated by the retry pause (took {:?})",
+            started.elapsed()
+        );
+        dropper.await.expect("dropper task");
     }
 }

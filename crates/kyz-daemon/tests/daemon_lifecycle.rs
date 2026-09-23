@@ -127,6 +127,55 @@ async fn timeout_triggers_graceful_shutdown_and_cleanup() {
 }
 
 #[tokio::test]
+async fn shutdown_answers_a_request_already_on_the_wire() {
+    let fixture = Fixture::new();
+    let daemon = fixture.start(None).await;
+    let paths = fixture.daemon_paths();
+    let token = fixture.ipc_token();
+
+    let request =
+        format!(r#"{{"version":{IPC_PROTOCOL_VERSION},"type":"status","token":"{token}"}}"#);
+    let mut stream = raw_connection(&paths).await;
+    // Prime the connection so its handler is parked in the read loop.
+    let primer = roundtrip(&mut stream, &request)
+        .await
+        .expect("primer response");
+    assert!(primer.contains(r#""ok":true"#), "primer failed: {primer}");
+
+    // A second request is fully on the wire, then shutdown fires before
+    // the daemon can answer it: the handler must finish the in-flight
+    // request (the drain contract), not drop the connection.
+    let mut payload = request.into_bytes();
+    payload.push(b'\n');
+    stream.write(&payload).await.expect("write request");
+    daemon.handle.stop();
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let answer = loop {
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .expect("read should not hang")
+            .expect("read should succeed");
+        if read == 0 {
+            break None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.ends_with(b"\n") {
+            break Some(String::from_utf8_lossy(&buffer).trim().to_string());
+        }
+    };
+    assert!(
+        answer
+            .as_deref()
+            .is_some_and(|a| a.contains(r#""ok":true"#)),
+        "request on the wire when shutdown fired must still be answered, got: {answer:?}"
+    );
+
+    daemon.handle.wait().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
 async fn second_instance_is_rejected_while_first_runs() {
     let fixture = Fixture::new();
     let daemon = fixture.start(None).await;
