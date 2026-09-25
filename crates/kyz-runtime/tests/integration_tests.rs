@@ -26,10 +26,6 @@ use kyz_runtime::{
     VaultKind, VaultSource,
 };
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
 // Real Ed25519 test key generated with ssh-keygen; used to exercise
 // metadata derivation. The corresponding public key and SHA-256
 // fingerprint are embedded below for assertion.
@@ -48,7 +44,25 @@ fn strong_passphrase() -> SecretString {
     SecretString::from("kyz-runtime-integration-test-passphrase".to_string())
 }
 
+/// OS keyrings do not reliably serialize concurrent access from multiple
+/// threads (the keyring crate calls this out for Windows in particular):
+/// parallel tests issuing concurrent session writes can lose one, which
+/// surfaces as spurious "vault is locked" failures mid-test. Tests that
+/// unlock a vault hold this lock so they run one at a time.
+static KEYRING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`KEYRING_TEST_LOCK`] for the lifetime of the test.
+fn keyring_guard() -> std::sync::MutexGuard<'static, ()> {
+    KEYRING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn temp_vault_path(label: &str) -> PathBuf {
+    // v4 writes allocate op ids through the global actor-state
+    // directory; isolate it away from the developer's real state file
+    // (idempotent, so calling it from every test is fine).
+    kyz_core::paths::isolate_state_dir().expect("isolate state dir");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -82,14 +96,6 @@ fn cleanup(vault: &Vault, path: &PathBuf) {
     let _ = std::fs::remove_file(path);
 }
 
-// ---------------------------------------------------------------------------
-// Error mapping
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Vault facade
-// ---------------------------------------------------------------------------
-
 #[test]
 fn open_explicit_path_infers_custom_source() {
     let path = temp_vault_path("custom-source");
@@ -100,6 +106,7 @@ fn open_explicit_path_infers_custom_source() {
 
 #[test]
 fn unlock_state_transitions() {
+    let _keyring = keyring_guard();
     let path = temp_vault_path("unlock-state");
     let vault = Vault::open_path(&path);
 
@@ -146,6 +153,7 @@ fn remote_approval_mode_reports_locked_requestable() {
 
 #[test]
 fn get_not_found_returns_typed_error() {
+    let _keyring = keyring_guard();
     let (vault, path) = new_unlocked_vault("not-found");
     let r = SecretRef::new("svc", "missing");
     let err = vault.get(&r).expect_err("expected NotFound");
@@ -158,6 +166,7 @@ fn get_not_found_returns_typed_error() {
 
 #[test]
 fn try_get_returns_none_on_miss() {
+    let _keyring = keyring_guard();
     let (vault, path) = new_unlocked_vault("try-get");
     let got = vault
         .try_get(&SecretRef::new("svc", "missing"))
@@ -168,6 +177,7 @@ fn try_get_returns_none_on_miss() {
 
 #[test]
 fn get_field_reports_missing_field_as_unsupported_kind() {
+    let _keyring = keyring_guard();
     let (vault, path) = new_unlocked_vault("field-missing");
     set_simple(&vault, "svc", "only-value", "hunter2");
     let err = vault
@@ -179,6 +189,7 @@ fn get_field_reports_missing_field_as_unsupported_kind() {
 
 #[test]
 fn list_all_returns_every_entry() {
+    let _keyring = keyring_guard();
     let (vault, path) = new_unlocked_vault("list-all");
     set_simple(&vault, "svc-a", "k1", "v1");
     set_simple(&vault, "svc-a", "k2", "v2");
@@ -188,10 +199,6 @@ fn list_all_returns_every_entry() {
     assert_eq!(all.len(), 3);
     cleanup(&vault, &path);
 }
-
-// ---------------------------------------------------------------------------
-// Layered resolver
-// ---------------------------------------------------------------------------
 
 struct Layered {
     vault: LayeredVault,
@@ -242,6 +249,7 @@ fn build_layered(label: &str) -> Layered {
 
 #[test]
 fn layered_resolve_first_hit_wins() {
+    let _keyring = keyring_guard();
     let l = build_layered("first-hit");
 
     let got = l
@@ -265,6 +273,7 @@ fn layered_resolve_first_hit_wins() {
 
 #[test]
 fn layered_constraint_workspace_only_blocks_personal_fallback() {
+    let _keyring = keyring_guard();
     let l = build_layered("ws-only");
 
     let err = l
@@ -281,6 +290,7 @@ fn layered_constraint_workspace_only_blocks_personal_fallback() {
 
 #[test]
 fn layered_constraint_no_personal_is_equivalent_for_service_mode() {
+    let _keyring = keyring_guard();
     let l = build_layered("no-personal");
     let err = l
         .vault
@@ -295,6 +305,7 @@ fn layered_constraint_no_personal_is_equivalent_for_service_mode() {
 
 #[test]
 fn layered_resolve_strict_detects_ambiguity() {
+    let _keyring = keyring_guard();
     let l = build_layered("ambiguous");
 
     let err = l
@@ -316,6 +327,7 @@ fn layered_resolve_strict_detects_ambiguity() {
 
 #[test]
 fn layered_resolve_strict_accepts_unique_hit() {
+    let _keyring = keyring_guard();
     let l = build_layered("strict-unique");
 
     let got = l
@@ -333,10 +345,6 @@ fn cleanup_paths(l: &Layered) {
     let _ = std::fs::remove_file(&l.workspace_path);
     let _ = std::fs::remove_file(&l.personal_path);
 }
-
-// ---------------------------------------------------------------------------
-// SSH identity helpers
-// ---------------------------------------------------------------------------
 
 fn ssh_entry_with_private_key(service: &str, key: &str) -> SecretEntry {
     let mut fields = BTreeMap::new();
@@ -432,6 +440,7 @@ fn identity_from_untagged_entry_returns_none() {
 
 #[test]
 fn list_ssh_identities_across_vault() {
+    let _keyring = keyring_guard();
     let (vault, path) = new_unlocked_vault("ssh-list");
 
     // Two SSH entries and one generic entry.
@@ -507,6 +516,7 @@ fn vault_source_display_includes_kind_and_path() {
 
 #[test]
 fn secret_string_field_round_trips() {
+    let _keyring = keyring_guard();
     let (vault, path) = new_unlocked_vault("field-round-trip");
     let mut fields = BTreeMap::new();
     fields.insert(
@@ -528,6 +538,7 @@ fn secret_string_field_round_trips() {
 
 #[test]
 fn locked_workspace_layer_does_not_poison_resolution() {
+    let _keyring = keyring_guard();
     // Hostile-repo shape: a workspace vault EXISTS but is never unlocked.
     // It must not break resolution of refs that live in later, unlocked
     // layers (run-2 finding F9), and failures must carry real provenance.

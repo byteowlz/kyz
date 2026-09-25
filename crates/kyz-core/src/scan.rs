@@ -13,6 +13,7 @@ use secrecy::ExposeSecret as _;
 use crate::error::CoreError;
 use crate::store::SecretEntry;
 use crate::vault_v3::{DK_LEN, VaultFileV3, decrypt_entry_v3};
+use crate::vault_v4::VaultFileV4;
 
 /// A match found during scanning.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -43,6 +44,19 @@ pub struct ScanOptions {
     pub path: Option<PathBuf>,
 }
 
+/// Index one entry's field values under `service/key:field` display
+/// names, skipping very short values (too many false positives).
+fn index_entry_fields(entry: &SecretEntry, index: &mut BTreeMap<String, String>) {
+    for (field_name, field_value) in &entry.fields {
+        let value = field_value.expose_secret();
+        if value.len() < 4 {
+            continue;
+        }
+        let display_name = format!("{}/{}:{}", entry.service, entry.key, field_name);
+        index.insert(value.to_string(), display_name);
+    }
+}
+
 /// Build a map of secret values → display names for scanning.
 ///
 /// # Errors
@@ -56,17 +70,43 @@ pub fn build_secret_index(
 
     for encrypted in vault.entries.values() {
         let entry: SecretEntry = decrypt_entry_v3(encrypted, dk)?;
-        for (field_name, field_value) in &entry.fields {
-            let value = field_value.expose_secret();
-            // Skip very short values (too many false positives)
-            if value.len() < 4 {
-                continue;
-            }
-            let display_name = format!("{}/{}:{}", entry.service, entry.key, field_name);
-            index.insert(value.to_string(), display_name);
-        }
+        index_entry_fields(&entry, &mut index);
     }
 
+    Ok(index)
+}
+
+/// Build the scan index from a v4 vault: every visible entry's winning
+/// snapshot (conflict losers and pruned snapshots are not live values).
+///
+/// Hidden entries (delete-wins tombstones) are skipped — they hold no
+/// live values — but every other failure is loud: a scan that silently
+/// skipped an entry whose current snapshot failed to decrypt would
+/// under-report leaks with exit code 0.
+///
+/// # Errors
+///
+/// Returns an error if the vault fails verification, projection, or the
+/// winning snapshot of any visible entry fails to decrypt.
+pub fn build_secret_index_v4(
+    vault: &VaultFileV4,
+    dk: &[u8; DK_LEN],
+) -> Result<BTreeMap<String, String>, CoreError> {
+    vault.verify_mac(dk)?;
+    let mut index: BTreeMap<String, String> = BTreeMap::new();
+    for ck in vault.entries.keys() {
+        let Some((service, key)) = VaultFileV4::split_compound_key(ck) else {
+            continue;
+        };
+        // One causal walk per entry: `decrypt_current` reports hidden
+        // (delete-wins) entries as SecretNotFound, which is the skip
+        // condition; every other failure stays loud.
+        match vault.decrypt_current(dk, &service, &key) {
+            Ok(snapshot) => index_entry_fields(&snapshot.to_entry(), &mut index),
+            Err(CoreError::SecretNotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(index)
 }
 
