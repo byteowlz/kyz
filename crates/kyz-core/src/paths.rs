@@ -3,6 +3,8 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-util")]
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -178,12 +180,60 @@ pub fn default_data_dir() -> Result<PathBuf> {
     Ok(base_dir("XDG_DATA_HOME", ".local/share", "APPDATA")?.join(APP_NAME))
 }
 
+/// Process-wide state-directory override (only compiled for this crate's
+/// own tests via the `test-util` feature).
+#[cfg(feature = "test-util")]
+static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Override [`default_state_dir`] for the rest of this process.
+///
+/// Test-only (gated on the `test-util` feature, never enabled for
+/// downstream builds): keeps v4-write tests from reading and writing the
+/// developer's real actor-state file. Idempotent; the first path wins.
+#[cfg(feature = "test-util")]
+pub fn set_state_dir_override(path: PathBuf) {
+    let _ = STATE_DIR_OVERRIDE.set(path);
+}
+
+/// Point [`default_state_dir`] at an isolated per-process temp dir.
+///
+/// Test-only, like [`set_state_dir_override`]. Shared by this crate's unit
+/// tests and integration tests (`tests/common`): v4 writes allocate op ids
+/// through the global actor-state directory, and without this every test
+/// would accumulate counters for random vault ids in the developer's real
+/// `actor-state.json` and contend with a running `kyz` for the actor lock.
+///
+/// # Errors
+///
+/// Returns an error if the temp directory cannot be created.
+#[cfg(feature = "test-util")]
+pub fn isolate_state_dir() -> Result<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static DONE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(dir) = DONE.get() {
+        set_state_dir_override(dir.clone());
+        return Ok(());
+    }
+    let dir = std::env::temp_dir().join(format!("kyz-test-state-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating isolated state dir {}", dir.display()))?;
+    set_state_dir_override(DONE.get_or_init(|| dir).clone());
+    Ok(())
+}
+
 /// Get the default state directory (`XDG_STATE_HOME` or fallback).
 ///
 /// # Errors
 ///
 /// Returns an error if the home directory cannot be determined.
 pub fn default_state_dir() -> Result<PathBuf> {
+    #[cfg(feature = "test-util")]
+    if let Some(dir) = STATE_DIR_OVERRIDE.get() {
+        return Ok(dir.clone());
+    }
     Ok(base_dir("XDG_STATE_HOME", ".local/state", "LOCALAPPDATA")?.join(APP_NAME))
 }
 

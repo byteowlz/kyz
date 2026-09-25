@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-api"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2013,7 +2013,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "age",
  "anyhow",
@@ -2048,9 +2048,13 @@ dependencies = [
  "config",
  "fs2",
  "getrandom 0.3.4",
+ "hex",
+ "hkdf",
+ "hmac",
  "hostname",
  "humantime",
  "keyring",
+ "kyz-core",
  "log",
  "schemars",
  "scrypt",
@@ -2070,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-daemon"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2097,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-mcp"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2112,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-runtime"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "kyz-core",
  "log",
@@ -2124,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "kyz-tui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",

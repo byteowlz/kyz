@@ -225,23 +225,97 @@ fn restrict_dir_acl_to_user(dir: &Path) -> Result<()> {
         .output()
         .map_err(|e| DaemonError::Internal(format!("verifying state dir ACL: {e}")))?;
     let text = String::from_utf8_lossy(&acl.stdout).to_ascii_lowercase();
-    if !acl.status.success()
-        || [
-            "everyone:",
-            "users:",
-            "authenticated users:",
-            "s-1-1-0:",
-            "s-1-5-32-545:",
-            "s-1-5-11:",
-        ]
-        .iter()
-        .any(|principal| text.contains(principal))
-    {
+    if !acl.status.success() || !state_dir_acl_is_user_only(&text, dir, &user) {
         return Err(DaemonError::Internal(
             "state dir ACL verification failed".to_string(),
         ));
     }
     Ok(())
+}
+
+/// Whether the (already lowercased) `icacls` output shows the directory's
+/// DACL granted to the current user and nothing else.
+///
+/// The tightening sequence (`/reset`, `/inheritance:r`, `/grant:r`) ends
+/// with exactly one explicit ACE for the current user, so verification
+/// checks *that* invariant instead of substring-matching well-known
+/// group names — an account named e.g. `appusers` must not trip the old
+/// `users:` check, while any genuinely foreign trustee (including
+/// `Everyone`/`BUILTIN\Users`/`Authenticated Users` by name or SID) is
+/// rejected because it is not the current user.
+#[cfg(windows)]
+fn state_dir_acl_is_user_only(text: &str, dir: &Path, user: &str) -> bool {
+    let trustees = icacls_trustees(text, dir);
+    let user = user.to_ascii_lowercase();
+    let machine_suffix = format!("\\{user}");
+    !trustees.is_empty()
+        && trustees
+            .iter()
+            .all(|trustee| trustee == &user || trustee.ends_with(&machine_suffix))
+}
+
+/// Extract the trustee names from `icacls <path>` output.
+///
+/// ACE lines look like `MACHINE\user:(OI)(CI)(F)`, possibly several ACEs
+/// on one line after the echoed path, and trustee names may contain
+/// spaces (`NT AUTHORITY\Authenticated Users`). Anything without a
+/// `trustee:(` shape (summary lines such as "Successfully processed 1
+/// files") yields nothing.
+#[cfg(windows)]
+fn icacls_trustees(lowercased_output: &str, path: &Path) -> Vec<String> {
+    let path_prefix = path.to_string_lossy().to_ascii_lowercase();
+    let mut trustees = Vec::new();
+    for line in lowercased_output.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("successfully processed")
+            || line.starts_with("failed processing")
+        {
+            continue;
+        }
+        let rest = line.strip_prefix(&path_prefix).map_or(line, |after| after);
+        trustees.extend(parse_ace_trustees(rest));
+    }
+    trustees
+}
+
+/// Scan `trustee:(rights)(rights) …` sequences out of one ACE line.
+#[cfg(windows)]
+fn parse_ace_trustees(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // The trustee runs to the first `:(` (drive-letter colons and
+        // colons inside names are never followed by a rights group).
+        let start = i;
+        let mut colon = None;
+        let mut j = i;
+        while j + 1 < chars.len() {
+            if chars[j] == ':' && chars[j + 1] == '(' {
+                colon = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        let Some(colon) = colon else {
+            break;
+        };
+        out.push(chars[start..colon].iter().collect());
+        // Consume the consecutive parenthesized rights groups.
+        i = colon + 1;
+        while i < chars.len() && chars[i] == '(' {
+            match chars[i..].iter().position(|&c| c == ')') {
+                Some(close) => i += close + 1,
+                None => i = chars.len(),
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -308,6 +382,66 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acl_verification_accepts_account_names_ending_in_users() {
+        // Regression: substring matching on `users:` rejected an ACE for
+        // an account actually named `appusers` even though the DACL was
+        // correctly tightened to that user alone.
+        let dir = Path::new(r"C:\state\daemon");
+        let output = "c:\\state\\daemon machine\\appusers:(oi)(ci)(f)\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n";
+        assert!(state_dir_acl_is_user_only(output, dir, "appusers"));
+        assert!(!state_dir_acl_is_user_only(output, dir, "otheruser"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acl_verification_rejects_foreign_trustees_by_name_or_sid() {
+        let dir = Path::new(r"C:\state\daemon");
+        for output in [
+            // Foreign group by name (inherited markers included).
+            "c:\\state\\daemon machine\\appusers:(oi)(ci)(f) builtin\\users:(i)(m)\r\n",
+            // Well-known SID form.
+            "c:\\state\\daemon *s-1-1-0:(f)\r\n",
+            // Spaced trustee name.
+            "c:\\state\\daemon nt authority\\authenticated users:(i)(m)\r\n",
+            // No ACE line at all.
+            "Successfully processed 0 files; Failed processing 1 files\r\n",
+        ] {
+            assert!(
+                !state_dir_acl_is_user_only(output, dir, "appusers"),
+                "must reject: {output}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ace_trustee_parser_handles_realistic_icacls_lines() {
+        assert_eq!(
+            parse_ace_trustees(r"machine\appusers:(oi)(ci)(f)"),
+            vec![r"machine\appusers".to_string()]
+        );
+        assert_eq!(
+            parse_ace_trustees(
+                r"machine\user:(oi)(ci)(f) builtin\users:(i)(m) nt authority\authenticated users:(i)(m)"
+            ),
+            vec![
+                r"machine\user".to_string(),
+                r"builtin\users".to_string(),
+                r"nt authority\authenticated users".to_string(),
+            ]
+        );
+        // Rights lists containing commas stay inside their group.
+        assert_eq!(
+            parse_ace_trustees(r"machine\user:(d,wdac)"),
+            vec![r"machine\user".to_string()]
+        );
+        // Non-ACE text yields nothing.
+        assert!(parse_ace_trustees("Successfully processed 1 files").is_empty());
+        assert!(parse_ace_trustees("").is_empty());
     }
 
     #[test]

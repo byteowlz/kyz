@@ -257,13 +257,17 @@ impl Vault {
 
     /// Store an entry under the given ref.
     ///
+    /// Re-adding a deleted entry is allowed: programmatic callers express
+    /// intent by writing the entry, so no interactive recreate confirmation
+    /// is interposed (the CLI keeps its `--yes` guard).
+    ///
     /// # Errors
     ///
     /// Returns an error on backend failure.
     pub fn set(&self, r: &SecretRef, entry: &SecretEntry) -> Result<()> {
         self.backend
             .store()
-            .set(r.service(), r.key(), entry)
+            .set_recreating(r.service(), r.key(), entry)
             .map_err(Error::from)
     }
 

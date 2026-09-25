@@ -159,3 +159,80 @@ fn scan_options_defaults() {
     assert!(!opts.staged_only);
     assert!(opts.path.is_none());
 }
+
+#[test]
+fn build_secret_index_v4_is_loud_on_undecryptable_winner() {
+    use std::collections::BTreeSet;
+
+    use kyz_core::{Hlc, OpId, SnapshotPlain, VaultFileV4};
+
+    let passphrase = SecretString::from("a-very-strong-passphrase-123".to_string());
+    let (mut vault, dk) = VaultFileV4::create(&passphrase).expect("create");
+
+    let snap = |service: &str, key: &str, value: &str| SnapshotPlain {
+        service: service.to_string(),
+        key: key.to_string(),
+        fields: BTreeMap::from([("value".to_string(), value.to_string())]),
+        tags: BTreeSet::new(),
+        created_at: 1,
+        updated_at: 1,
+    };
+    let actor = "0123456789abcdef0123456789abcdef";
+    let mut counter = 0u64;
+    let mut next_id = || {
+        counter += 1;
+        OpId::new(actor, counter).expect("op id")
+    };
+
+    // A healthy visible entry.
+    vault
+        .append_put(
+            &snap("svc", "ok", "good-value-1234"),
+            next_id(),
+            vec![],
+            Hlc::zero(),
+            &dk,
+        )
+        .expect("put");
+    // A tombstoned entry: hidden, no live values — must be skipped.
+    let gone = next_id();
+    vault
+        .append_put(
+            &snap("svc", "gone", "deleted-value-99"),
+            gone.clone(),
+            vec![],
+            Hlc::zero(),
+            &dk,
+        )
+        .expect("put");
+    vault.append_delete("svc", "gone", next_id(), vec![gone], Hlc::zero());
+    // A visible entry whose winner has no ciphertext (pruned-winner shape).
+    vault
+        .append_put(
+            &snap("svc", "broken", "lost-value-777"),
+            next_id(),
+            vec![],
+            Hlc::zero(),
+            &dk,
+        )
+        .expect("put");
+    vault.entries.get_mut("svc/broken").expect("entry")[0].blob = None;
+    vault.finalize(&dk).expect("finalize");
+
+    // Control: without the broken entry the index builds, and the
+    // tombstoned value is absent from it.
+    let mut healthy = vault.clone();
+    healthy.entries.remove("svc/broken");
+    healthy.finalize(&dk).expect("finalize");
+    let index = kyz_core::scan::build_secret_index_v4(&healthy, &dk).expect("index");
+    assert!(index.contains_key("good-value-1234"));
+    assert!(!index.contains_key("deleted-value-99"));
+
+    // The broken winner must fail the whole scan — silently skipping it
+    // would under-report leaks with exit code 0.
+    let err = kyz_core::scan::build_secret_index_v4(&vault, &dk).expect_err("must fail loudly");
+    assert!(
+        format!("{err}").contains("ciphertext"),
+        "unexpected error: {err}"
+    );
+}

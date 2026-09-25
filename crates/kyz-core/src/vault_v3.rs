@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use scrypt::Params as ScryptParams;
 use secrecy::{ExposeSecret as _, SecretString};
@@ -26,10 +26,6 @@ use crate::store::{
     DEFAULT_HISTORY_RETENTION, HistoryEntry, SecretEntry, SecretSummary, VaultFileV2,
     decrypt_entry, now_unix,
 };
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Length of the data key in bytes (XChaCha20-Poly1305 takes a 256-bit key).
 pub const DK_LEN: usize = 32;
@@ -68,15 +64,11 @@ pub const MAX_KDF_R: u32 = 64;
 /// Maximum supported scrypt parallelism parameter.
 pub const MAX_KDF_P: u32 = 8;
 
-// ---------------------------------------------------------------------------
-// KDF parameters (stored in vault file header)
-// ---------------------------------------------------------------------------
-
 /// Scrypt parameters and salt persisted alongside the vault.
 ///
 /// The salt is unique per vault and never reused. `log_n`/`r`/`p` are stored
 /// so a future tuning of defaults does not invalidate existing vaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KdfParams {
     /// KDF algorithm identifier. Always `"scrypt"` in v3.
     pub algo: String,
@@ -159,10 +151,6 @@ impl KdfParams {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Vault file structure
-// ---------------------------------------------------------------------------
-
 /// Vault file format v3: one-time scrypt-derived KEK wraps a per-vault DK;
 /// entries are encrypted under the DK with XChaCha20-Poly1305.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,7 +224,7 @@ impl VaultFileV3 {
         let kdf = KdfParams::with_random_salt()?;
         let kek = derive_kek(passphrase, &kdf)?;
         let dk = generate_dk()?;
-        let wrapped_dk = aead_encrypt_b64(&kek, &*dk)?;
+        let wrapped_dk = aead_encrypt_b64(&kek, &*dk, &[])?;
         let file = Self {
             version: Self::CURRENT_VERSION,
             kdf,
@@ -262,18 +250,7 @@ impl VaultFileV3 {
         &self,
         passphrase: &SecretString,
     ) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
-        let kek = derive_kek(passphrase, &self.kdf)?;
-        let bytes = aead_decrypt_b64(&kek, &self.wrapped_dk)
-            .map_err(|_| CoreError::Secret("wrong passphrase or vault corrupt".to_string()))?;
-        if bytes.len() != DK_LEN {
-            return Err(CoreError::Secret(format!(
-                "unexpected DK length {} (want {DK_LEN})",
-                bytes.len()
-            )));
-        }
-        let mut dk = Zeroizing::new([0u8; DK_LEN]);
-        dk.copy_from_slice(&bytes);
-        Ok(dk)
+        unwrap_dk_from(&self.kdf, &self.wrapped_dk, passphrase)
     }
 
     /// List summaries for a service (no decryption needed).
@@ -391,8 +368,7 @@ impl VaultFileV3 {
             })?;
         let target = &existing.history[target_idx];
 
-        // Decrypt the target version's fields directly.
-        let restored_fields_json = aead_decrypt_b64(dk, &target.fields_blob)?;
+        let restored_fields_json = aead_decrypt_b64(dk, &target.fields_blob, &[])?;
         let restored_fields: BTreeMap<String, String> =
             serde_json::from_slice(&restored_fields_json)
                 .map_err(|e| CoreError::Serialization(format!("parsing restored fields: {e}")))?;
@@ -409,7 +385,6 @@ impl VaultFileV3 {
             updated_at: now_unix(),
         };
 
-        // Archive current version before rollback.
         let mut history = existing.history.clone();
         let next_version = history.first().map_or(1, |h| h.version + 1);
         history.insert(
@@ -454,10 +429,6 @@ impl VaultFileV3 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Crypto primitives
-// ---------------------------------------------------------------------------
-
 /// Derive a 32-byte KEK from a passphrase + KDF parameters using scrypt.
 ///
 /// # Errors
@@ -492,17 +463,57 @@ pub fn generate_dk() -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
     Ok(dk)
 }
 
-/// AEAD-encrypt `plaintext` under `key` with a random nonce.
+/// Unwrap the data key from `wrapped_dk` under the passphrase-derived KEK.
 ///
-/// Returns base64 of `nonce(24) || ciphertext || tag(16)`.
-fn aead_encrypt_b64(key: &[u8; DK_LEN], plaintext: &[u8]) -> Result<String, CoreError> {
+/// Shared by the v3 and v4 file formats, which store the `kdf`/`wrapped_dk`
+/// header verbatim. Pays one scrypt.
+///
+/// # Errors
+///
+/// Returns an error if the passphrase is wrong or the header is corrupt.
+pub(crate) fn unwrap_dk_from(
+    kdf: &KdfParams,
+    wrapped_dk: &str,
+    passphrase: &SecretString,
+) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
+    let kek = derive_kek(passphrase, kdf)?;
+    let bytes = aead_decrypt_b64(&kek, wrapped_dk, &[])
+        .map_err(|_| CoreError::Secret("wrong passphrase or vault corrupt".to_string()))?;
+    if bytes.len() != DK_LEN {
+        return Err(CoreError::Secret(format!(
+            "unexpected DK length {} (want {DK_LEN})",
+            bytes.len()
+        )));
+    }
+    let mut dk = Zeroizing::new([0u8; DK_LEN]);
+    dk.copy_from_slice(&bytes);
+    Ok(dk)
+}
+
+/// AEAD-encrypt `plaintext` under `key` with a random nonce, binding `aad`
+/// as associated data.
+///
+/// Returns base64 of `nonce(24) || ciphertext || tag(16)`. Shared with v4,
+/// which keeps the v3 `wrapped_dk` format verbatim (aad empty) and binds op
+/// headers as AAD for its entry blobs.
+pub(crate) fn aead_encrypt_b64(
+    key: &[u8; DK_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<String, CoreError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce_bytes = [0u8; XCHACHA_NONCE_LEN];
     getrandom::fill(&mut nonce_bytes)
         .map_err(|e| CoreError::Secret(format!("getrandom AEAD nonce: {e}")))?;
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| CoreError::Secret(format!("AEAD encrypt: {e}")))?;
     let mut out = Vec::with_capacity(XCHACHA_NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -510,7 +521,16 @@ fn aead_encrypt_b64(key: &[u8; DK_LEN], plaintext: &[u8]) -> Result<String, Core
     Ok(base64::engine::general_purpose::STANDARD.encode(&out))
 }
 
-fn aead_decrypt_b64(key: &[u8; DK_LEN], blob_b64: &str) -> Result<Vec<u8>, CoreError> {
+/// Verify-and-decrypt a base64 `nonce || ct || tag` blob under `key`,
+/// authenticating `aad`.
+///
+/// Shared with v4, which unwraps the v3 `wrapped_dk` verbatim (aad empty)
+/// and decrypts migrated v3 history blobs with it.
+pub(crate) fn aead_decrypt_b64(
+    key: &[u8; DK_LEN],
+    blob_b64: &str,
+    aad: &[u8],
+) -> Result<Vec<u8>, CoreError> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(blob_b64)
         .map_err(|e| CoreError::Serialization(format!("invalid AEAD blob base64: {e}")))?;
@@ -519,15 +539,10 @@ fn aead_decrypt_b64(key: &[u8; DK_LEN], blob_b64: &str) -> Result<Vec<u8>, CoreE
     }
     let (nonce_bytes, ct) = raw.split_at(XCHACHA_NONCE_LEN);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce = XNonce::from_slice(nonce_bytes);
     cipher
-        .decrypt(nonce, ct)
+        .decrypt(XNonce::from_slice(nonce_bytes), Payload { msg: ct, aad })
         .map_err(|e| CoreError::Secret(format!("AEAD decrypt failed: {e}")))
 }
-
-// ---------------------------------------------------------------------------
-// Entry encrypt / decrypt
-// ---------------------------------------------------------------------------
 
 /// Encrypt a [`SecretEntry`]'s fields into an [`EncryptedEntryV3`] using the DK.
 ///
@@ -545,7 +560,7 @@ pub fn encrypt_entry_v3(
         .collect();
     let json = serde_json::to_vec(&plain_fields)
         .map_err(|e| CoreError::Serialization(format!("serializing entry fields: {e}")))?;
-    let fields_blob = aead_encrypt_b64(dk, &json)?;
+    let fields_blob = aead_encrypt_b64(dk, &json, &[])?;
 
     Ok(EncryptedEntryV3 {
         key: entry.key.clone(),
@@ -568,7 +583,7 @@ pub fn decrypt_entry_v3(
     entry: &EncryptedEntryV3,
     dk: &[u8; DK_LEN],
 ) -> Result<SecretEntry, CoreError> {
-    let plain = aead_decrypt_b64(dk, &entry.fields_blob)?;
+    let plain = aead_decrypt_b64(dk, &entry.fields_blob, &[])?;
     let plain_fields: BTreeMap<String, String> = serde_json::from_slice(&plain)
         .map_err(|e| CoreError::Serialization(format!("parsing decrypted fields: {e}")))?;
     let fields: BTreeMap<String, SecretString> = plain_fields
@@ -584,10 +599,6 @@ pub fn decrypt_entry_v3(
         updated_at: entry.updated_at,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Migration from V2
-// ---------------------------------------------------------------------------
 
 /// Convert a v2 vault (per-entry scrypt-age) to a v3 vault (DK-wrapped AEAD).
 ///
@@ -607,7 +618,7 @@ pub fn migrate_v2_to_v3(
     let kdf = KdfParams::with_random_salt()?;
     let kek = derive_kek(passphrase, &kdf)?;
     let dk = generate_dk()?;
-    let wrapped_dk = aead_encrypt_b64(&kek, &*dk)?;
+    let wrapped_dk = aead_encrypt_b64(&kek, &*dk, &[])?;
 
     let mut v3_entries: BTreeMap<String, EncryptedEntryV3> = BTreeMap::new();
     for (ck, v2_entry) in &v2.entries {
@@ -653,7 +664,7 @@ fn migrate_v2_history(
             .map_err(|e| CoreError::Secret(format!("history decrypt: {e}")))?;
         std::io::Read::read_to_end(&mut reader, &mut plain)
             .map_err(|e| CoreError::Secret(format!("history read: {e}")))?;
-        let fields_blob = aead_encrypt_b64(dk, &plain)?;
+        let fields_blob = aead_encrypt_b64(dk, &plain, &[])?;
         out.push(HistoryEntryV3 {
             version: h.version,
             archived_at: h.archived_at,
@@ -730,7 +741,7 @@ mod tests {
 
         // history[0] should still decrypt to v1
         let h0 = &enc.history[0];
-        let plain = aead_decrypt_b64(&dk, &h0.fields_blob).expect("decrypt history");
+        let plain = aead_decrypt_b64(&dk, &h0.fields_blob, &[]).expect("decrypt history");
         let map: BTreeMap<String, String> = serde_json::from_slice(&plain).unwrap();
         assert_eq!(map.get("value"), Some(&"v1".to_string()));
     }

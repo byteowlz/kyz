@@ -713,9 +713,50 @@ impl ProxyFixture {
 
     /// Replace the fixture secret's token field in the on-disk vault,
     /// simulating `kyz set` while the daemon runs (live re-read).
+    ///
+    /// Handles both the pre-migration v3 fixture file and the v4 file the
+    /// daemon's first unlock leaves on disk.
     pub fn update_vault_secret(&self, new_value: &str) {
+        use kyz_core::vault_v4::{Hlc, OpId, VaultFileV4};
+
         let passphrase = SecretString::from(FIXTURE_PASSPHRASE.to_string());
         let raw = std::fs::read(&self.fixture.vault_path).expect("read vault");
+        if kyz_core::store::detect_vault_version(&raw) == 4 {
+            let mut vault = VaultFileV4::parse(&raw).expect("parse v4 vault");
+            let dk = vault.unwrap_dk(&passphrase).expect("unwrap dk");
+            // Overlay the new field on the current snapshot, exactly like
+            // `kyz set` does, then append a fresh put on the frontier.
+            let mut snapshot = vault
+                .decrypt_current(&dk, "app", "api")
+                .expect("decrypt current");
+            snapshot
+                .fields
+                .insert("token".to_string(), new_value.to_string());
+            snapshot.updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let fixture_actor = "ffffffffffffffffffffffffffffffff";
+            let parents: Vec<OpId> = vault
+                .frontier_of("app", "api")
+                .expect("frontier")
+                .map_or_else(Vec::new, |f| f.into_iter().collect());
+            let id = OpId::new(fixture_actor, vault.max_counter_of(fixture_actor) + 1)
+                .expect("fixture op id");
+            vault
+                .append_put(
+                    &snapshot,
+                    id,
+                    parents,
+                    Hlc::tick(Some(vault.max_hlc())),
+                    &dk,
+                )
+                .expect("append put");
+            vault.finalize(&dk).expect("finalize");
+            let serialized = serde_json::to_string_pretty(&vault).expect("serialize vault");
+            kyz_core::atomic::write_atomic(&self.fixture.vault_path, serialized.as_bytes())
+                .expect("write vault");
+            return;
+        }
         let mut vault: kyz_core::vault_v3::VaultFileV3 =
             serde_json::from_slice(&raw).expect("parse vault");
         let dk = vault.unwrap_dk(&passphrase).expect("unwrap dk");
@@ -728,7 +769,8 @@ impl ProxyFixture {
             .set_with_retention(&SecretEntry::new("app", "api", fields), &dk, 0)
             .expect("update secret");
         let serialized = serde_json::to_string_pretty(&vault).expect("serialize vault");
-        std::fs::write(&self.fixture.vault_path, serialized).expect("write vault");
+        kyz_core::atomic::write_atomic(&self.fixture.vault_path, serialized.as_bytes())
+            .expect("write vault");
     }
 
     /// Send one authorized request through the proxy.
