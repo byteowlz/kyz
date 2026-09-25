@@ -4,10 +4,12 @@
 //! Startup order: load+validate config snapshot → install run log →
 //! unlock vault in memory (one passphrase, no session) → acquire the
 //! single-instance lock → clear stale socket/pid → write pid → write IPC
-//! and proxy tokens → open audit sink → publish snapshot → bind the
-//! management listener → audit `daemon_start`. The run log is installed
-//! before the unlock so migration diagnostics cannot be lost, and the
-//! listener is bound synchronously so a bind failure fails startup.
+//! and proxy tokens → open audit sink → publish snapshot → audit
+//! `daemon_start` (drained to disk before serving, so a running daemon
+//! already owes its full set of state files) → bind the management
+//! listener. The run log is installed before the unlock so migration
+//! diagnostics cannot be lost, and the listener is bound synchronously so
+//! a bind failure fails startup.
 //!
 //! Shutdown never calls `std::process::exit`: mark shutting down →
 //! refuse new proxy/grant work → close the listener → wait for in-flight
@@ -471,6 +473,11 @@ async fn run_daemon_inner(
     state.set_timeout(timeout_secs);
     state.snapshots.publish(snapshot);
     state.audit.emit(&AuditEvent::daemon_start());
+    // Drain barrier: the writer thread creates `audit.log` lazily on its
+    // first write, so startup must block on the queued `daemon_start`
+    // before serving — a running daemon owes the caller its full set of
+    // state files with their restricted permissions.
+    state.audit.flush();
     log::info!(
         "kyz daemon started (pid {}, timeout {}s)",
         std::process::id(),
