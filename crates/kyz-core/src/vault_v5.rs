@@ -572,6 +572,31 @@ impl EntryFile {
         })
         .map_err(|e| CoreError::Serialization(format!("serializing entry MAC body: {e}")))
     }
+
+    /// Parse and structurally validate entry-file bytes (no MAC or key
+    /// check): schema version, vault-id encoding, and op-log structure.
+    /// This is the no-DK entry point exercised by the fuzz harness and by
+    /// callers that only need to shade a hostile file before any crypto.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes are not a structurally valid v5
+    /// entry file.
+    pub fn parse(raw: &[u8]) -> Result<Self, CoreError> {
+        let file: Self = serde_json::from_slice(raw)
+            .map_err(|e| CoreError::Serialization(format!("parsing entry file: {e}")))?;
+        if file.version != VERSION {
+            return Err(CoreError::Secret(format!(
+                "entry file has unsupported version {}",
+                file.version
+            )));
+        }
+        validate_hex_id("entry vault id", &file.vault_id, VAULT_ID_LEN)?;
+        let mut log = OpLog::new(&file.vault_id);
+        log.entries.insert(String::new(), file.ops.clone());
+        log.validate_entries()?;
+        Ok(file)
+    }
 }
 
 /// Result of reading one entry: its unioned ops plus the sync conflict

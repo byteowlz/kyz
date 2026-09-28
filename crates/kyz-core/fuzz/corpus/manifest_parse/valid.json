@@ -1,0 +1,16 @@
+{
+  "version": 5,
+  "vault_id": "0123456789abcdef0123456789abcdef",
+  "passphrase_policy_checked": true,
+  "keyslots": {
+    "fedcba9876543210fedcba9876543210": {
+      "kind": "Passphrase",
+      "kdf": { "algo": "scrypt", "log_n": 15, "r": 1, "p": 1, "salt_b64": "AA==" },
+      "wrapped_dk": "AAA",
+      "label": "laptop",
+      "created_at": 1700000000,
+      "removed_at": null
+    }
+  },
+  "mac": ""
+}

@@ -1,0 +1,44 @@
+{
+  "target": {
+    "vault_id": "0123456789abcdef0123456789abcdef",
+    "entries": {
+      "service/key": [
+        {
+          "id": { "actor": "0123456789abcdef0123456789abcdef", "counter": 1 },
+          "parents": [],
+          "kind": "put",
+          "changed_at": { "phys": 1700000000, "logical": 0 },
+          "meta": {
+            "tags": [],
+            "field_names": ["password"],
+            "created_at": 1700000000,
+            "updated_at": 1700000000
+          },
+          "blob": null
+        }
+      ]
+    }
+  },
+  "source": {
+    "vault_id": "0123456789abcdef0123456789abcdef",
+    "entries": {
+      "service/key": [
+        {
+          "id": { "actor": "0123456789abcdef0123456789abcdef", "counter": 2 },
+          "parents": [
+            { "actor": "0123456789abcdef0123456789abcdef", "counter": 1 }
+          ],
+          "kind": "put",
+          "changed_at": { "phys": 1700000001, "logical": 1 },
+          "meta": {
+            "tags": [],
+            "field_names": ["password", "username"],
+            "created_at": 1700000000,
+            "updated_at": 1700000001
+          },
+          "blob": null
+        }
+      ]
+    }
+  }
+}

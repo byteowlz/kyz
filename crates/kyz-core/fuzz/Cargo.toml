@@ -1,0 +1,42 @@
+[package]
+name = "kyz-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace so `cargo fuzz` / `cargo check` work from this dir
+# without pulling into the kyz workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+kyz-core = { path = ".." }
+
+[[bin]]
+name = "manifest_parse"
+path = "fuzz_targets/manifest_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "entry_file_load"
+path = "fuzz_targets/entry_file_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merge_ops"
+path = "fuzz_targets/merge_ops.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

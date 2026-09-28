@@ -1,0 +1,21 @@
+{
+  "version": 5,
+  "vault_id": "0123456789abcdef0123456789abcdef",
+  "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "ops": [
+    {
+      "id": { "actor": "0123456789abcdef0123456789abcdef", "counter": 1 },
+      "parents": [],
+      "kind": "put",
+      "changed_at": { "phys": 1700000000, "logical": 0 },
+      "meta": {
+        "tags": [],
+        "field_names": ["password"],
+        "created_at": 1700000000,
+        "updated_at": 1700000000
+      },
+      "blob": null
+    }
+  ],
+  "mac": ""
+}

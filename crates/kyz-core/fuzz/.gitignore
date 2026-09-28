@@ -1,0 +1,11 @@
+# cargo-fuzz build artifacts (the kyz root .gitignore does not cover this dir)
+target
+coverage
+artifacts
+
+# libFuzzer writes minimized/derived inputs into corpus/ by hash name while
+# running; keep only the hand-authored seed files you intend to commit.
+corpus/*
+!corpus/*/
+corpus/*/*
+!corpus/*/valid*.json
