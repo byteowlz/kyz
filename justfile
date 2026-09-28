@@ -115,6 +115,10 @@ clean:
 test:
     cargo test --workspace
 
+# Vault v4 growth/latency benchmark: ENTRIES VERSIONS DELETES
+bench-vault ENTRIES="1000" VERSIONS="10" DELETES="200":
+    cargo run --release -p kyz-core --example vault_bench -- {{ENTRIES}} {{VERSIONS}} {{DELETES}}
+
 # Run tests for a specific crate
 test-crate CRATE:
     cargo test -p {{CRATE}}
