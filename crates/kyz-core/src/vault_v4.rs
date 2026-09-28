@@ -1238,6 +1238,10 @@ pub struct HistoryItem {
 /// winning frontier put marked current, other frontier puts marked
 /// conflict, dominated puts marked ancestor, and deletes marked tombstone.
 ///
+/// When a delete is in the frontier the entry is hidden (delete-wins), so
+/// no put is current: frontier puts concurrent with that delete are edits
+/// that lost to it and are marked conflict (still rollback-able).
+///
 /// # Errors
 ///
 /// Returns an error on graph violations.
@@ -1246,12 +1250,11 @@ pub fn history(ops: &[Op]) -> Result<Vec<HistoryItem>, CoreError> {
         return Ok(Vec::new());
     }
     let frontier_ids = frontier(ops)?;
-    // Winner among frontier puts: greatest (changed_at, id).
-    let winner: Option<OpId> = winner_put(
-        ops.iter()
-            .filter(|op| op.kind == OpKind::Put && frontier_ids.contains(&op.id)),
-    )
-    .map(|op| op.id.clone());
+    // The winner must agree with `project`: none while the entry is hidden.
+    let winner: Option<OpId> = match project(ops)? {
+        Projection::Visible { current, .. } => Some(current),
+        Projection::Hidden => None,
+    };
     let mut items: Vec<HistoryItem> = ops
         .iter()
         .map(|op| {
@@ -1295,6 +1298,18 @@ pub struct EntryConflict {
     pub losing: Vec<OpId>,
 }
 
+/// An entry that is deleted after a merge while concurrent edits of it
+/// exist: delete-wins hid those edits, but they stay rollback-able.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LostToDelete {
+    /// `service/key` of the entry.
+    pub entry: String,
+    /// Frontier delete(s) hiding the entry.
+    pub tombstones: Vec<OpId>,
+    /// Concurrent edits (frontier puts) hidden by the delete.
+    pub losing: Vec<OpId>,
+}
+
 /// Structured merge report. Never contains secret values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeReport {
@@ -1329,6 +1344,11 @@ pub struct MergeReport {
     /// new slots or removals).
     #[serde(default)]
     pub keyslots_changed: bool,
+    /// Entries changed by this merge that end up deleted while concurrent
+    /// edits exist — including entries that were already deleted here, so
+    /// an incoming edit is never hidden silently.
+    #[serde(default)]
+    pub lost_to_delete: Vec<LostToDelete>,
 }
 
 fn projection_states(file: &OpLog) -> Result<BTreeMap<String, Projection>, CoreError> {
@@ -1466,6 +1486,7 @@ pub fn merge_ops(
 
     let report = build_merge_report(
         target,
+        &before_file,
         &before,
         &after,
         MergeReport {
@@ -1481,6 +1502,7 @@ pub fn merge_ops(
             source_ops,
             changed,
             keyslots_changed: false,
+            lost_to_delete: Vec::new(),
         },
     );
     Ok(report)
@@ -1490,6 +1512,7 @@ pub fn merge_ops(
 /// per-entry sections of the report.
 fn build_merge_report(
     target: &OpLog,
+    before_log: &OpLog,
     before: &BTreeMap<String, Projection>,
     after: &BTreeMap<String, Projection>,
     mut report: MergeReport,
@@ -1515,6 +1538,26 @@ fn build_merge_report(
                 report.deleted_entries.push(ck.clone());
             }
             (None | Some(Projection::Hidden), None | Some(Projection::Hidden)) => {}
+        }
+        if matches!(post, Some(Projection::Hidden))
+            && let Some(ops) = target.entries.get(ck)
+            && before_log.entries.get(ck) != Some(ops)
+            && let Ok(frontier_ids) = frontier(ops)
+        {
+            let (mut tombstones, mut losing) = (Vec::new(), Vec::new());
+            for op in ops.iter().filter(|op| frontier_ids.contains(&op.id)) {
+                match op.kind {
+                    OpKind::Delete => tombstones.push(op.id.clone()),
+                    OpKind::Put => losing.push(op.id.clone()),
+                }
+            }
+            if !losing.is_empty() {
+                report.lost_to_delete.push(LostToDelete {
+                    entry: ck.clone(),
+                    tombstones,
+                    losing,
+                });
+            }
         }
         if let Some(Projection::Visible { current, conflicts }) = post
             && !conflicts.is_empty()
@@ -2635,19 +2678,34 @@ mod tests {
             11,
         );
         put_op(&mut file, "svc", "k", "side", op_id(2, 1), vec![], 12);
-        delete_op(&mut file, "svc", "k", op_id(3, 1), vec![], 5);
         let items = history(ops_of(&file, "k")).expect("history");
         let by_id = |id: &OpId| items.iter().find(|i| &i.op_id == id).expect("item");
         assert_eq!(by_id(&op_id(2, 1)).role, HistoryRole::Current);
         assert_eq!(by_id(&op_id(1, 2)).role, HistoryRole::Conflict);
         assert_eq!(by_id(&op_id(1, 1)).role, HistoryRole::Ancestor);
-        assert_eq!(by_id(&op_id(3, 1)).role, HistoryRole::Tombstone);
         // Newest first.
         assert!(
             items
                 .windows(2)
                 .all(|w| (w[0].changed_at, &w[0].op_id) > (w[1].changed_at, &w[1].op_id))
         );
+
+        // A concurrent delete joins the frontier: delete-wins hides the
+        // entry, so no put may be current — the frontier puts are edits
+        // that lost to the delete (trx-dgqe.3), and history agrees with
+        // the projection.
+        delete_op(&mut file, "svc", "k", op_id(3, 1), vec![], 5);
+        assert_eq!(
+            project(ops_of(&file, "k")).expect("project"),
+            Projection::Hidden
+        );
+        let items = history(ops_of(&file, "k")).expect("history");
+        let by_id = |id: &OpId| items.iter().find(|i| &i.op_id == id).expect("item");
+        assert_eq!(by_id(&op_id(2, 1)).role, HistoryRole::Conflict);
+        assert_eq!(by_id(&op_id(1, 2)).role, HistoryRole::Conflict);
+        assert_eq!(by_id(&op_id(1, 1)).role, HistoryRole::Ancestor);
+        assert_eq!(by_id(&op_id(3, 1)).role, HistoryRole::Tombstone);
+        assert!(items.iter().all(|i| i.role != HistoryRole::Current));
     }
 
     fn v3_with_history() -> (VaultFileV3, [u8; DK_LEN]) {

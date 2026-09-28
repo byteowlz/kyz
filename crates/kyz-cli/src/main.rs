@@ -880,6 +880,17 @@ fn merge_report_json(report: &kyz_core::MergeReport, dry_run: bool) -> serde_jso
         "updated_entries": report.updated_entries,
         "deleted_entries": report.deleted_entries,
         "keyslots_changed": report.keyslots_changed,
+        "lost_to_delete": report
+            .lost_to_delete
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "entry": l.entry,
+                    "tombstones": l.tombstones.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+                    "losing": l.losing.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>(),
         "conflicts": report
             .conflicts
             .iter()
@@ -954,6 +965,14 @@ fn handle_vault_merge(ctx: &RuntimeContext, cmd: &VaultMergeCommand) -> Result<(
     }
     for entry in &report.deleted_entries {
         println!("  deleted (wins):   {entry}");
+    }
+    for lost in &report.lost_to_delete {
+        println!(
+            "  lost to delete:   {} ({} concurrent edit(s) kept; see `kyz history {}`)",
+            lost.entry,
+            lost.losing.len(),
+            lost.entry
+        );
     }
     if report.keyslots_changed {
         println!("  key slots:        updated from the source manifest");
@@ -1712,6 +1731,9 @@ fn print_history(
             println!(
                 "  ! {stored_conflicts} concurrent write(s) kept for rollback (kyz rollback --to <seq>)"
             );
+        }
+        if !rows.is_empty() && !rows.iter().any(|r| r.role == HistoryRole::Current) {
+            println!("  (entry is deleted; restore a version with kyz rollback --to <seq>)");
         }
     }
     Ok(())

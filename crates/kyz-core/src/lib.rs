@@ -73,8 +73,9 @@ pub use vault_v3::{
     MIN_KDF_LOG_N, VaultFileV3, decrypt_entry_v3, derive_kek, encrypt_entry_v3, migrate_v2_to_v3,
 };
 pub use vault_v4::{
-    EntryConflict, EntryMeta, HistoryItem, HistoryRole, Hlc, MergeReport, Op, OpId, OpKind, OpLog,
-    Projection, SnapshotPlain, VaultFileV4, derive_vault_id, merge_ops, migrate_v3_to_v4,
+    EntryConflict, EntryMeta, HistoryItem, HistoryRole, Hlc, LostToDelete, MergeReport, Op, OpId,
+    OpKind, OpLog, Projection, SnapshotPlain, VaultFileV4, derive_vault_id, merge_ops,
+    migrate_v3_to_v4,
 };
 pub use vault_v5::{KeySlotInfo, SlotKind};
 pub use workspace_trust::{

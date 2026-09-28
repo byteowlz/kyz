@@ -357,6 +357,102 @@ fn conflict_footnote_counts_stored_log_beyond_display_window() {
     );
 }
 
+/// trx-dgqe.3 / trx-dgqe.4: replica A deletes an entry while replica B
+/// edits it concurrently. After merging B into A the entry is deleted
+/// (delete wins); history must not call B's edit `current`, and the merge
+/// report must name the edit it hid.
+#[test]
+fn edit_lost_to_concurrent_delete_is_reported_and_not_current() {
+    let fixture = HistoryFixture::new();
+    let vault = fixture.vault_path("vault-a");
+    let replica = fixture.vault_path("vault-b");
+    let run_ok = |path: &Path, args: &[&str], what: &str| {
+        HistoryFixture::assert_ok(&fixture.run(path, args), what);
+    };
+
+    HistoryFixture::assert_ok(
+        &fixture.run_with_passphrase(&vault, &["vault", "create"]),
+        "vault create",
+    );
+    HistoryFixture::assert_ok(
+        &fixture.run_with_passphrase(&vault, &["vault", "unlock"]),
+        "vault unlock",
+    );
+    run_ok(
+        &vault,
+        &["set", "--service", "svc", "todel", "base"],
+        "base set",
+    );
+    copy_vault(&vault, &replica);
+    HistoryFixture::assert_ok(
+        &fixture.run_with_passphrase(&replica, &["vault", "unlock"]),
+        "unlock replica",
+    );
+    run_ok(
+        &vault,
+        &["delete", "--service", "svc", "todel", "--yes"],
+        "delete on A",
+    );
+    run_ok(
+        &replica,
+        &["set", "--service", "svc", "todel", "edited-on-b"],
+        "edit on B",
+    );
+
+    let merge = fixture.run(
+        &vault,
+        &["vault", "merge", &replica.to_string_lossy(), "--json"],
+    );
+    HistoryFixture::assert_ok(&merge, "merge");
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&merge.stdout)).expect("merge JSON");
+    let lost = report["lost_to_delete"].as_array().expect("lost_to_delete");
+    assert_eq!(
+        lost.len(),
+        1,
+        "edit hidden by the delete must be reported: {report}"
+    );
+    assert_eq!(lost[0]["entry"], "svc/todel");
+    assert_eq!(lost[0]["losing"].as_array().map(Vec::len), Some(1));
+    assert_eq!(lost[0]["tombstones"].as_array().map(Vec::len), Some(1));
+
+    let payload = history_json(&fixture, &vault, "svc/todel");
+    let mut roles: Vec<String> = payload["history"]
+        .as_array()
+        .expect("history")
+        .iter()
+        .map(|row| row["role"].as_str().expect("role").to_string())
+        .collect();
+    roles.sort();
+    assert_eq!(
+        roles,
+        vec!["ancestor", "conflict", "tombstone"],
+        "{payload}"
+    );
+
+    let human = fixture.run(&vault, &["history", "svc/todel"]);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(!stdout.contains("[current"), "{stdout}");
+    assert!(stdout.contains("entry is deleted"), "{stdout}");
+
+    // The lost edit is recoverable: rolling back to it revives the entry.
+    let conflict_seq = payload["history"]
+        .as_array()
+        .expect("history")
+        .iter()
+        .find(|row| row["role"] == "conflict")
+        .and_then(|row| row["seq"].as_u64())
+        .expect("conflict seq")
+        .to_string();
+    run_ok(
+        &vault,
+        &["rollback", "svc/todel", "--to", &conflict_seq],
+        "rollback",
+    );
+    let listed = fixture.run(&vault, &["list", "--service", "svc"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("todel"));
+}
+
 /// Copy a vault replica: the manifest plus its sibling entries directory.
 fn copy_vault(from: &Path, to: &Path) {
     let entries = |p: &Path| p.with_file_name("vault.entries");

@@ -31,6 +31,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `kyz history` labeled an edit as `current` while a concurrent delete hid the entry (`get` reported it missing). History now follows the projection: a deleted entry has no current version, and edits hidden by the delete are shown as conflicts (rollback-able). The human view notes that the entry is deleted.
+- `kyz vault merge` gave no hint when an incoming edit lost to a delete already present in the target. The report now lists such entries under `lost_to_delete` (entry, tombstones, hidden edits).
 - v3→v4 migration minted identical op ids for two snapshots with identical content inside the same unix second (`set A; set B; set A`); canonicalization's dedup then dropped the current version's op and `kyz get` silently returned the superseded value. Op id derivation now includes the snapshot's chain position.
 - v4 compound keys split at the first `/`, misattributing entries whose service name itself contains `/` (possible in library-created v3 vaults) in `list`/`list_services` while `get` still resolved them. Both parts are now percent-escaped so the split is unambiguous.
 - Unlocking a v4 vault whose `passphrase_policy_checked` flag was already set skipped the file MAC check; a corrupt vault unlocked "successfully" and only failed on the first get/list. Unlock now MAC-verifies the file (parse + AEAD unwrapping + MAC before any session is persisted).

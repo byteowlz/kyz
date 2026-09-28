@@ -780,3 +780,53 @@ fn single_file_v4_vault_migrates_and_merges() {
     cleanup(&path);
     cleanup(&v4_copy);
 }
+
+#[test]
+fn edits_lost_to_a_concurrent_delete_are_reported_in_both_directions() {
+    let (a, path_a) = fresh_unlocked("lost-a");
+    set(&a, "svc", "k", "base");
+    let path_b = temp_path("lost-b");
+    copy_vault(&path_a, &path_b);
+    let b = VaultStore::new(path_b.clone());
+    b.unlock(PASS, 60).expect("unlock b");
+    a.delete("svc", "k").expect("delete on a");
+    set(&b, "svc", "k", "edited-on-b");
+
+    // B (edit) merges A (delete): the entry disappears on B.
+    let report = b
+        .merge_vault_from(&path_a, false, false)
+        .expect("merge a into b");
+    assert_eq!(report.deleted_entries, vec!["svc/k".to_string()]);
+    assert_eq!(report.lost_to_delete.len(), 1);
+    assert_eq!(report.lost_to_delete[0].entry, "svc/k");
+    assert_eq!(report.lost_to_delete[0].losing.len(), 1);
+
+    // A (already deleted) merges B: nothing becomes hidden, but the
+    // incoming edit is still reported instead of vanishing silently.
+    let report = a
+        .merge_vault_from(&path_b, false, false)
+        .expect("merge b into a");
+    assert!(report.deleted_entries.is_empty());
+    assert_eq!(report.lost_to_delete.len(), 1, "{report:?}");
+
+    // Neither side calls a hidden version current.
+    for store in [&a, &b] {
+        let items = store.history_v4("svc", "k").expect("history");
+        assert!(
+            items
+                .iter()
+                .all(|i| i.role != kyz_core::HistoryRole::Current),
+            "{items:?}"
+        );
+        assert_eq!(current_value(store, "svc", "k"), None);
+    }
+
+    // Re-merging reports nothing new.
+    let report = a.merge_vault_from(&path_b, false, false).expect("re-merge");
+    assert!(report.lost_to_delete.is_empty());
+
+    let _ = a.lock();
+    let _ = b.lock();
+    cleanup(&path_a);
+    cleanup(&path_b);
+}
