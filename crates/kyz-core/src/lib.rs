@@ -21,7 +21,9 @@
 //! - Vault session management (unlock/lock lifecycle)
 //! - Common types and error handling
 
+pub mod actor;
 pub mod agent_ctx;
+pub mod atomic;
 pub mod audit;
 pub mod auth_request;
 pub mod config;
@@ -34,6 +36,7 @@ pub mod scan;
 pub mod schema;
 pub mod store;
 pub mod vault_v3;
+pub mod vault_v4;
 pub mod workspace_trust;
 
 pub use agent_ctx::{AgentContext, RunMode};
@@ -59,13 +62,18 @@ pub use proxy_config::{
 };
 pub use schema::{generate_example_config, generate_schema, write_generated_files};
 pub use store::{
-    DEFAULT_HISTORY_RETENTION, EncryptedEntry, HistoryEntry, KeyringStore, SecretEntry,
-    SecretStore, SecretSummary, UnlockedVault, VaultData, VaultFileV2, VaultSession, VaultStatus,
-    VaultStore, decrypt_entry, encrypt_entry, env_vault_path, fnv1a_64, list_environments,
+    DEFAULT_HISTORY_RETENTION, EncryptedEntry, HistoryEntry, HistoryView, KeyringStore,
+    SecretEntry, SecretStore, SecretSummary, UnlockedVault, VaultContents, VaultData, VaultFileV2,
+    VaultSession, VaultStatus, VaultStore, decrypt_entry, encrypt_entry, env_vault_path, fnv1a_64,
+    list_environments,
 };
 pub use vault_v3::{
     DK_LEN, EncryptedEntryV3, HistoryEntryV3, KdfParams, MAX_KDF_LOG_N, MAX_KDF_P, MAX_KDF_R,
     MIN_KDF_LOG_N, VaultFileV3, decrypt_entry_v3, derive_kek, encrypt_entry_v3, migrate_v2_to_v3,
+};
+pub use vault_v4::{
+    EntryConflict, EntryMeta, HistoryItem, HistoryRole, Hlc, MergeReport, Op, OpId, OpKind,
+    Projection, SnapshotPlain, VaultFileV4, derive_vault_id, merge_ops, migrate_v3_to_v4,
 };
 pub use workspace_trust::{
     fingerprint as workspace_vault_fingerprint, is_trusted as workspace_vault_is_trusted,

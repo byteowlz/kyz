@@ -9,6 +9,11 @@ keywords.workspace = true
 categories.workspace = true
 description = "Core library for kyz - a cross-platform secrets manager"
 
+[features]
+# Test-only hooks (enabled for this crate's own tests via the self
+# dev-dependency below); never enabled for downstream builds.
+test-util = []
+
 [lints]
 workspace = true
 
@@ -28,6 +33,9 @@ age.workspace = true
 scrypt.workspace = true
 chacha20poly1305.workspace = true
 sha2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+hex.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
 hostname.workspace = true
@@ -37,4 +45,7 @@ fs2.workspace = true
 tokio.workspace = true
 getrandom.workspace = true
 zxcvbn.workspace = true
+
+[dev-dependencies]
 tempfile.workspace = true
+kyz-core = { path = ".", features = ["test-util"] }

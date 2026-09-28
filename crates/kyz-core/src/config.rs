@@ -383,7 +383,11 @@ pub struct ProxyConfig {
 }
 
 /// Headers stripped from client requests before credentials are injected.
-pub const DEFAULT_STRIP_HEADERS: &[&str] = &["Authorization", "X-Api-Key"];
+///
+/// Additive only: the proxy request sanitizer always strips Authorization,
+/// Cookie, Proxy-Authorization, and every injected header name, even when
+/// this list is empty.
+pub const DEFAULT_STRIP_HEADERS: &[&str] = &["X-Api-Key"];
 
 fn default_strip() -> Vec<String> {
     DEFAULT_STRIP_HEADERS

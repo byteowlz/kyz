@@ -21,3 +21,8 @@ ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "p256", "p38
 
 [dev-dependencies]
 tempfile.workspace = true
+# Enables `kyz_core::paths::isolate_state_dir` for the integration
+# tests: v4 writes allocate op ids through the global actor-state
+# directory, and tests must not touch the developer's real
+# actor-state.json or contend with a running `kyz` for its lock.
+kyz-core = { workspace = true, features = ["test-util"] }

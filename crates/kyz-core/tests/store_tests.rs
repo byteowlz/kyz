@@ -25,9 +25,7 @@ use kyz_core::store::{
     encrypt_entry, encrypt_vault, env_vault_path,
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+mod common;
 
 fn temp_vault_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -44,6 +42,7 @@ const fn strong_passphrase() -> &'static str {
 }
 
 fn setup_vault(label: &str) -> (VaultStore, PathBuf) {
+    common::isolate_state_dir();
     let vault_path = temp_vault_path(label);
     let store = VaultStore::new(vault_path.clone());
     store
@@ -59,10 +58,6 @@ fn cleanup(store: &VaultStore, vault_path: &PathBuf) {
     let _ = store.lock();
     let _ = std::fs::remove_file(vault_path);
 }
-
-// =========================================================================
-// SecretEntry unit tests
-// =========================================================================
 
 #[test]
 fn secret_entry_single_field() {
@@ -149,10 +144,6 @@ fn secret_summary_from_entry() {
     assert_eq!(summary.field_names, vec!["value"]);
     assert!(summary.tags.contains("prod"));
 }
-
-// =========================================================================
-// VaultData tests
-// =========================================================================
 
 #[test]
 fn vault_data_new_is_empty() {
@@ -248,10 +239,6 @@ fn vault_data_services() {
     assert_eq!(services, vec!["alpha", "zebra"]);
 }
 
-// =========================================================================
-// VaultFileV2 tests
-// =========================================================================
-
 #[test]
 fn vault_file_v2_new_is_empty() {
     let v2 = VaultFileV2::new();
@@ -323,7 +310,6 @@ fn vault_file_v2_rollback() {
     v2.set(&SecretEntry::single("svc", "key", "v3"), &passphrase)
         .expect("v3");
 
-    // Rollback to version 1
     v2.rollback("svc", "key", 1, &passphrase)
         .expect("rollback should succeed");
 
@@ -403,10 +389,6 @@ fn vault_file_v2_tags_preserved() {
     assert!(enc.tags.contains("critical"));
 }
 
-// =========================================================================
-// Encryption / decryption tests
-// =========================================================================
-
 #[test]
 fn encrypt_decrypt_entry_roundtrip() {
     let passphrase = SecretString::from(strong_passphrase().to_string());
@@ -466,10 +448,6 @@ fn detect_vault_version_v1_binary() {
     assert_eq!(kyz_core::store::detect_vault_version(binary_data), 1);
 }
 
-// =========================================================================
-// VaultStore CRUD integration tests
-// =========================================================================
-
 #[test]
 fn vault_store_init_creates_file() {
     let vault_path = temp_vault_path("init");
@@ -506,11 +484,11 @@ fn vault_store_init_no_overwrite_without_force() {
 
 #[test]
 fn vault_store_init_force_overwrites() {
+    common::isolate_state_dir();
     let vault_path = temp_vault_path("force-overwrite");
     let store = VaultStore::new(vault_path.clone());
     store.init(strong_passphrase(), false).expect("first init");
 
-    // Add a secret
     store.unlock(strong_passphrase(), 60).expect("unlock");
     store
         .set("svc", "key", &SecretEntry::single("svc", "key", "val"))
@@ -530,30 +508,24 @@ fn vault_store_init_force_overwrites() {
 fn vault_store_full_crud_lifecycle() {
     let (store, vault_path) = setup_vault("lifecycle");
 
-    // Set
     let entry = SecretEntry::single("app", "api-key", "token-abc");
     store.set("app", "api-key", &entry).expect("set");
 
-    // Get
     let fetched = store.get("app", "api-key").expect("get");
     assert_eq!(fetched.value(), Some("token-abc"));
 
-    // List
     let summaries = store.list("app").expect("list");
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].key, "api-key");
 
-    // List services
     let services = store.list_services().expect("list services");
     assert!(services.contains(&"app".to_string()));
 
-    // Update
     let updated = SecretEntry::single("app", "api-key", "token-xyz");
     store.set("app", "api-key", &updated).expect("update");
     let fetched = store.get("app", "api-key").expect("get after update");
     assert_eq!(fetched.value(), Some("token-xyz"));
 
-    // Delete
     store.delete("app", "api-key").expect("delete");
     let result = store.get("app", "api-key");
     assert!(result.is_err());
@@ -619,6 +591,7 @@ fn vault_store_get_nonexistent_fails() {
 
 #[test]
 fn vault_store_unlock_wrong_passphrase() {
+    common::isolate_state_dir();
     let vault_path = temp_vault_path("wrong-pass");
     let store = VaultStore::new(vault_path.clone());
     store.init(strong_passphrase(), false).expect("init");
@@ -640,10 +613,6 @@ fn vault_store_unlock_wrong_passphrase() {
 
     let _ = std::fs::remove_file(&vault_path);
 }
-
-// =========================================================================
-// VaultSession tests
-// =========================================================================
 
 #[test]
 fn vault_session_expiry() {
@@ -688,10 +657,6 @@ fn vault_session_file_for_different_vaults() {
     assert_ne!(file1, file2);
 }
 
-// =========================================================================
-// VaultStore status and lock tests
-// =========================================================================
-
 #[test]
 fn vault_store_status_lifecycle() {
     let vault_path = temp_vault_path("status");
@@ -725,10 +690,6 @@ fn vault_store_status_lifecycle() {
     let _ = std::fs::remove_file(&vault_path);
 }
 
-// =========================================================================
-// Environment vault tests
-// =========================================================================
-
 #[test]
 fn env_vault_path_contains_env_name() {
     let path = env_vault_path("staging").expect("env vault path");
@@ -743,10 +704,6 @@ fn env_vault_path_different_envs() {
     let prod = env_vault_path("production").expect("production");
     assert_ne!(staging, prod);
 }
-
-// =========================================================================
-// VaultFileV2 serialization tests
-// =========================================================================
 
 #[test]
 fn vault_file_v2_json_roundtrip() {
@@ -775,10 +732,6 @@ fn vault_file_v2_default_is_new() {
     assert_eq!(v2.version, 2);
     assert!(v2.entries.is_empty());
 }
-
-// =========================================================================
-// Edge cases
-// =========================================================================
 
 #[test]
 fn secret_entry_empty_field_value() {
@@ -823,7 +776,6 @@ fn vault_store_concurrent_read_write() {
         store.set("svc", &format!("key-{i}"), &entry).expect("set");
     }
 
-    // Verify all entries
     for i in 0..10 {
         let fetched = store.get("svc", &format!("key-{i}")).expect("get");
         assert_eq!(fetched.value(), Some(format!("val-{i}").as_str()));
@@ -860,10 +812,6 @@ fn vault_store_multi_field_entry() {
 
     cleanup(&store, &vault_path);
 }
-
-// ---------------------------------------------------------------------------
-// resolve_with_env: AGENT_CTX_WORKSPACE_PATH defaulting
-// ---------------------------------------------------------------------------
 
 #[test]
 fn resolve_with_env_uses_workspace_hint_when_vault_present() {
@@ -903,33 +851,40 @@ fn resolve_with_env_ignores_hint_without_workspace_vault() {
     );
 }
 
-// =========================================================================
-// V3 vault format tests
-// =========================================================================
-
 #[test]
-fn vault_store_init_writes_v3_on_disk() {
-    let vault_path = temp_vault_path("v3-on-disk");
+fn vault_store_init_writes_v4_on_disk() {
+    let vault_path = temp_vault_path("v4-on-disk");
     let store = VaultStore::new(vault_path.clone());
     store.init(strong_passphrase(), false).expect("init");
 
     let bytes = std::fs::read(&vault_path).expect("read vault file");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
-    assert_eq!(value["version"], 3, "newly-initialized vault should be v3");
+    assert_eq!(value["version"], 4, "newly-initialized vault should be v4");
+    assert!(
+        value.get("vault_id").is_some(),
+        "v4 vault must contain a vault id"
+    );
     assert!(
         value.get("kdf").is_some(),
-        "v3 vault must contain kdf header"
+        "v4 vault must contain kdf header"
     );
     assert!(
         value.get("wrapped_dk").is_some(),
-        "v3 vault must contain wrapped_dk header"
+        "v4 vault must contain wrapped_dk header"
+    );
+    assert!(
+        value
+            .get("mac")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "v4 vault must carry an authenticating MAC"
     );
 
     let _ = std::fs::remove_file(&vault_path);
 }
 
 #[test]
-fn vault_store_unlock_migrates_v2_to_v3() {
+fn vault_store_unlock_migrates_v2_to_v4() {
     let vault_path = temp_vault_path("migrate-v2");
     let pass = SecretString::from(strong_passphrase().to_string());
 
@@ -940,7 +895,7 @@ fn vault_store_unlock_migrates_v2_to_v3() {
     let json = serde_json::to_vec_pretty(&v2).expect("serialize v2");
     std::fs::write(&vault_path, &json).expect("write v2 file");
 
-    // Unlock should auto-migrate V2 → V3.
+    // Unlock should auto-migrate V2 → V4.
     let store = VaultStore::new(vault_path.clone());
     store.unlock(strong_passphrase(), 60).expect("unlock");
 
@@ -948,10 +903,9 @@ fn vault_store_unlock_migrates_v2_to_v3() {
     let fetched = store.get("svc", "key").expect("get after migrate");
     assert_eq!(fetched.value(), Some("secret-value-abc"));
 
-    // On-disk vault is now v3.
     let bytes = std::fs::read(&vault_path).expect("read vault file");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
-    assert_eq!(value["version"], 3, "vault should be v3 after migration");
+    assert_eq!(value["version"], 4, "vault should be v4 after migration");
 
     cleanup(&store, &vault_path);
 }

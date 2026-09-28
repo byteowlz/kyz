@@ -30,7 +30,10 @@ use std::{
 use kyz_core::jit::now_unix;
 use kyz_core::paths::write_default_config;
 use kyz_core::store::{DEFAULT_SERVICE, DEFAULT_SESSION_TIMEOUT_SECS};
-use kyz_core::{AppConfig, AppPaths, SecretEntry, SecretStore, VaultStore, default_cache_dir};
+use kyz_core::{
+    AppConfig, AppPaths, HistoryRole, HistoryView, OpKind, SecretEntry, SecretStore, VaultStore,
+    default_cache_dir,
+};
 
 /// Application name from Cargo.toml package name.
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
@@ -246,8 +249,6 @@ enum Command {
 #[derive(Debug, Clone, Copy, Args)]
 struct CtxCommand {}
 
-// -- Vault commands -----------------------------------------------------------
-
 #[derive(Debug, Subcommand)]
 enum VaultCommand {
     /// Create a new encrypted vault.
@@ -258,6 +259,8 @@ enum VaultCommand {
     Lock,
     /// Show vault status.
     Status,
+    /// Merge operations from another replica of this vault (v4).
+    Merge(VaultMergeCommand),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -274,7 +277,12 @@ struct VaultUnlockCommand {
     timeout: u64,
 }
 
-// -- Secret commands ----------------------------------------------------------
+#[derive(Debug, Clone, Args)]
+struct VaultMergeCommand {
+    /// Path to a v4 replica of this vault (e.g. a Syncthing conflict copy).
+    #[arg(value_name = "PATH")]
+    source: PathBuf,
+}
 
 #[derive(Debug, Clone, Args)]
 struct SetCommand {
@@ -369,8 +377,6 @@ enum ConfigCommand {
     Reset,
 }
 
-// -- Scan command -------------------------------------------------------------
-
 #[derive(Debug, Clone, Args)]
 struct ScanCommand {
     /// Only scan staged files (for pre-commit hooks).
@@ -383,8 +389,6 @@ struct ScanCommand {
     #[arg(long)]
     hook: bool,
 }
-
-// -- History / Rollback commands -----------------------------------------------
 
 #[derive(Debug, Clone, Args)]
 struct HistoryCommand {
@@ -401,15 +405,16 @@ struct RollbackCommand {
     /// Secret reference as service/key.
     #[arg(value_name = "SERVICE/KEY")]
     secret: String,
-    /// Version number to rollback to.
+    /// Target version: the `#n` sequence shown by `kyz history` (1 =
+    /// oldest; stable as new writes append). Advanced: also accepts a
+    /// v4 operation id (`actor:counter`), which stays stable across
+    /// concurrent writes.
     #[arg(long = "to", value_name = "VERSION")]
-    version: u32,
+    target: String,
     /// Service namespace (used if secret doesn't contain '/').
     #[arg(long, default_value = DEFAULT_SERVICE)]
     service: String,
 }
-
-// -- Exec command -------------------------------------------------------------
 
 #[derive(Debug, Clone, Args)]
 struct ExecCommand {
@@ -456,8 +461,6 @@ struct ExecCommand {
     command: Vec<String>,
 }
 
-// -- Pipe command -------------------------------------------------------------
-
 #[derive(Debug, Clone, Args)]
 struct PipeCommand {
     /// Path to a policy file (overrides auto-discovery).
@@ -481,8 +484,6 @@ struct PipeCommand {
     command: Vec<String>,
 }
 
-// -- Wrap command -------------------------------------------------------------
-
 #[derive(Debug, Clone, Args)]
 struct WrapCommand {
     /// Secret names to pre-approve (comma-separated, or '*' for all).
@@ -499,8 +500,6 @@ struct WrapCommand {
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
 }
-
-// -- IPC command -------------------------------------------------------------
 
 #[derive(Debug, Clone, Subcommand)]
 enum IpcCommand {
@@ -636,8 +635,6 @@ impl DaemonStartArgs {
     }
 }
 
-// -- Runtime context ----------------------------------------------------------
-
 #[derive(Debug, Clone)]
 struct RuntimeContext {
     common: CommonOpts,
@@ -745,14 +742,13 @@ impl RuntimeContext {
     }
 }
 
-// -- Vault command handlers ---------------------------------------------------
-
 fn handle_vault(ctx: &RuntimeContext, command: VaultCommand) -> Result<()> {
     match command {
         VaultCommand::Create(cmd) => handle_vault_create(ctx, &cmd),
         VaultCommand::Unlock(cmd) => handle_vault_unlock(ctx, &cmd),
         VaultCommand::Lock => handle_vault_lock(ctx),
         VaultCommand::Status => handle_vault_status(ctx),
+        VaultCommand::Merge(cmd) => handle_vault_merge(ctx, &cmd),
     }
 }
 
@@ -859,6 +855,128 @@ fn handle_vault_lock(ctx: &RuntimeContext) -> Result<()> {
     Ok(())
 }
 
+/// Human-readable summary of a v4 merge report (no secret values).
+fn merge_report_json(report: &kyz_core::MergeReport, dry_run: bool) -> serde_json::Value {
+    serde_json::json!({
+        "source": {
+            "path_vault_id": report.source_vault_id,
+            "digest": report.source_digest,
+            "operations": report.source_ops,
+        },
+        "dry_run": dry_run,
+        "written": !dry_run && report.changed,
+        "changed": report.changed,
+        "ops_added": report.ops_added,
+        "ops_already_present": report.ops_already_present,
+        "new_entries": report.new_entries,
+        "legacy_resurrections": report.legacy_resurrections,
+        "updated_entries": report.updated_entries,
+        "deleted_entries": report.deleted_entries,
+        "conflicts": report
+            .conflicts
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "entry": c.entry,
+                    "kept": c.kept.to_string(),
+                    "kept_updated_at": c.kept_updated_at,
+                    "losing": c.losing.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn handle_vault_merge(ctx: &RuntimeContext, cmd: &VaultMergeCommand) -> Result<()> {
+    let store = ctx.vault_store()?;
+    let dry_run = ctx.common.dry_run;
+
+    // `--yes` accepts entries that exist only in the source's pre-v4
+    // history and are absent here: v3-era deletions leave no tombstone,
+    // so they may be secrets deleted before one of the two sides
+    // migrated. Without it such a merge fails without writing.
+    let report = store
+        .merge_vault_from(&cmd.source, dry_run, ctx.common.assume_yes)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    if ctx.common.json || ctx.common.yaml {
+        let payload = merge_report_json(&report, dry_run);
+        if ctx.common.yaml {
+            println!(
+                "{}",
+                serde_yaml::to_string(&payload).context("serializing merge report to YAML")?
+            );
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .context("serializing merge report to JSON")?
+            );
+        }
+        return Ok(());
+    }
+
+    if report.ops_added == 0 && !report.changed {
+        println!(
+            "Nothing to merge: all {} source operations already present",
+            report.source_ops
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Merged {} operation(s) from {} (source digest {}…)",
+        report.ops_added,
+        cmd.source.display(),
+        report.source_digest.chars().take(12).collect::<String>(),
+    );
+    if report.ops_already_present > 0 {
+        println!("  already present: {0}", report.ops_already_present);
+    }
+    for entry in &report.new_entries {
+        println!("  new entry:        {entry}");
+    }
+    for entry in &report.legacy_resurrections {
+        println!(
+            "  pre-v4 only:      {entry} (may have been deleted in v3; confirm before keeping)"
+        );
+    }
+    for entry in &report.updated_entries {
+        println!("  updated entry:    {entry}");
+    }
+    for entry in &report.deleted_entries {
+        println!("  deleted (wins):   {entry}");
+    }
+    for conflict in &report.conflicts {
+        println!(
+            "  conflict:         {} kept {} (losing: {})",
+            conflict.entry,
+            conflict.kept,
+            conflict
+                .losing
+                .iter()
+                .map(kyz_core::OpId::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!(
+        "Losing versions remain visible via `kyz history <service/key>` and can be restored with `kyz rollback`."
+    );
+    if dry_run {
+        println!("dry-run: target vault not modified");
+    } else if report.changed {
+        println!("Vault updated at {}", store.vault_path().display());
+    }
+    if !dry_run {
+        println!(
+            "Source left untouched at {}; remove or archive it once satisfied.",
+            cmd.source.display()
+        );
+    }
+    Ok(())
+}
+
 fn handle_ctx(ctx: &RuntimeContext) -> Result<()> {
     let agent_ctx = kyz_core::AgentContext::from_env();
 
@@ -916,8 +1034,6 @@ fn handle_vault_status(ctx: &RuntimeContext) -> Result<()> {
     }
     Ok(())
 }
-
-// -- Secret command handlers --------------------------------------------------
 
 /// Parse --field arguments into a `BTreeMap`.
 fn parse_fields(raw: &[String]) -> Result<BTreeMap<String, SecretString>> {
@@ -1018,7 +1134,6 @@ fn mask_sensitive_fields(
 }
 
 fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
-    // Build fields from --field args or fallback to positional value
     let fields = if cmd.fields.is_empty() {
         let value = read_secret_value(cmd.value.as_deref())?;
         let mut m = BTreeMap::new();
@@ -1042,8 +1157,11 @@ fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
     }
 
     let vault_store = ctx.vault_store()?;
+    // --yes doubles as the explicit confirmation to rebuild a deleted
+    // entry: without it, set on a deleted entry fails instead of silently
+    // resurrecting it (previous values are unrecoverable in v4).
     vault_store
-        .set_with_retention(&cmd.service, &cmd.key, &entry, ctx.config.history_retention)
+        .set_with_options(&cmd.service, &cmd.key, &entry, ctx.common.assume_yes)
         .map_err(|e| anyhow!("{e}"))?;
 
     if !ctx.common.quiet {
@@ -1077,7 +1195,6 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
         .get(&cmd.service, &cmd.key)
         .map_err(|e| anyhow!("{e}"))?;
 
-    // If a specific field was requested, print just that value
     if let Some(ref field_name) = cmd.field {
         let value = entry
             .field(field_name)
@@ -1090,7 +1207,6 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
         return Ok(());
     }
 
-    // Otherwise print the full entry
     if ctx.common.json {
         let obj = serde_json::json!({
             "service": entry.service,
@@ -1116,14 +1232,12 @@ fn handle_get(ctx: &RuntimeContext, cmd: &GetCommand) -> Result<()> {
             serde_yaml::to_string(&obj).context("serializing to YAML")?
         );
     } else if entry.fields.len() == 1 && entry.fields.contains_key("value") {
-        // Single-value entry: check if the field is sensitive
         if is_sensitive_field("value") {
             println!("****");
         } else if let Some(v) = entry.value() {
             println!("{v}");
         }
     } else {
-        // Multi-field: print each field
         for (name, value) in &entry.fields {
             if is_sensitive_field(name) {
                 println!("{name}: ****");
@@ -1258,11 +1372,16 @@ fn handle_scan(ctx: &RuntimeContext, cmd: &ScanCommand) -> Result<()> {
     use kyz_core::scan;
 
     let store = ctx.vault_store()?;
-    let passphrase = store.require_session_pub().map_err(|e| anyhow!("{e}"))?;
-    let vault = store.read_vault_file_pub().map_err(|e| anyhow!("{e}"))?;
+    let dk = store.require_session_pub().map_err(|e| anyhow!("{e}"))?;
 
-    // Build index of secret values → names
-    let secret_index = scan::build_secret_index(&vault, &passphrase).map_err(|e| anyhow!("{e}"))?;
+    let secret_index = match store.read_contents_pub().map_err(|e| anyhow!("{e}"))? {
+        kyz_core::VaultContents::V3(vault) => {
+            scan::build_secret_index(&vault, &dk).map_err(|e| anyhow!("{e}"))?
+        }
+        kyz_core::VaultContents::V4(vault) => {
+            scan::build_secret_index_v4(&vault, &dk).map_err(|e| anyhow!("{e}"))?
+        }
+    };
 
     if secret_index.is_empty() {
         if !ctx.common.quiet {
@@ -1271,7 +1390,6 @@ fn handle_scan(ctx: &RuntimeContext, cmd: &ScanCommand) -> Result<()> {
         return Ok(());
     }
 
-    // Get files to scan
     let opts = scan::ScanOptions {
         staged_only: cmd.staged,
         path: cmd.path.clone(),
@@ -1284,10 +1402,8 @@ fn handle_scan(ctx: &RuntimeContext, cmd: &ScanCommand) -> Result<()> {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
 
-    // Scan
     let result = scan::scan_files(&files, &secret_index, &base_dir).map_err(|e| anyhow!("{e}"))?;
 
-    // Output results
     if ctx.common.json {
         println!(
             "{}",
@@ -1335,31 +1451,113 @@ fn parse_secret_ref<'a>(secret: &'a str, default_service: &'a str) -> (&'a str, 
 fn handle_history(ctx: &RuntimeContext, cmd: &HistoryCommand) -> Result<()> {
     let (service, key) = parse_secret_ref(&cmd.secret, &cmd.service);
     let store = ctx.vault_store()?;
-    let vault = store.read_vault_file_pub()?;
 
-    let encrypted = vault
-        .get_encrypted(service, key)
-        .ok_or_else(|| anyhow!("secret '{key}' not found in service '{service}'"))?;
+    // Rows are newest-first. For v4 the stored log is never trimmed;
+    // history_retention limits display only, and sequence numbers count
+    // from the oldest operation so they stay stable as versions append —
+    // older versions that fall out of the display window remain
+    // reachable by op id (shown with -v or --json).
+    let (rows, stored_conflicts) = match store.history(service, key).map_err(|e| anyhow!("{e}"))? {
+        HistoryView::V4(mut items) => {
+            let total = items.len();
+            // Counted over the stored log, not the display window: every
+            // kept conflict snapshot stays rollback-able even when it
+            // falls outside the retention window.
+            let stored_conflicts = items
+                .iter()
+                .filter(|item| item.role == HistoryRole::Conflict)
+                .count();
+            let limit = ctx.config.history_retention;
+            if limit > 0 && total > limit as usize {
+                items.truncate(limit as usize);
+            }
+            let rows = items
+                .into_iter()
+                .enumerate()
+                .map(|(idx, item)| HistoryRow {
+                    seq: Some(total - idx),
+                    op_id: Some(item.op_id.to_string()),
+                    role: item.role,
+                    kind: item.kind,
+                    changed_at: item.changed_at.phys,
+                    field_names: item.field_names,
+                    tags: item.tags,
+                    has_snapshot: item.has_blob,
+                })
+                .collect();
+            (rows, stored_conflicts)
+        }
+        // v3 rollback resolves archived versions by number, so those keep
+        // their version as the sequence; the live entry is not a rollback
+        // target in v3 and must not advertise a number.
+        HistoryView::V3 { encrypted } => {
+            let mut rows = vec![HistoryRow {
+                seq: None,
+                op_id: None,
+                role: HistoryRole::Current,
+                kind: OpKind::Put,
+                changed_at: encrypted.updated_at,
+                field_names: encrypted.field_names.clone(),
+                tags: encrypted.tags.clone(),
+                has_snapshot: true,
+            }];
+            rows.extend(encrypted.history.iter().map(|h| HistoryRow {
+                seq: Some(h.version as usize),
+                op_id: None,
+                role: HistoryRole::Ancestor,
+                kind: OpKind::Put,
+                changed_at: h.archived_at,
+                field_names: h.field_names.clone(),
+                tags: BTreeSet::new(),
+                has_snapshot: true,
+            }));
+            (rows, 0)
+        }
+    };
+    print_history(ctx, service, key, &rows, stored_conflicts)
+}
 
-    if encrypted.history.is_empty() {
+/// One display row of `kyz history`, normalized across vault formats.
+struct HistoryRow {
+    /// 1-based sequence counting from the oldest operation; matches the
+    /// JSON `seq` and rollback's `--to`. `None` marks a row with no
+    /// rollback handle — the live v3 entry, which v3 rollback (archived
+    /// versions only) cannot target.
+    seq: Option<usize>,
+    /// Stable operation id (v4 only).
+    op_id: Option<String>,
+    role: HistoryRole,
+    kind: OpKind,
+    changed_at: u64,
+    field_names: Vec<String>,
+    tags: BTreeSet<String>,
+    has_snapshot: bool,
+}
+
+/// `stored_conflicts` counts conflict snapshots in the stored log (which
+/// retention never trims), not just the displayed window.
+fn print_history(
+    ctx: &RuntimeContext,
+    service: &str,
+    key: &str,
+    rows: &[HistoryRow],
+    stored_conflicts: usize,
+) -> Result<()> {
+    if rows.is_empty() {
+        let payload = serde_json::json!({
+            "service": service,
+            "key": key,
+            "history": [],
+        });
         if ctx.common.json {
             println!(
                 "{}",
-                serde_json::json!({
-                    "service": service,
-                    "key": key,
-                    "history": []
-                })
+                serde_json::to_string_pretty(&payload).context("serializing history to JSON")?
             );
         } else if ctx.common.yaml {
             println!(
                 "{}",
-                serde_yaml::to_string(&serde_json::json!({
-                    "service": service,
-                    "key": key,
-                    "history": []
-                }))
-                .context("serializing to YAML")?
+                serde_yaml::to_string(&payload).context("serializing history to YAML")?
             );
         } else {
             println!("No history for '{service}/{key}'");
@@ -1367,65 +1565,73 @@ fn handle_history(ctx: &RuntimeContext, cmd: &HistoryCommand) -> Result<()> {
         return Ok(());
     }
 
+    let items_json: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let mut item = serde_json::json!({
+                "seq": row.seq,
+                "role": row.role,
+                "kind": if row.kind == OpKind::Put { "put" } else { "delete" },
+                "changed_at": row.changed_at,
+                "field_names": row.field_names,
+                "tags": row.tags,
+                "has_snapshot": row.has_snapshot,
+            });
+            if let Some(op_id) = &row.op_id {
+                item["op_id"] = serde_json::json!(op_id);
+            }
+            item
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "service": service,
+        "key": key,
+        "history": items_json,
+    });
     if ctx.common.json {
-        let history: Vec<serde_json::Value> = encrypted
-            .history
-            .iter()
-            .map(|h| {
-                serde_json::json!({
-                    "version": h.version,
-                    "archived_at": h.archived_at,
-                    "field_names": h.field_names,
-                })
-            })
-            .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "service": service,
-                "key": key,
-                "current_fields": encrypted.field_names,
-                "current_updated_at": encrypted.updated_at,
-                "history": history,
-            }))
-            .context("serializing to JSON")?
+            serde_json::to_string_pretty(&payload).context("serializing history to JSON")?
         );
     } else if ctx.common.yaml {
-        let history: Vec<serde_json::Value> = encrypted
-            .history
-            .iter()
-            .map(|h| {
-                serde_json::json!({
-                    "version": h.version,
-                    "archived_at": h.archived_at,
-                    "field_names": h.field_names,
-                })
-            })
-            .collect();
         println!(
             "{}",
-            serde_yaml::to_string(&serde_json::json!({
-                "service": service,
-                "key": key,
-                "current_fields": encrypted.field_names,
-                "current_updated_at": encrypted.updated_at,
-                "history": history,
-            }))
-            .context("serializing to YAML")?
+            serde_yaml::to_string(&payload).context("serializing history to YAML")?
         );
     } else {
         println!("History for '{service}/{key}':");
-        println!(
-            "  current  [{}]  updated {}",
-            encrypted.field_names.join(", "),
-            format_timestamp(encrypted.updated_at)
-        );
-        for h in &encrypted.history {
+        for row in rows {
+            let role = match row.role {
+                HistoryRole::Current => "current",
+                HistoryRole::Conflict => "CONFLICT",
+                HistoryRole::Ancestor => "ancestor",
+                HistoryRole::Tombstone => "deleted",
+            };
+            let details = if row.kind == OpKind::Put {
+                format!("[{}]", row.field_names.join(", "))
+            } else {
+                "(tombstone)".to_string()
+            };
+            // The op id is a stable rollback handle but pure noise while
+            // browsing; show it only for verbose runs.
+            let op_id = match (&row.op_id, ctx.common.verbose > 0) {
+                (Some(id), true) => format!("  {id}"),
+                _ => String::new(),
+            };
+            // No `#n` for rows without a rollback handle (v3 live entry):
+            // the rollback help promises every displayed `#n` resolves.
+            let seq = row
+                .seq
+                .map_or_else(|| " - ".to_string(), |seq| format!("#{seq:<2}"));
             println!(
-                "  v{}  [{}]  archived {}",
-                h.version,
-                h.field_names.join(", "),
-                format_timestamp(h.archived_at)
+                "  {seq} [{:<8}]  {}  {details}{op_id}",
+                role,
+                format_timestamp(row.changed_at),
+            );
+        }
+        if stored_conflicts > 0 {
+            println!(
+                "  ! {stored_conflicts} concurrent write(s) kept for rollback (kyz rollback --to <seq>)"
             );
         }
     }
@@ -1438,31 +1644,33 @@ fn handle_rollback(ctx: &RuntimeContext, cmd: &RollbackCommand) -> Result<()> {
     if ctx.common.dry_run {
         info!(
             "dry-run: would rollback '{service}/{key}' to version {}",
-            cmd.version
+            cmd.target
         );
         return Ok(());
     }
 
     let store = ctx.vault_store()?;
-    let passphrase = store.require_session_pub()?;
-    let mut vault = store.read_vault_file_pub()?;
-    let retention = ctx.config.history_retention;
-
-    vault
-        .rollback_with_retention(service, key, cmd.version, &passphrase, retention)
+    store
+        .rollback(service, key, &cmd.target, ctx.config.history_retention)
         .map_err(|e| anyhow!("{e}"))?;
-    store.write_vault_file_pub(&vault)?;
 
     if !ctx.common.quiet {
-        println!("Rolled back '{service}/{key}' to version {}", cmd.version);
+        println!("Rolled back '{service}/{key}' to version {}", cmd.target);
     }
     Ok(())
 }
 
 /// Format a Unix timestamp as a human-readable string.
+///
+/// The value is clamped to year 9999: v3 vaults carry plaintext,
+/// unauthenticated timestamps, and a tampered value must not panic the
+/// display path with a duration-overflow.
 fn format_timestamp(ts: u64) -> String {
-    humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts))
-        .to_string()
+    const MAX_TS: u64 = 253_402_300_799; // 9999-12-31T23:59:59Z
+    humantime::format_rfc3339_seconds(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts.min(MAX_TS)),
+    )
+    .to_string()
 }
 
 fn handle_env(ctx: &RuntimeContext) -> Result<()> {
@@ -1587,9 +1795,16 @@ fn handle_import(ctx: &RuntimeContext, cmd: &ImportCommand) -> Result<()> {
 
     for entry in &entries {
         let svc = cmd.service.as_deref().unwrap_or(&entry.service);
-        store
-            .set(svc, &entry.key, entry)
-            .map_err(|e| anyhow!("{e}"))?;
+        // `--yes` doubles as the explicit confirmation to recreate
+        // tombstoned entries (matching `kyz set --yes`); without it a
+        // deleted entry fails with a working --yes suggestion instead of
+        // an unreachable one.
+        let result = if ctx.common.assume_yes {
+            store.set_recreating(svc, &entry.key, entry)
+        } else {
+            store.set(svc, &entry.key, entry)
+        };
+        result.map_err(|e| anyhow!("{e}"))?;
         count += 1;
     }
 
@@ -1601,8 +1816,6 @@ fn handle_import(ctx: &RuntimeContext, cmd: &ImportCommand) -> Result<()> {
     }
     Ok(())
 }
-
-// -- Config command handlers --------------------------------------------------
 
 fn handle_init(ctx: &RuntimeContext, cmd: InitCommand) -> Result<()> {
     if ctx.paths.config_file.exists() && !(cmd.force || ctx.common.assume_yes) {
@@ -1952,8 +2165,6 @@ fn sanitized_ipc_output(
     }))
 }
 
-// -- Exec command handler -----------------------------------------------------
-
 /// Environment map plus the `service/key` refs of every secret that fed it.
 pub type ExecEnv = (BTreeMap<String, String>, Vec<String>);
 
@@ -1977,7 +2188,6 @@ fn resolve_exec_env(
             .get(alias_name)
             .ok_or_else(|| anyhow!("alias '{alias_name}' not found in config"))?;
 
-        // Explicit secret refs from alias
         for secret_ref in &alias.secrets {
             if let Some(entry) = resolve_secret_ref(store, secret_ref)? {
                 entries.push(entry);
@@ -1985,13 +2195,11 @@ fn resolve_exec_env(
             }
         }
 
-        // Tag-based resolution from alias
         for entry in resolve_by_tags(store, &alias.tags)? {
             resolved_refs.push(format!("{}/{}", entry.service, entry.key));
             entries.push(entry);
         }
 
-        // Explicit env mappings from alias
         for (env_var, field_ref) in &alias.env_map {
             if !kyz_core::is_safe_exec_env_name(env_var) {
                 return Err(anyhow!(
@@ -2524,7 +2732,6 @@ const SCRUB_ENV_PREFIXES: &[&str] = &["KYZ_VAULT_PASS", "KYZ_SESSION_"];
 /// follows the platform's rules there — a lowercase `kyz_vault_password`
 /// must be scrubbed just like the canonical spelling or the secret would
 /// leak through `GetEnvironmentVariable`-style lookups in the child.
-#[cfg(test)]
 fn env_key_is_sensitive(key: &str) -> bool {
     let is_name = |candidate: &str| {
         if cfg!(windows) {
@@ -2548,10 +2755,7 @@ fn env_key_is_sensitive(key: &str) -> bool {
 /// Build a scrubbed copy of the current environment, removing sensitive kyz vars.
 fn scrubbed_env() -> Vec<(String, String)> {
     std::env::vars()
-        .filter(|(key, _)| {
-            !SCRUB_ENV_VARS.iter().any(|s| key == *s)
-                && !SCRUB_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
-        })
+        .filter(|(key, _)| !env_key_is_sensitive(key))
         .collect()
 }
 
@@ -3274,6 +3478,21 @@ mod tests {
 
     #[cfg(unix)]
     use super::sanitized_ipc_output;
+
+    use super::format_timestamp;
+
+    #[test]
+    fn format_timestamp_clamps_out_of_range_values() {
+        // A tampered v3 plaintext timestamp must not panic on the display
+        // path (duration overflow at UNIX_EPOCH + u64::MAX secs).
+        assert_eq!(
+            format_timestamp(u64::MAX),
+            format_timestamp(253_402_300_799),
+            "values past year 9999 clamp instead of panicking"
+        );
+        assert!(format_timestamp(0).starts_with("1970-"));
+        assert!(format_timestamp(1_758_000_000).starts_with("202"));
+    }
 
     #[test]
     fn sensitive_env_names_match_platform_case_rules() {
