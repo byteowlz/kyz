@@ -302,8 +302,7 @@ fn conflict_footnote_counts_stored_log_beyond_display_window() {
     // sequences below the display window's edge while still being a
     // frontier conflict (only a new write on this vault could resolve
     // it, and none follows).
-    std::fs::create_dir_all(replica.parent().expect("replica parent")).expect("mkdir");
-    std::fs::copy(&vault, &replica).expect("copy replica");
+    copy_vault(&vault, &replica);
     HistoryFixture::assert_ok(
         &fixture.run_with_passphrase(&replica, &["vault", "unlock"]),
         "unlock replica",
@@ -356,4 +355,15 @@ fn conflict_footnote_counts_stored_log_beyond_display_window() {
         &fixture.run(&vault, &["rollback", "svc/conf", "--to", "2"]),
         "rollback to conflict",
     );
+}
+
+/// Copy a vault replica: the manifest plus its sibling entries directory.
+fn copy_vault(from: &Path, to: &Path) {
+    let entries = |p: &Path| p.with_file_name("vault.entries");
+    std::fs::create_dir_all(entries(to)).expect("mkdir replica entries");
+    std::fs::copy(from, to).expect("copy manifest");
+    for item in std::fs::read_dir(entries(from)).expect("read entries") {
+        let item = item.expect("entry");
+        std::fs::copy(item.path(), entries(to).join(item.file_name())).expect("copy entry");
+    }
 }

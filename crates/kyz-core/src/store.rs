@@ -23,8 +23,9 @@ use crate::actor::ActorState;
 use crate::error::CoreError;
 use crate::vault_v3::{DK_LEN, EncryptedEntryV3, VaultFileV3, decrypt_entry_v3, migrate_v2_to_v3};
 use crate::vault_v4::{
-    self, HistoryItem, Hlc, MergeReport, OpId, Projection, SnapshotPlain, VaultFileV4,
+    self, HistoryItem, Hlc, MergeReport, OpId, OpLog, Projection, SnapshotPlain, VaultFileV4,
 };
+use crate::vault_v5::{self, KeySlotInfo, Manifest, VaultDir};
 
 /// Default service name used when none is specified.
 pub const DEFAULT_SERVICE: &str = "kyz";
@@ -1313,9 +1314,11 @@ impl VaultStore {
 
     /// Initialize a new vault with a passphrase.
     ///
-    /// Creates an empty v4 vault file (operation logs + MAC, one-time
-    /// scrypt + DK-wrapped AEAD). Fails if one already exists (use `force`
-    /// to overwrite).
+    /// Creates an empty v5 vault: the manifest at the vault path (one
+    /// passphrase key slot wrapping a fresh DK) plus an empty entries
+    /// directory. Fails if a vault already exists (use `force` to replace
+    /// it; the previous entries directory is kept aside as
+    /// `<name>.entries.replaced-<unix-time>`).
     ///
     /// # Errors
     ///
@@ -1333,20 +1336,27 @@ impl VaultStore {
                 self.vault_path.display()
             )));
         }
+        let dir = VaultDir::new(&self.vault_path);
+        if dir.entries_dir().exists() {
+            let aside = dir
+                .entries_dir()
+                .with_extension(format!("entries.replaced-{}", now_unix()));
+            fs::rename(dir.entries_dir(), &aside).map_err(CoreError::Io)?;
+        }
 
         let passphrase_secret = SecretString::from(passphrase.to_string());
-        let (mut v4, dk) = VaultFileV4::create(&passphrase_secret)?;
+        let (mut manifest, dk) = Manifest::create(&passphrase_secret)?;
         // Strength was already checked above, so flag it.
-        v4.passphrase_policy_checked = true;
-        self.write_v4_unlocked(&mut v4, &dk)
+        manifest.passphrase_policy_checked = true;
+        dir.write_manifest(&mut manifest, &dk)
     }
 
     /// Unlock the vault: derive the KEK, unwrap the DK, persist a session.
     ///
-    /// Auto-migrates v1 (single-blob age), v2 (per-entry scrypt-age) and
-    /// v3 (last-writer-wins) vaults to v4 on first unlock. After this
-    /// call, hot-path operations (`get`/`set`/`list`) pay only AEAD
-    /// cost — no scrypt.
+    /// Auto-migrates v1 (single-blob age), v2 (per-entry scrypt-age), v3
+    /// (last-writer-wins) and single-file v4 vaults to v5 on first unlock.
+    /// After this call, hot-path operations (`get`/`set`/`list`) pay only
+    /// AEAD cost — no scrypt.
     ///
     /// # Errors
     ///
@@ -1368,12 +1378,13 @@ impl VaultStore {
 
     /// Helper: open the vault, migrate if needed, and return the DK.
     ///
-    /// All migrations (v1/v2/v3 → v4) and the one-time passphrase-policy
-    /// flag write run inside an exclusive file-lock transaction, so a
-    /// concurrent CLI writer can never observe or clobber a half-migrated
-    /// vault. The slow scrypt KDF runs **before** the lock wherever the
-    /// on-disk version is already known; holding the exclusive lock across
-    /// it would serialize unrelated concurrent `kyz get` calls.
+    /// All migrations (v1–v4 → v5), the one-time passphrase-policy flag
+    /// write, and sync-conflict-copy cleanup run inside an exclusive
+    /// file-lock transaction, so a concurrent CLI writer can never observe
+    /// or clobber a half-migrated vault. The slow scrypt KDF runs **before**
+    /// the lock wherever the on-disk version is already known; holding the
+    /// exclusive lock across it would serialize unrelated concurrent
+    /// `kyz get` calls.
     fn unlock_to_dk(
         &self,
         passphrase: &SecretString,
@@ -1386,13 +1397,17 @@ impl VaultStore {
         }
         let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
         match detect_vault_version(&raw) {
-            // Migrations rewrite the vault file: re-read under the lock so
-            // the whole detect -> migrate -> write sequence is one
-            // transaction over the current bytes.
-            1 | 2 => {
-                let _lock = VaultFileLock::exclusive(&self.vault_path)?;
-                let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
-                self.unlock_migrate_legacy(&raw, passphrase)
+            5 => {
+                let manifest = Manifest::parse(&raw)?;
+                let (_, dk) = manifest.unwrap_dk(passphrase)?;
+                if !manifest.passphrase_policy_checked {
+                    ensure_passphrase_strength(passphrase.expose_secret())?;
+                }
+                if !manifest.passphrase_policy_checked || self.has_conflict_copies()? {
+                    let _lock = VaultFileLock::exclusive(&self.vault_path)?;
+                    self.maintain_v5_locked(&dk)?;
+                }
+                Ok(dk)
             }
             3 => {
                 // Derive the DK outside the lock (scrypt), then migrate
@@ -1414,13 +1429,14 @@ impl VaultStore {
                                 "vault changed while unlocking; run unlock again".to_string(),
                             ));
                         }
-                        log::info!("migrating vault from v3 to v4");
+                        log::info!("migrating vault from v3 to v5");
                         self.migrate_v3_and_write(&current, &dk)?;
                         Ok(dk)
                     }
-                    4 => {
-                        let current = VaultFileV4::parse(&raw)?;
-                        self.finish_v4_unlock_locked(current, &dk)?;
+                    5 => {
+                        // A concurrent process migrated it meanwhile.
+                        VaultDir::new(&self.vault_path).read_verified_manifest(&dk)?;
+                        self.maintain_v5_locked(&dk)?;
                         Ok(dk)
                     }
                     other => Err(CoreError::Secret(format!(
@@ -1428,16 +1444,13 @@ impl VaultStore {
                     ))),
                 }
             }
-            4 => {
-                let (v4, dk) = Self::open_v4_file(&raw, passphrase)?;
-                if v4.passphrase_policy_checked {
-                    return Ok(dk);
-                }
+            // Migrations rewrite the vault file: re-read under the lock so
+            // the whole detect -> migrate -> write sequence is one
+            // transaction over the current bytes.
+            1 | 2 | 4 => {
                 let _lock = VaultFileLock::exclusive(&self.vault_path)?;
                 let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
-                let current = VaultFileV4::parse(&raw)?;
-                self.finish_v4_unlock_locked(current, &dk)?;
-                Ok(dk)
+                self.unlock_migrate_legacy(&raw, passphrase)
             }
             other => Err(CoreError::Secret(format!(
                 "unsupported vault format version {other}"
@@ -1445,22 +1458,59 @@ impl VaultStore {
         }
     }
 
-    /// One-time passphrase-policy flag write on an unlocked v4 file.
-    /// The caller must hold the exclusive vault lock.
-    ///
-    /// The re-read file is MAC-verified under the session DK before it is
-    /// rewritten: a concurrent replace between the unlocked read and the
-    /// lock acquisition must surface as a verification error, never as a
-    /// silently re-signed foreign file.
-    fn finish_v4_unlock_locked(
-        &self,
-        mut file: VaultFileV4,
-        dk: &Zeroizing<[u8; DK_LEN]>,
-    ) -> Result<(), CoreError> {
-        file.verify_mac(dk)?;
-        if !file.passphrase_policy_checked {
-            file.passphrase_policy_checked = true;
-            self.write_v4_unlocked(&mut file, dk)?;
+    /// Whether sync conflict copies of the manifest or any entry exist.
+    fn has_conflict_copies(&self) -> Result<bool, CoreError> {
+        let dir = VaultDir::new(&self.vault_path);
+        if !dir.manifest_conflict_copies()?.is_empty() {
+            return Ok(true);
+        }
+        dir.has_entry_conflict_copies()
+    }
+
+    /// Maintenance of an unlocked v5 vault under the exclusive lock: set
+    /// the passphrase-policy flag, fold verified manifest conflict copies
+    /// into the manifest, and fold entry conflict copies into their entry
+    /// files. Copies that fail verification are left untouched.
+    fn maintain_v5_locked(&self, dk: &Zeroizing<[u8; DK_LEN]>) -> Result<(), CoreError> {
+        let dir = VaultDir::new(&self.vault_path);
+        let mut manifest = dir.read_verified_manifest(dk)?;
+        let mut changed = !manifest.passphrase_policy_checked;
+        manifest.passphrase_policy_checked = true;
+        let mut absorbed_manifests = Vec::new();
+        for copy in dir.manifest_conflict_copies()? {
+            let parsed = fs::read(&copy)
+                .map_err(CoreError::Io)
+                .and_then(|raw| Manifest::parse(&raw))
+                .and_then(|m| m.verify_mac(dk).map(|()| m));
+            match parsed {
+                Ok(other) if other.vault_id == manifest.vault_id => {
+                    changed |= manifest.merge_from(&other)?;
+                    absorbed_manifests.push(copy);
+                }
+                Ok(_) => log::warn!(
+                    "ignoring manifest copy {} of a different vault",
+                    copy.display()
+                ),
+                Err(e) => log::warn!(
+                    "ignoring unverifiable manifest copy {}: {e}",
+                    copy.display()
+                ),
+            }
+        }
+        if changed {
+            dir.write_manifest(&mut manifest, dk)?;
+        }
+        for copy in absorbed_manifests {
+            if let Err(e) = fs::remove_file(&copy) {
+                log::warn!(
+                    "could not remove absorbed manifest copy {}: {e}",
+                    copy.display()
+                );
+            }
+        }
+        let all = dir.read_all(dk, &manifest.vault_id)?;
+        if !all.absorbed.is_empty() {
+            vault_v5::write_changed(&dir, &all, &all.log, dk)?;
         }
         Ok(())
     }
@@ -1480,27 +1530,9 @@ impl VaultStore {
         Ok((v3, dk))
     }
 
-    /// Parse a v4 file, unwrap its DK, MAC-verify it against the DK, and
-    /// enforce the one-time passphrase policy gate. Shared prelude of
-    /// every unlock arm that opens v4 bytes. Verifying here keeps a
-    /// corrupt or tampered vault from unlocking "successfully" and only
-    /// failing on the first get/list with an unrelated error.
-    fn open_v4_file(
-        raw: &[u8],
-        passphrase: &SecretString,
-    ) -> Result<(VaultFileV4, Zeroizing<[u8; DK_LEN]>), CoreError> {
-        let v4 = VaultFileV4::parse(raw)?;
-        let dk = v4.unwrap_dk(passphrase)?;
-        v4.verify_mac(&dk)?;
-        if !v4.passphrase_policy_checked {
-            ensure_passphrase_strength(passphrase.expose_secret())?;
-        }
-        Ok((v4, dk))
-    }
-
-    /// Legacy migration arms (v1/v2 → v4), run while holding the exclusive
-    /// vault lock. v1/v2 files first walk the existing v2/v3 chain, then
-    /// convert to v4 in the same transaction.
+    /// Legacy migration arms (v1/v2/v4 → v5, plus v3/v5 when a concurrent
+    /// process got there first), run while holding the exclusive vault
+    /// lock. v1/v2 files first walk the existing v2/v3 chain.
     fn unlock_migrate_legacy(
         &self,
         raw: &[u8],
@@ -1508,7 +1540,7 @@ impl VaultStore {
     ) -> Result<Zeroizing<[u8; DK_LEN]>, CoreError> {
         match detect_vault_version(raw) {
             1 => {
-                log::info!("migrating vault from v1 to v4");
+                log::info!("migrating vault from v1 to v5");
                 let mut v2 = migrate_v1_to_v2(raw, passphrase)?;
                 v2.passphrase_policy_checked = true;
                 let (v3, dk) = migrate_v2_to_v3(&v2, passphrase)?;
@@ -1526,21 +1558,31 @@ impl VaultStore {
                 if !v2.passphrase_policy_checked {
                     ensure_passphrase_strength(passphrase.expose_secret())?;
                 }
-                log::info!("migrating vault from v2 to v4");
+                log::info!("migrating vault from v2 to v5");
                 let (v3, dk) = migrate_v2_to_v3(&v2, passphrase)?;
                 self.migrate_v3_and_write(&v3, &dk)?;
                 Ok(dk)
             }
-            // A concurrent process migrated the vault between the unlocked
-            // read and lock acquisition: take the steady-state path.
             3 => {
                 let (current, dk) = Self::open_v3_file(raw, passphrase)?;
                 self.migrate_v3_and_write(&current, &dk)?;
                 Ok(dk)
             }
             4 => {
-                let (current, dk) = Self::open_v4_file(raw, passphrase)?;
-                self.finish_v4_unlock_locked(current, &dk)?;
+                let mut v4 = VaultFileV4::parse(raw)?;
+                let dk = v4.unwrap_dk(passphrase)?;
+                v4.verify_mac(&dk)?;
+                if !v4.passphrase_policy_checked {
+                    ensure_passphrase_strength(passphrase.expose_secret())?;
+                }
+                log::info!("migrating vault from single-file v4 to v5");
+                v4.passphrase_policy_checked = true;
+                VaultDir::new(&self.vault_path).write_from_v4(&v4, &dk)?;
+                Ok(dk)
+            }
+            5 => {
+                let (_, dk) = Manifest::parse(raw)?.unwrap_dk(passphrase)?;
+                self.maintain_v5_locked(&dk)?;
                 Ok(dk)
             }
             other => Err(CoreError::Secret(format!(
@@ -1611,24 +1653,9 @@ impl VaultStore {
         crate::atomic::write_atomic(&self.vault_path, json.as_bytes())
     }
 
-    /// Write the v4 vault file without acquiring the vault lock:
-    /// finalize (canonicalize + MAC), serialize pretty, atomic replace.
-    ///
-    /// Same locking contract as [`Self::write_vault_file_unlocked`]: only
-    /// call inside an already-held exclusive lock transaction.
-    fn write_v4_unlocked(
-        &self,
-        vault: &mut VaultFileV4,
-        dk: &Zeroizing<[u8; DK_LEN]>,
-    ) -> Result<(), CoreError> {
-        vault.finalize(dk)?;
-        let bytes = vault.to_bytes_pretty()?;
-        crate::atomic::write_atomic(&self.vault_path, &bytes)
-    }
-
-    /// Migrate a decrypted v3 vault to v4 and persist it, setting the
+    /// Migrate a decrypted v3 vault to v5 and persist it, setting the
     /// passphrase-policy flag (migration implies the passphrase was just
-    /// verified against the v3 file).
+    /// verified against the v3 file). Caller holds the exclusive lock.
     fn migrate_v3_and_write(
         &self,
         v3: &VaultFileV3,
@@ -1636,7 +1663,61 @@ impl VaultStore {
     ) -> Result<(), CoreError> {
         let mut v4 = vault_v4::migrate_v3_to_v4(v3, dk)?;
         v4.passphrase_policy_checked = true;
-        self.write_v4_unlocked(&mut v4, dk)
+        VaultDir::new(&self.vault_path).write_from_v4(&v4, dk)?;
+        Ok(())
+    }
+
+    /// Change the vault passphrase: add a slot for `new`, then remove the
+    /// slot `current` unlocked. The DK is unchanged, so existing sessions
+    /// and every replica stay valid; the removal propagates on merge.
+    ///
+    /// Copies of the manifest made before the change (backups, stale
+    /// replicas) still unlock with the old passphrase — see
+    /// [`crate::vault_v5`] on revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault is not v5 (unlock first to migrate),
+    /// `current` is wrong, or `new` fails the strength policy.
+    pub fn change_passphrase(&self, current: &str, new: &str) -> Result<(), CoreError> {
+        ensure_passphrase_strength(new)?;
+        let current = SecretString::from(current.to_string());
+        let new = SecretString::from(new.to_string());
+        let dir = VaultDir::new(&self.vault_path);
+        let (slot_id, dk) = self.read_manifest_v5()?.unwrap_dk(&current)?;
+        let _lock = VaultFileLock::exclusive(&self.vault_path)?;
+        let mut manifest = dir.read_verified_manifest(&dk)?;
+        let label = manifest
+            .keyslots
+            .get(&slot_id)
+            .and_then(|s| s.label.clone());
+        manifest.add_passphrase_slot(&dk, &new, label)?;
+        manifest.remove_slot(&slot_id)?;
+        dir.write_manifest(&mut manifest, &dk)
+    }
+
+    /// Value-free list of the vault's key slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault is locked, not v5, or fails
+    /// verification.
+    pub fn key_slots(&self) -> Result<Vec<KeySlotInfo>, CoreError> {
+        let dk = self.require_session()?;
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        Ok(VaultDir::new(&self.vault_path)
+            .read_verified_manifest(&dk)?
+            .slot_infos())
+    }
+
+    fn read_manifest_v5(&self) -> Result<Manifest, CoreError> {
+        let raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
+        match detect_vault_version(&raw) {
+            5 => Manifest::parse(&raw),
+            other => Err(CoreError::Secret(format!(
+                "vault is v{other}; run 'kyz vault unlock' to migrate it first"
+            ))),
+        }
     }
 
     /// Unlock the vault into memory without persisting any session state.
@@ -1644,7 +1725,7 @@ impl VaultStore {
     /// Returns an [`UnlockedVault`] whose data key lives only in process
     /// memory. Unlike [`VaultStore::unlock`], this never calls
     /// [`VaultSession::save`], never writes to the OS keyring, and never
-    /// creates a session file. Any vault migration (v1/v2 → v3, passphrase
+    /// creates a session file. Any vault migration (v1–v4 → v5, passphrase
     /// policy update) happens inside a single exclusive file-lock
     /// transaction before the handle is returned.
     ///
@@ -1666,7 +1747,7 @@ impl VaultStore {
 /// The DK is private: there is no accessor for the raw key bytes, and
 /// decryption stays encapsulated in `kyz-core`. The handle holds **no
 /// plaintext cache** — every [`UnlockedVault::get`] /
-/// [`UnlockedVault::resolve_fields`] call re-reads the latest `vault.json`
+/// [`UnlockedVault::resolve_fields`] call re-reads the latest entry file
 /// under the shared vault lock, so secret updates made by the CLI while the
 /// daemon is alive are visible on the next resolve.
 ///
@@ -1737,15 +1818,15 @@ impl UnlockedVault {
     }
 }
 
-/// Vault contents parsed from disk, version-dispatched.
+/// Vault storage dispatched by on-disk version.
 #[derive(Debug, Clone)]
 pub enum VaultContents {
     /// Legacy v3 file (last-writer-wins entries). `set`/`delete` upgrade
-    /// it to v4 inside their write transactions; rollback writes it back
+    /// it to v5 inside their write transactions; rollback writes it back
     /// as v3 until one of those (or the next unlock) migrates it.
     V3(VaultFileV3),
-    /// v4 file (per-entry operation logs).
-    V4(VaultFileV4),
+    /// v5 vault: manifest plus one file per entry.
+    V5(VaultDir),
 }
 
 /// History of one entry, dispatched by the on-disk format.
@@ -1757,16 +1838,16 @@ pub enum HistoryView {
         /// The encrypted entry with its archived history.
         encrypted: EncryptedEntryV3,
     },
-    /// v4 operation-log history (current/conflict/ancestor/tombstone).
+    /// Operation-log history (current/conflict/ancestor/tombstone).
     V4(Vec<HistoryItem>),
 }
 
-/// Read the vault file at `vault_path` under a shared (read) lock and
-/// dispatch by detected version.
+/// Read the vault at `vault_path` under a shared (read) lock and dispatch
+/// by detected version.
 ///
 /// # Errors
 ///
-/// Returns an error if the file is missing, unparsable, or older than v3.
+/// Returns an error if the file is missing, unparsable, or not v3/v5.
 fn read_contents_at(vault_path: &Path) -> Result<VaultContents, CoreError> {
     if !vault_path.exists() {
         return Err(CoreError::Secret(format!(
@@ -1778,8 +1859,8 @@ fn read_contents_at(vault_path: &Path) -> Result<VaultContents, CoreError> {
     read_contents_no_lock(vault_path)
 }
 
-/// Read and parse the vault file without taking any lock (the caller must
-/// already hold a vault lock when the file may be written concurrently).
+/// Detect the on-disk format without taking any lock (the caller must
+/// already hold a vault lock when the vault may be written concurrently).
 ///
 /// # Errors
 ///
@@ -1793,19 +1874,61 @@ fn read_contents_no_lock(vault_path: &Path) -> Result<VaultContents, CoreError> 
                 .map_err(|e| CoreError::Serialization(format!("parsing vault: {e}")))?;
             Ok(VaultContents::V3(v3))
         }
-        4 => {
-            let v4 = VaultFileV4::parse(&raw)?;
-            Ok(VaultContents::V4(v4))
-        }
+        5 => Ok(VaultContents::V5(VaultDir::new(vault_path))),
         other => Err(CoreError::Secret(format!(
             "vault is v{other}; run 'kyz vault unlock' to migrate it"
         ))),
     }
 }
 
-/// Decrypt and return a full secret entry from already-parsed vault
-/// contents. Shared by [`UnlockedVault::get`] and the `SecretStore` impl,
-/// which differ only in where the session DK comes from.
+/// One entry of a v5 vault: the verified manifest's vault id, the entry
+/// as a single-entry log, and the conflict copies folded into it.
+struct EntryLog {
+    log: OpLog,
+    absorbed: Vec<PathBuf>,
+}
+
+fn read_entry_log(
+    dir: &VaultDir,
+    dk: &Zeroizing<[u8; DK_LEN]>,
+    service: &str,
+    key: &str,
+) -> Result<EntryLog, CoreError> {
+    let manifest = dir.read_verified_manifest(dk)?;
+    let ck = OpLog::compound_key(service, key);
+    let read = dir.read_entry(dk, &manifest.vault_id, &ck)?;
+    let mut log = OpLog::new(&manifest.vault_id);
+    if !read.ops.is_empty() {
+        log.entries.insert(ck, read.ops);
+    }
+    Ok(EntryLog {
+        log,
+        absorbed: read.absorbed,
+    })
+}
+
+fn write_entry_log(
+    dir: &VaultDir,
+    dk: &Zeroizing<[u8; DK_LEN]>,
+    entry: EntryLog,
+    service: &str,
+    key: &str,
+) -> Result<(), CoreError> {
+    let ck = OpLog::compound_key(service, key);
+    let mut log = entry.log;
+    let ops = log.entries.remove(&ck).unwrap_or_default();
+    dir.write_entry(dk, &log.vault_id, &ck, ops, &entry.absorbed)
+}
+
+/// Read and verify every entry of a v5 vault (caller holds a lock).
+fn load_log_with(dir: &VaultDir, dk: &Zeroizing<[u8; DK_LEN]>) -> Result<OpLog, CoreError> {
+    let manifest = dir.read_verified_manifest(dk)?;
+    Ok(dir.read_all(dk, &manifest.vault_id)?.log)
+}
+
+/// Decrypt and return a full secret entry. Shared by
+/// [`UnlockedVault::get`] and the `SecretStore` impl, which differ only in
+/// where the session DK comes from.
 fn get_entry_from(
     contents: &VaultContents,
     dk: &Zeroizing<[u8; DK_LEN]>,
@@ -1821,9 +1944,9 @@ fn get_entry_from(
             })?;
             decrypt_entry_v3(encrypted, dk)
         }
-        VaultContents::V4(vault) => {
-            vault.verify_mac(dk)?;
-            Ok(vault.decrypt_current(dk, service, key)?.to_entry())
+        VaultContents::V5(dir) => {
+            let entry = read_entry_log(dir, dk, service, key)?;
+            Ok(entry.log.decrypt_current(dk, service, key)?.to_entry())
         }
     }
 }
@@ -1842,20 +1965,19 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Derive the v4 history view from already-parsed contents. Shared by
-/// [`VaultStore::history_v4`] and the v4 arm of [`VaultStore::history`].
+/// History of one entry of a v5 vault.
 ///
 /// # Errors
 ///
 /// Returns an error if verification fails or the entry has no operations.
-fn history_v4_from(
-    vault: &VaultFileV4,
+fn history_v5(
+    dir: &VaultDir,
     dk: &Zeroizing<[u8; DK_LEN]>,
     service: &str,
     key: &str,
 ) -> Result<Vec<HistoryItem>, CoreError> {
-    vault.verify_mac(dk)?;
-    let ops = vault.ops(service, key).ok_or_else(|| {
+    let entry = read_entry_log(dir, dk, service, key)?;
+    let ops = entry.log.ops(service, key).ok_or_else(|| {
         CoreError::SecretNotFound(format!("secret '{key}' not found in service '{service}'"))
     })?;
     vault_v4::history(ops)
@@ -1899,35 +2021,47 @@ impl SecretStore for VaultStore {
     fn delete(&self, service: &str, key: &str) -> Result<(), CoreError> {
         let dk = self.require_session()?;
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
-        // Writes upgrade a v3 file inside the same transaction (matching
-        // `set`), so a successful delete always leaves a v4 vault behind.
-        let mut vault = self.load_v4_for_write(&dk)?;
-        // Deleting a non-existent (never-written or already tombstoned)
-        // entry keeps the historical CLI semantics and generates no
-        // operation — and no write, so a failed delete leaves the file
-        // untouched.
-        if !matches!(vault.projection(service, key)?, Projection::Visible { .. }) {
+        // Writes upgrade a v3 vault inside the same transaction (matching
+        // `set`), so a successful delete always leaves a v5 vault behind —
+        // but a delete of a missing entry must not write at all.
+        if let VaultContents::V3(v3) = read_contents_no_lock(&self.vault_path)?
+            && v3.get_encrypted(service, key).is_none()
+        {
             return Err(CoreError::SecretNotFound(format!(
                 "secret '{key}' not found in service '{service}'"
             )));
         }
-        Self::append_local_delete(&mut vault, service, key)?;
-        self.write_v4_unlocked(&mut vault, &dk)
+        let dir = self.v5_for_write(&dk)?;
+        let mut entry = read_entry_log(&dir, &dk, service, key)?;
+        // Deleting a non-existent (never-written or already tombstoned)
+        // entry keeps the historical CLI semantics and generates no
+        // operation — and no write, so a failed delete leaves the vault
+        // untouched.
+        if !matches!(
+            entry.log.projection(service, key)?,
+            Projection::Visible { .. }
+        ) {
+            return Err(CoreError::SecretNotFound(format!(
+                "secret '{key}' not found in service '{service}'"
+            )));
+        }
+        Self::append_local_delete(&mut entry.log, service, key)?;
+        write_entry_log(&dir, &dk, entry, service, key)
     }
 
     fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
         let dk = self.require_session()?;
         match read_contents_at(&self.vault_path)? {
             VaultContents::V3(vault) => Ok(vault.summaries(service)),
-            VaultContents::V4(vault) => {
-                vault.verify_mac(&dk)?;
+            VaultContents::V5(dir) => {
+                let log = load_log_with(&dir, &dk)?;
                 let mut out = Vec::new();
-                for (ck, meta) in vault.visible_metas()? {
+                for (ck, meta) in log.visible_metas()? {
                     // Compound keys split at the first `/` after both
                     // parts were percent-escaped, so services or keys
                     // containing `/` (possible in library-created v3
                     // vaults) are attributed correctly.
-                    let Some((svc, key)) = VaultFileV4::split_compound_key(&ck) else {
+                    let Some((svc, key)) = OpLog::split_compound_key(&ck) else {
                         continue;
                     };
                     if svc != service {
@@ -1950,12 +2084,11 @@ impl SecretStore for VaultStore {
         let dk = self.require_session()?;
         match read_contents_at(&self.vault_path)? {
             VaultContents::V3(vault) => Ok(vault.services()),
-            VaultContents::V4(vault) => {
-                vault.verify_mac(&dk)?;
-                let mut svcs: Vec<String> = vault
+            VaultContents::V5(dir) => {
+                let mut svcs: Vec<String> = load_log_with(&dir, &dk)?
                     .visible_metas()?
                     .into_iter()
-                    .filter_map(|(ck, _)| VaultFileV4::split_compound_key(&ck).map(|(svc, _)| svc))
+                    .filter_map(|(ck, _)| OpLog::split_compound_key(&ck).map(|(svc, _)| svc))
                     .collect();
                 svcs.sort();
                 svcs.dedup();
@@ -1969,7 +2102,7 @@ impl VaultStore {
     /// Store or update an entry, optionally allowing an explicit rebuild
     /// of a deleted entry.
     ///
-    /// v4 `set` re-reads the file under the exclusive vault lock and bases
+    /// `set` re-reads the entry under the exclusive vault lock and bases
     /// the new snapshot on the current projection:
     ///
     /// - entry visible: the passed fields overlay the current snapshot
@@ -1991,7 +2124,9 @@ impl VaultStore {
     ) -> Result<(), CoreError> {
         let dk = self.require_session()?;
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
-        let mut vault = self.load_v4_for_write(&dk)?;
+        let dir = self.v5_for_write(&dk)?;
+        let mut current = read_entry_log(&dir, &dk, service, key)?;
+        let vault = &mut current.log;
 
         // One causal walk serves both the overlay base and the new op's
         // parents: when the projection is visible the frontier is exactly
@@ -2036,29 +2171,45 @@ impl VaultStore {
             }
         };
 
-        Self::append_local_put(&mut vault, &snapshot, parents, &dk)?;
-        self.write_v4_unlocked(&mut vault, &dk)
+        Self::append_local_put(vault, &snapshot, parents, &dk)?;
+        write_entry_log(&dir, &dk, current, service, key)
     }
 
-    /// Load the vault as v4 for a write transaction. A v3 file is upgraded
+    /// The v5 vault for a write transaction. A v3 vault is migrated to v5
     /// inside the caller's exclusive-lock transaction first, so every new
-    /// write produces the v4 format. Files read from disk as v4 are
-    /// MAC-verified before being returned; freshly migrated files carry no
-    /// MAC yet and are trusted as local output.
-    fn load_v4_for_write(&self, dk: &Zeroizing<[u8; DK_LEN]>) -> Result<VaultFileV4, CoreError> {
+    /// write produces the v5 format. Caller holds the exclusive lock.
+    fn v5_for_write(&self, dk: &Zeroizing<[u8; DK_LEN]>) -> Result<VaultDir, CoreError> {
         match read_contents_no_lock(&self.vault_path)? {
-            VaultContents::V4(vault) => {
-                vault.verify_mac(dk)?;
-                Ok(vault)
+            VaultContents::V5(dir) => Ok(dir),
+            VaultContents::V3(v3) => {
+                self.migrate_v3_and_write(&v3, dk)?;
+                Ok(VaultDir::new(&self.vault_path))
             }
-            VaultContents::V3(v3) => Ok(vault_v4::migrate_v3_to_v4(&v3, dk)?),
         }
+    }
+
+    /// Read the whole v5 vault into memory (session-authenticated, shared
+    /// lock). Used by listing, scanning and merge reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is locked, the vault is not v5, or
+    /// any file fails verification.
+    pub fn load_log(&self) -> Result<OpLog, CoreError> {
+        let dk = self.require_session()?;
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        let VaultContents::V5(dir) = read_contents_no_lock(&self.vault_path)? else {
+            return Err(CoreError::Secret(
+                "vault is still v3; run 'kyz vault unlock' to migrate it".to_string(),
+            ));
+        };
+        load_log_with(&dir, &dk)
     }
 
     /// Mint a fresh operation id and HLC for a local write and append a
     /// put with the given causal parents.
     fn append_local_put(
-        vault: &mut VaultFileV4,
+        vault: &mut OpLog,
         snapshot: &SnapshotPlain,
         parents: Vec<OpId>,
         dk: &Zeroizing<[u8; DK_LEN]>,
@@ -2070,11 +2221,7 @@ impl VaultStore {
 
     /// Append a delete (tombstone) with a fresh local id over the current
     /// frontier.
-    fn append_local_delete(
-        vault: &mut VaultFileV4,
-        service: &str,
-        key: &str,
-    ) -> Result<(), CoreError> {
+    fn append_local_delete(vault: &mut OpLog, service: &str, key: &str) -> Result<(), CoreError> {
         let id = allocate_op_id(vault)?;
         let changed_at = Hlc::tick(Some(vault.max_hlc()));
         let parents: Vec<OpId> = vault
@@ -2093,34 +2240,35 @@ impl VaultStore {
         read_contents_at(&self.vault_path)
     }
 
-    /// Derive the v4 history view for one entry (session-authenticated).
+    /// Derive the operation-log history view for one entry
+    /// (session-authenticated).
     ///
     /// # Errors
     ///
-    /// Returns an error if the session is locked, the vault is not v4
+    /// Returns an error if the session is locked, the vault is not v5
     /// (run unlock to migrate), verification fails, or the entry has no
     /// operations.
     pub fn history_v4(&self, service: &str, key: &str) -> Result<Vec<HistoryItem>, CoreError> {
         let dk = self.require_session()?;
         match read_contents_at(&self.vault_path)? {
             VaultContents::V3(_) => Err(CoreError::Secret(
-                "vault is still v3; run 'kyz vault unlock' to migrate it to v4".to_string(),
+                "vault is still v3; run 'kyz vault unlock' to migrate it".to_string(),
             )),
-            VaultContents::V4(vault) => history_v4_from(&vault, &dk, service, key),
+            VaultContents::V5(dir) => history_v5(&dir, &dk, service, key),
         }
     }
 
     /// History of one entry, dispatched by the on-disk format.
     ///
     /// Version dispatch lives here (like `get`/`set`/`delete`) so callers
-    /// never need to sniff the format themselves. v4 vaults require an
+    /// never need to sniff the format themselves. v5 vaults require an
     /// unlocked session (the view is MAC-verified); legacy v3 vaults are
     /// read without one, matching the pre-v4 CLI behavior.
     ///
     /// # Errors
     ///
     /// Returns an error if the entry is missing, the session is locked
-    /// (v4 only), or verification fails.
+    /// (v5 only), or verification fails.
     pub fn history(&self, service: &str, key: &str) -> Result<HistoryView, CoreError> {
         match read_contents_at(&self.vault_path)? {
             VaultContents::V3(vault) => {
@@ -2133,14 +2281,14 @@ impl VaultStore {
                     encrypted: encrypted.clone(),
                 })
             }
-            VaultContents::V4(vault) => {
+            VaultContents::V5(dir) => {
                 let dk = self.require_session()?;
-                Ok(HistoryView::V4(history_v4_from(&vault, &dk, service, key)?))
+                Ok(HistoryView::V4(history_v5(&dir, &dk, service, key)?))
             }
         }
     }
 
-    /// Roll back (or explicitly rebuild) an entry from a historical v4
+    /// Roll back (or explicitly rebuild) an entry from a historical
     /// snapshot.
     ///
     /// `target` is either an operation id in `actor:counter` form or a
@@ -2157,15 +2305,16 @@ impl VaultStore {
     pub fn rollback_v4(&self, service: &str, key: &str, target: &str) -> Result<(), CoreError> {
         let dk = self.require_session()?;
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
-        let mut vault = self.load_v4_for_write(&dk)?;
-        rollback_v4_locked(&mut vault, &dk, service, key, target)?;
-        self.write_v4_unlocked(&mut vault, &dk)
+        let dir = self.v5_for_write(&dk)?;
+        let mut entry = read_entry_log(&dir, &dk, service, key)?;
+        rollback_v4_locked(&mut entry.log, &dk, service, key, target)?;
+        write_entry_log(&dir, &dk, entry, service, key)
     }
 
     /// Roll back an entry to a historical version, dispatched by the
     /// on-disk format inside one exclusive-lock transaction (like `set`).
     ///
-    /// v4 vaults: `target` follows [`Self::rollback_v4`]. Legacy v3
+    /// v5 vaults: `target` follows [`Self::rollback_v4`]. Legacy v3
     /// vaults: `target` is the archived version number (also counted
     /// from the oldest, so a literal `--to N` keeps its meaning across
     /// migration) and the file is written back as v3 — the one v3 write
@@ -2188,32 +2337,35 @@ impl VaultStore {
             VaultContents::V3(mut vault) => {
                 let version: u32 = target.parse().map_err(|_| {
                     CoreError::Secret(
-                        "v3 vaults accept numeric versions only; unlock first to migrate to v4"
+                        "v3 vaults accept numeric versions only; unlock first to migrate"
                             .to_string(),
                     )
                 })?;
                 vault.rollback_with_retention(service, key, version, &dk, retention)?;
                 self.write_vault_file_unlocked(&vault)
             }
-            VaultContents::V4(mut vault) => {
-                vault.verify_mac(&dk)?;
-                rollback_v4_locked(&mut vault, &dk, service, key, target)?;
-                self.write_v4_unlocked(&mut vault, &dk)
+            VaultContents::V5(dir) => {
+                let mut entry = read_entry_log(&dir, &dk, service, key)?;
+                rollback_v4_locked(&mut entry.log, &dk, service, key, target)?;
+                write_entry_log(&dir, &dk, entry, service, key)
             }
         }
     }
 
-    /// Merge operations from the v4 vault file at `source_path` into this
-    /// vault.
+    /// Merge another replica of this vault into it.
     ///
-    /// Transaction shape (design §7): the source is read and fully
-    /// verified (version, same-origin, MAC, per-blob AEAD) from a byte
-    /// snapshot **before** the target's exclusive lock is taken — no
+    /// `source_path` is either a v5 vault (a manifest, with its entries
+    /// directory next to it) or a legacy single-file v4 vault. A replica
+    /// is accepted when it carries the same `vault_id` and verifies under
+    /// the session DK — key slots may differ.
+    ///
+    /// Transaction shape: the source is read and fully verified (MACs and
+    /// every blob) **before** the target's exclusive lock is taken, so no
     /// concurrent `get`/`list`/daemon resolve is blocked by the O(source
-    /// size) verification. Only then is the lock acquired, the target
-    /// re-read and verified, the operation sets unioned, canonicalized,
-    /// and — unless `dry_run` or the merge changed nothing — atomically
-    /// written back. The source file is never modified.
+    /// size) verification. Then the target is read under the lock, the
+    /// operation sets are unioned per entry, and — unless `dry_run` or
+    /// nothing changed — only the changed entry files (and the manifest,
+    /// when key slots changed) are written. The source is never modified.
     ///
     /// `allow_legacy_resurrections` gates entries the merge would
     /// introduce that exist only as pre-v4 operations in the source and
@@ -2223,9 +2375,9 @@ impl VaultStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the session is locked, the source or target is
-    /// not a verified v4 replica of this vault, the merge violates
-    /// integrity rules, or a legacy resurrection is not allowed.
+    /// Returns an error if the session is locked, the source is not a
+    /// verified replica of this vault, the merge violates integrity rules,
+    /// or a legacy resurrection is not allowed.
     pub fn merge_vault_from(
         &self,
         source_path: &Path,
@@ -2234,63 +2386,77 @@ impl VaultStore {
     ) -> Result<MergeReport, CoreError> {
         let dk = self.require_session()?;
 
-        // 1. Source byte snapshot + structural validation (read-only, no
-        //    locks; the file may keep changing underneath — the merge uses
-        //    exactly these verified bytes).
+        // 1. Source: read, structurally validate, and verify under the
+        //    session DK (read-only, no locks).
         let raw = fs::read(source_path).map_err(CoreError::Io)?;
-        let version = detect_vault_version(&raw);
-        if version != 4 {
-            return Err(CoreError::Secret(format!(
-                "source {} is a v{version} vault; merge only accepts v4 — unlock the source copy first to migrate it",
-                source_path.display()
-            )));
-        }
-        let source = VaultFileV4::parse(&raw)?;
         let source_digest = {
             use sha2::Digest as _;
             hex::encode(sha2::Sha256::digest(&raw))
         };
-
-        // 2. Same-origin gate on an unlocked target peek, so an
-        //    independent vault fails with a clear message before any
-        //    source crypto. Re-checked on the locked re-read below.
-        let peek_raw = fs::read(&self.vault_path).map_err(CoreError::Io)?;
-        if detect_vault_version(&peek_raw) != 4 {
-            return Err(CoreError::Secret(
-                "target vault is not v4; run 'kyz vault unlock' to migrate it to v4 before merging"
-                    .to_string(),
-            ));
-        }
-        vault_v4::ensure_same_origin(&VaultFileV4::parse(&peek_raw)?, &source)?;
-
-        // 3. Full source verification with the session DK, before the
-        //    target lock: MAC over all headers and ciphertext, then AEAD
-        //    on every blob.
-        source.verify_mac(&dk)?;
-        for (ck, ops) in &source.entries {
+        let (source_log, source_manifest) = match detect_vault_version(&raw) {
+            5 => {
+                let manifest = Manifest::parse(&raw)?;
+                manifest.verify_mac(&dk).map_err(|_| {
+                    CoreError::Secret(format!(
+                        "source {} is not a replica of this vault (it does not verify under this vault's key)",
+                        source_path.display()
+                    ))
+                })?;
+                let log = VaultDir::new(source_path)
+                    .read_all(&dk, &manifest.vault_id)?
+                    .log;
+                (log, Some(manifest))
+            }
+            4 => {
+                let file = VaultFileV4::parse(&raw)?;
+                file.verify_mac(&dk).map_err(|_| {
+                    CoreError::Secret(format!(
+                        "source {} is not a replica of this vault (it does not verify under this vault's key)",
+                        source_path.display()
+                    ))
+                })?;
+                (file.log, None)
+            }
+            other => {
+                return Err(CoreError::Secret(format!(
+                    "source {} is a v{other} vault; merge accepts v5 vaults and v4 files — unlock the source copy first to migrate it",
+                    source_path.display()
+                )));
+            }
+        };
+        for (ck, ops) in &source_log.entries {
             for op in ops {
-                source.decrypt_op_at(&dk, ck, op)?;
+                source_log.decrypt_op_at(&dk, ck, op)?;
             }
         }
 
-        // 4. Target under its exclusive lock, re-read from disk.
+        // 2. Target under its exclusive lock.
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
-        let raw_target = fs::read(&self.vault_path).map_err(CoreError::Io)?;
-        let target_version = detect_vault_version(&raw_target);
-        if target_version != 4 {
+        let VaultContents::V5(dir) = read_contents_no_lock(&self.vault_path)? else {
+            return Err(CoreError::Secret(
+                "target vault is not v5; run 'kyz vault unlock' to migrate it before merging"
+                    .to_string(),
+            ));
+        };
+        let mut manifest = dir.read_verified_manifest(&dk)?;
+        if manifest.vault_id != source_log.vault_id {
             return Err(CoreError::Secret(format!(
-                "target vault is v{target_version}; run 'kyz vault unlock' to migrate it to v4 before merging"
+                "source vault {} is not a replica of target vault {} (independent vaults cannot be merged)",
+                source_log.vault_id, manifest.vault_id
             )));
         }
-        let mut target = VaultFileV4::parse(&raw_target)?;
-        target.verify_mac(&dk)?;
-        vault_v4::ensure_same_origin(&target, &source)?;
+        let target = dir.read_all(&dk, &manifest.vault_id)?;
 
-        // 5. Union + canonicalize + report.
-        let mut report = vault_v4::merge_ops(&mut target, &source, &dk)?;
+        // 3. Union + report.
+        let mut merged = target.log.clone();
+        let mut report = vault_v4::merge_ops(&mut merged, &source_log, &dk)?;
         report.source_digest = source_digest;
+        if let Some(source_manifest) = &source_manifest {
+            report.keyslots_changed = manifest.merge_from(source_manifest)?;
+            report.changed |= report.keyslots_changed;
+        }
 
-        // 6. Legacy resurrection gate: refuse the write unless the caller
+        // 4. Legacy resurrection gate: refuse the write unless the caller
         //    explicitly accepts entries that may have been deleted in v3.
         if !dry_run && !allow_legacy_resurrections && !report.legacy_resurrections.is_empty() {
             return Err(CoreError::Secret(format!(
@@ -2300,23 +2466,27 @@ impl VaultStore {
             )));
         }
 
-        // 7. Write back (never in dry-run; never when nothing changed).
+        // 5. Write back only what changed (never in dry-run).
         if !dry_run && report.changed {
-            self.write_v4_unlocked(&mut target, &dk)?;
+            vault_v5::write_changed(&dir, &target, &merged, &dk)?;
+            if report.keyslots_changed {
+                dir.write_manifest(&mut manifest, &dk)?;
+            }
         }
         Ok(report)
     }
 }
 
 /// Draw the next counter for this machine's actor on this vault, floored
-/// by the largest counter already present in the file (so a lost
-/// actor-state file can never re-issue ids).
+/// by the largest counter already present in the entry being written (so
+/// a lost actor-state file can never re-issue an id within that entry;
+/// op ids only need to be unique per entry).
 ///
-/// A v4 write must not hard-fail just because the global state directory
+/// A write must not hard-fail just because the global state directory
 /// is unusable (read-only home, stripped service account): in that case an
 /// ephemeral in-process actor takes over, whose random 16-byte id keeps
 /// op-id collisions negligible.
-fn allocate_op_id(vault: &VaultFileV4) -> Result<OpId, CoreError> {
+fn allocate_op_id(vault: &OpLog) -> Result<OpId, CoreError> {
     let ephemeral_actor =
         || ActorState::ephemeral().map_err(|e| CoreError::Secret(format!("ephemeral actor: {e}")));
     let mut actor = match crate::paths::default_state_dir() {
@@ -2360,17 +2530,17 @@ fn resolve_rollback_target<'a>(target: &str, items: &'a [HistoryItem]) -> Option
     }
 }
 
-/// Core of [`VaultStore::rollback_v4`] (also the v4 arm of
+/// Core of [`VaultStore::rollback_v4`] (also the v5 arm of
 /// [`VaultStore::rollback`]): resolve `target` against the entry's
 /// history and append the restoring put. The caller holds the exclusive
-/// vault lock, has MAC-verified `vault`, and writes the file.
+/// vault lock and writes the entry.
 ///
 /// # Errors
 ///
 /// Returns an error if the target cannot be resolved or its ciphertext
 /// was pruned.
 fn rollback_v4_locked(
-    vault: &mut VaultFileV4,
+    vault: &mut OpLog,
     dk: &Zeroizing<[u8; DK_LEN]>,
     service: &str,
     key: &str,
@@ -2381,7 +2551,7 @@ fn rollback_v4_locked(
             "invalid rollback target '{target}': expected <seq> or <actor:counter>"
         )));
     }
-    let ck = VaultFileV4::compound_key(service, key);
+    let ck = OpLog::compound_key(service, key);
     let ops = vault.ops(service, key).ok_or_else(|| {
         CoreError::SecretNotFound(format!("secret '{key}' not found in service '{service}'"))
     })?;
@@ -2762,7 +2932,15 @@ mod tests {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        std::env::temp_dir().join(format!("kyz-{label}-{}-{nanos}.json", std::process::id()))
+        let dir = std::env::temp_dir().join(format!("kyz-{label}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp vault dir");
+        dir.join("vault.json")
+    }
+
+    fn remove_temp_vault(vault_path: &Path) {
+        if let Some(dir) = vault_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// OS keyrings do not reliably serialize concurrent access from
@@ -2854,7 +3032,7 @@ mod tests {
         assert!(missing.is_err());
 
         let _ = store.lock();
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -2879,7 +3057,7 @@ mod tests {
             !vault_path.with_extension("json.lock").exists(),
             "steady-state v3 unlock must not serialize on the vault lock"
         );
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -2953,7 +3131,7 @@ mod tests {
         assert_eq!(fetched.value(), Some("value-2"));
 
         let _ = store.lock();
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3018,7 +3196,7 @@ mod tests {
         assert_eq!(items.len(), 5);
 
         let _ = store.lock();
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3057,7 +3235,7 @@ mod tests {
         assert_eq!(items[0].role, vault_v4::HistoryRole::Current);
 
         let _ = store.lock();
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3071,7 +3249,7 @@ mod tests {
             assert!(err.to_string().contains("Weak vault passphrase rejected"));
         }
 
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3093,13 +3271,13 @@ mod tests {
         let raw = std::fs::read(&vault_path)
             .map_err(|e| format!("read vault failed: {e}"))
             .expect("vault file should be readable");
-        let parsed: VaultFileV2 = serde_json::from_slice(&raw)
-            .map_err(|e| format!("parse vault failed: {e}"))
-            .expect("vault should parse as v2 json");
+        let parsed = Manifest::parse(&raw)
+            .map_err(|e| format!("parse manifest failed: {e}"))
+            .expect("vault should parse as a v5 manifest");
         assert!(parsed.passphrase_policy_checked);
 
         let _ = store.lock();
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3173,7 +3351,7 @@ mod tests {
             panic!("in-memory unlock must not write the DK to the keyring: {stored}");
         }
 
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3202,7 +3380,7 @@ mod tests {
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains(passphrase));
 
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3240,7 +3418,7 @@ mod tests {
         assert_eq!(uv.get("app", "key").expect("get v2").value(), Some("v2"));
 
         let _ = store.lock();
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3279,7 +3457,7 @@ mod tests {
             .expect("empty field list should resolve to empty map");
         assert!(resolved.is_empty());
 
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 
     #[test]
@@ -3321,9 +3499,9 @@ mod tests {
             .expect("unlock thread should not panic");
 
         let raw = std::fs::read(&vault_path).expect("read migrated vault");
-        assert_eq!(detect_vault_version(&raw), 4, "vault should now be v4");
+        assert_eq!(detect_vault_version(&raw), 5, "vault should now be v5");
         assert_eq!(uv.get("app", "key").expect("get").value(), Some("v2-value"));
 
-        let _ = std::fs::remove_file(&vault_path);
+        remove_temp_vault(&vault_path);
     }
 }

@@ -4,7 +4,7 @@
     clippy::cast_precision_loss,
     reason = "benchmark binary: aborting on setup failure and printing results is the point"
 )]
-//! Growth and latency benchmark for the v4 vault format (trx-dgqe.2).
+//! Growth and latency benchmark for the vault format (trx-dgqe.2).
 //!
 //! Builds a throwaway vault with `ENTRIES` entries, then rewrites every
 //! entry `VERSIONS - 1` more times, reporting file size and per-op latency
@@ -14,10 +14,11 @@
 //! cargo run --release -p kyz-core --example vault_bench -- 1000 50 200
 //! ```
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kyz_core::store::{SecretEntry, SecretStore as _, VaultStore};
+use kyz_core::vault_v5::entries_dir_for;
 
 const PASS: &str = "a-very-strong-passphrase-123";
 
@@ -32,8 +33,26 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn size_mb(path: &PathBuf) -> f64 {
-    std::fs::metadata(path).map_or(0.0, |m| m.len() as f64 / 1_048_576.0)
+/// Total size of the manifest plus every entry file.
+fn size_mb(path: &Path) -> f64 {
+    let manifest = std::fs::metadata(path).map_or(0, |m| m.len());
+    let entries: u64 = std::fs::read_dir(entries_dir_for(path)).map_or(0, |dir| {
+        dir.filter_map(Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum()
+    });
+    (manifest + entries) as f64 / 1_048_576.0
+}
+
+fn copy_vault(from: &Path, to: &Path) {
+    std::fs::copy(from, to).expect("copy manifest");
+    let (src, dst) = (entries_dir_for(from), entries_dir_for(to));
+    std::fs::create_dir_all(&dst).expect("replica entries dir");
+    for item in std::fs::read_dir(src).expect("read entries") {
+        let item = item.expect("entry");
+        std::fs::copy(item.path(), dst.join(item.file_name())).expect("copy entry");
+    }
 }
 
 fn value(i: usize, v: usize) -> String {
@@ -86,8 +105,10 @@ fn main() {
         }
     }
 
-    let replica = dir.path().join("replica.json");
-    std::fs::copy(&path, &replica).expect("copy replica");
+    let replica_dir = dir.path().join("replica");
+    std::fs::create_dir_all(&replica_dir).expect("replica dir");
+    let replica = replica_dir.join("vault.json");
+    copy_vault(&path, &replica);
 
     let t = Instant::now();
     for i in 0..deletes {

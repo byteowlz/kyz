@@ -259,8 +259,12 @@ enum VaultCommand {
     Lock,
     /// Show vault status.
     Status,
-    /// Merge operations from another replica of this vault (v4).
+    /// Merge another replica of this vault (a v5 vault or a v4 file).
     Merge(VaultMergeCommand),
+    /// Change the vault passphrase (key material of other slots is kept).
+    Passwd,
+    /// List the vault's key slots (no key material).
+    Slots,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -279,7 +283,8 @@ struct VaultUnlockCommand {
 
 #[derive(Debug, Clone, Args)]
 struct VaultMergeCommand {
-    /// Path to a v4 replica of this vault (e.g. a Syncthing conflict copy).
+    /// Path to a replica of this vault: its `vault.json` (entries are read
+    /// from the sibling `vault.entries/`), or a legacy single-file v4 vault.
     #[arg(value_name = "PATH")]
     source: PathBuf,
 }
@@ -749,6 +754,8 @@ fn handle_vault(ctx: &RuntimeContext, command: VaultCommand) -> Result<()> {
         VaultCommand::Lock => handle_vault_lock(ctx),
         VaultCommand::Status => handle_vault_status(ctx),
         VaultCommand::Merge(cmd) => handle_vault_merge(ctx, &cmd),
+        VaultCommand::Passwd => handle_vault_passwd(ctx),
+        VaultCommand::Slots => handle_vault_slots(ctx),
     }
 }
 
@@ -872,6 +879,7 @@ fn merge_report_json(report: &kyz_core::MergeReport, dry_run: bool) -> serde_jso
         "legacy_resurrections": report.legacy_resurrections,
         "updated_entries": report.updated_entries,
         "deleted_entries": report.deleted_entries,
+        "keyslots_changed": report.keyslots_changed,
         "conflicts": report
             .conflicts
             .iter()
@@ -947,6 +955,9 @@ fn handle_vault_merge(ctx: &RuntimeContext, cmd: &VaultMergeCommand) -> Result<(
     for entry in &report.deleted_entries {
         println!("  deleted (wins):   {entry}");
     }
+    if report.keyslots_changed {
+        println!("  key slots:        updated from the source manifest");
+    }
     for conflict in &report.conflicts {
         println!(
             "  conflict:         {} kept {} (losing: {})",
@@ -972,6 +983,73 @@ fn handle_vault_merge(ctx: &RuntimeContext, cmd: &VaultMergeCommand) -> Result<(
         println!(
             "Source left untouched at {}; remove or archive it once satisfied.",
             cmd.source.display()
+        );
+    }
+    Ok(())
+}
+
+fn handle_vault_passwd(ctx: &RuntimeContext) -> Result<()> {
+    let store = ctx.vault_store()?;
+    // Piped stdin carries two lines: the current passphrase, then the new
+    // one (no confirmation, matching `vault create` for scripted use).
+    let (current, new) = if io::stdin().is_terminal() {
+        let current = prompt_passphrase("Current vault passphrase: ")?;
+        (current, prompt_new_passphrase()?)
+    } else {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading passphrases from stdin")?;
+        let mut lines = buf.lines();
+        match (lines.next(), lines.next()) {
+            (Some(current), Some(new)) if !new.is_empty() => (current.to_string(), new.to_string()),
+            _ => {
+                return Err(anyhow!(
+                    "expected two lines on stdin: current passphrase, new passphrase"
+                ));
+            }
+        }
+    };
+    store
+        .change_passphrase(&current, &new)
+        .map_err(|e| anyhow!("{e}"))?;
+    if !ctx.common.quiet {
+        println!("Passphrase changed for {}", store.vault_path().display());
+        println!(
+            "Other replicas pick up the change on their next `kyz vault merge` or synced unlock; older copies of vault.json still open with the old passphrase."
+        );
+    }
+    Ok(())
+}
+
+fn handle_vault_slots(ctx: &RuntimeContext) -> Result<()> {
+    let store = ctx.vault_store()?;
+    let slots = store.key_slots().map_err(|e| anyhow!("{e}"))?;
+    if ctx.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&slots).context("serializing key slots")?
+        );
+        return Ok(());
+    }
+    if ctx.common.yaml {
+        println!(
+            "{}",
+            serde_yaml::to_string(&slots).context("serializing key slots")?
+        );
+        return Ok(());
+    }
+    for slot in slots {
+        let state = slot
+            .removed_at
+            .map_or_else(|| "active".to_string(), |t| format!("removed at {t}"));
+        println!(
+            "{}  {:?}  {}  created {}  {}",
+            slot.id,
+            slot.kind,
+            slot.label.as_deref().unwrap_or("-"),
+            slot.created_at,
+            state
         );
     }
     Ok(())
@@ -1378,8 +1456,9 @@ fn handle_scan(ctx: &RuntimeContext, cmd: &ScanCommand) -> Result<()> {
         kyz_core::VaultContents::V3(vault) => {
             scan::build_secret_index(&vault, &dk).map_err(|e| anyhow!("{e}"))?
         }
-        kyz_core::VaultContents::V4(vault) => {
-            scan::build_secret_index_v4(&vault, &dk).map_err(|e| anyhow!("{e}"))?
+        kyz_core::VaultContents::V5(_) => {
+            let log = store.load_log().map_err(|e| anyhow!("{e}"))?;
+            scan::build_secret_index_v4(&log, &dk).map_err(|e| anyhow!("{e}"))?
         }
     };
 

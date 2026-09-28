@@ -714,16 +714,24 @@ impl ProxyFixture {
     /// Replace the fixture secret's token field in the on-disk vault,
     /// simulating `kyz set` while the daemon runs (live re-read).
     ///
-    /// Handles both the pre-migration v3 fixture file and the v4 file the
+    /// Handles both the pre-migration v3 fixture file and the v5 vault the
     /// daemon's first unlock leaves on disk.
     pub fn update_vault_secret(&self, new_value: &str) {
-        use kyz_core::vault_v4::{Hlc, OpId, VaultFileV4};
+        use kyz_core::vault_v4::{Hlc, OpId, OpLog};
+        use kyz_core::vault_v5::{Manifest, VaultDir};
 
         let passphrase = SecretString::from(FIXTURE_PASSPHRASE.to_string());
         let raw = std::fs::read(&self.fixture.vault_path).expect("read vault");
-        if kyz_core::store::detect_vault_version(&raw) == 4 {
-            let mut vault = VaultFileV4::parse(&raw).expect("parse v4 vault");
-            let dk = vault.unwrap_dk(&passphrase).expect("unwrap dk");
+        if kyz_core::store::detect_vault_version(&raw) == 5 {
+            let manifest = Manifest::parse(&raw).expect("parse manifest");
+            let (_, dk) = manifest.unwrap_dk(&passphrase).expect("unwrap dk");
+            let dir = VaultDir::new(&self.fixture.vault_path);
+            let ck = OpLog::compound_key("app", "api");
+            let read = dir
+                .read_entry(&dk, &manifest.vault_id, &ck)
+                .expect("read entry");
+            let mut vault = OpLog::new(&manifest.vault_id);
+            vault.entries.insert(ck.clone(), read.ops);
             // Overlay the new field on the current snapshot, exactly like
             // `kyz set` does, then append a fresh put on the frontier.
             let mut snapshot = vault
@@ -742,19 +750,13 @@ impl ProxyFixture {
                 .map_or_else(Vec::new, |f| f.into_iter().collect());
             let id = OpId::new(fixture_actor, vault.max_counter_of(fixture_actor) + 1)
                 .expect("fixture op id");
+            let changed_at = Hlc::tick(Some(vault.max_hlc()));
             vault
-                .append_put(
-                    &snapshot,
-                    id,
-                    parents,
-                    Hlc::tick(Some(vault.max_hlc())),
-                    &dk,
-                )
+                .append_put(&snapshot, id, parents, changed_at, &dk)
                 .expect("append put");
-            vault.finalize(&dk).expect("finalize");
-            let serialized = serde_json::to_string_pretty(&vault).expect("serialize vault");
-            kyz_core::atomic::write_atomic(&self.fixture.vault_path, serialized.as_bytes())
-                .expect("write vault");
+            let ops = vault.entries.remove(&ck).unwrap_or_default();
+            dir.write_entry(&dk, &manifest.vault_id, &ck, ops, &read.absorbed)
+                .expect("write entry");
             return;
         }
         let mut vault: kyz_core::vault_v3::VaultFileV3 =

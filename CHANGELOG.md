@@ -6,7 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **Vault format v4 — entry-level multi-replica merging** (`crates/kyz-core/src/vault_v4.rs`):
+- **Vault format v5 — one file per entry, mergeable key slots** (`crates/kyz-core/src/vault_v5.rs`):
+  - `vault.json` becomes a small manifest (vault id, key slots, MAC); entries live in `vault.entries/<id>.json`, one file per entry, each with its own MAC bound to its file name. `get`/`set`/`delete` read one entry file, so latency no longer grows with vault size (1000 entries × 10 versions: `set` 127 ms → 1.2 ms, `get` 85 ms → 0.9 ms; `just bench-vault`).
+  - Entry file names are keyed hashes of `service/key`; service and key names are stored encrypted.
+  - Key slots: the DK is wrapped once per slot. Replicas are identified by `vault_id` plus proof of the same DK, so replicas with different slots still merge; slot sets merge as a union where removal wins. `kyz vault passwd` changes the passphrase (new slot, old slot removed); `kyz vault slots` lists slots.
+  - Sync conflict copies (`<id>.sync-conflict-….json`, `vault.sync-conflict-….json`) are read immediately, folded in on the next write of the entry or on unlock, and removed; unverifiable copies are ignored and kept.
+  - `kyz vault merge` accepts a v5 vault or a legacy single-file v4 vault and writes only changed entry files.
+  - Workspace-vault trust pins the manifest, so writes no longer require re-confirmation.
+- **Operation-log merging (from the v4 design)** (`crates/kyz-core/src/vault_v4.rs`):
   - Every entry write becomes an operation (`put`/`delete`) with a globally unique id (`actor_id + counter`), causal parents (the observed frontier), and an HLC timestamp. The current entry state is a deterministic projection of the operation log: concurrent delete wins over concurrent puts; concurrent puts resolve by `(changed_at, id)` with losers visible in history.
   - `kyz vault merge <PATH>` merges a v4 replica (e.g. a Syncthing conflict copy) into the current vault. Reports new/updated/deleted entries and conflict versions (`--json`/`--yaml`, `--dry-run` supported); repeated merges of the same content write nothing.
   - All vault writes now use crash-safe atomic replacement (same-directory temp file + fsync + rename) and every file carries an HMAC-SHA256 over the canonical body, keyed via domain-separated HKDF from the DK. Merging refuses foreign vaults, tampered files, or blobs that fail AEAD.
@@ -15,9 +22,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- New vaults are created as v4. Unlocking migrates v1/v2/v3 vaults to v4 in the exclusive-lock transaction, preserving kdf, wrapped DK, and passphrase; migration ids derive deterministically from pre-migration data, so forked v3 copies migrating on different machines deduplicate their shared history on merge.
+- New vaults are created as v5. Unlocking migrates v1/v2/v3 and single-file v4 vaults to v5 in the exclusive-lock transaction, preserving the DK and passphrase (the existing kdf/wrapped DK become the first key slot); migration ids derive deterministically from pre-migration data, so forked v3 copies migrating on different machines deduplicate their shared history on merge.
 - `kyz history` lists operations with stable op ids (`actor:counter`) and roles (current / conflict / ancestor / tombstone); `kyz rollback --to` accepts a sequence number (counted from the oldest operation, matching v3 version numbers so a literal `--to N` keeps its meaning across migration) or an op id and always creates a new write. Version dispatch for history/rollback moved into the store (`VaultStore::history` returning `HistoryView`, `VaultStore::rollback`), one locked read/write transaction per command; the v3-specific `read_vault_file_pub`/`write_vault_file_pub`/`detect_format` APIs were removed from `kyz-core`.
-- `kyz set` and `kyz delete` on a legacy v3 vault now upgrade the file to v4 inside the same write transaction (a failed delete of a missing entry still writes nothing); rolling back a v3 vault keeps the v3 format until the next unlock/set/delete migrates it.
+- `kyz set` and `kyz delete` on a legacy v3 vault now upgrade it to v5 inside the same write transaction (a failed delete of a missing entry still writes nothing); rolling back a v3 vault keeps the v3 format until the next unlock/set/delete migrates it.
 - `kyz set` on a deleted entry now fails unless `--yes` is passed (explicit rebuild from exactly the provided fields; previous values are not recoverable). `kyz import` honors the same flag to recreate tombstoned entries from a backup.
 - `kyz vault merge` refuses, without `--yes`, merges that would introduce entries existing only in the source's pre-v4 history and absent from the target: v3-era deletions leave no tombstone, so those entries may be secrets deleted before migration. Dry-run reports them as `legacy_resurrections`.
 - `history_retention` no longer trims stored history for v4 vaults; it only limits display (old replicas may re-deliver pruned versions, so the operation log is kept).

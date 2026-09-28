@@ -13,7 +13,7 @@ use secrecy::ExposeSecret as _;
 use crate::error::CoreError;
 use crate::store::SecretEntry;
 use crate::vault_v3::{DK_LEN, VaultFileV3, decrypt_entry_v3};
-use crate::vault_v4::VaultFileV4;
+use crate::vault_v4::OpLog;
 
 /// A match found during scanning.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -76,8 +76,11 @@ pub fn build_secret_index(
     Ok(index)
 }
 
-/// Build the scan index from a v4 vault: every visible entry's winning
-/// snapshot (conflict losers and pruned snapshots are not live values).
+/// Build the scan index from a vault's operation log.
+///
+/// Indexes every visible entry's winning snapshot (conflict losers and
+/// pruned snapshots are not live values). The log must come from a
+/// verified read ([`crate::store::VaultStore::load_log`]).
 ///
 /// Hidden entries (delete-wins tombstones) are skipped — they hold no
 /// live values — but every other failure is loud: a scan that silently
@@ -86,16 +89,15 @@ pub fn build_secret_index(
 ///
 /// # Errors
 ///
-/// Returns an error if the vault fails verification, projection, or the
-/// winning snapshot of any visible entry fails to decrypt.
+/// Returns an error if projection fails or the winning snapshot of any
+/// visible entry fails to decrypt.
 pub fn build_secret_index_v4(
-    vault: &VaultFileV4,
+    vault: &OpLog,
     dk: &[u8; DK_LEN],
 ) -> Result<BTreeMap<String, String>, CoreError> {
-    vault.verify_mac(dk)?;
     let mut index: BTreeMap<String, String> = BTreeMap::new();
     for ck in vault.entries.keys() {
-        let Some((service, key)) = VaultFileV4::split_compound_key(ck) else {
+        let Some((service, key)) = OpLog::split_compound_key(ck) else {
             continue;
         };
         // One causal walk per entry: `decrypt_current` reports hidden

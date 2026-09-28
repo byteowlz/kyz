@@ -31,10 +31,15 @@ fn temp_vault_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    std::env::temp_dir().join(format!(
-        "kyz-test-{label}-{}-{nanos}.json",
-        std::process::id()
-    ))
+    let dir = std::env::temp_dir().join(format!("kyz-test-{label}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp vault dir");
+    dir.join("vault.json")
+}
+
+fn remove_temp_vault(vault_path: &std::path::Path) {
+    if let Some(dir) = vault_path.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 const fn strong_passphrase() -> &'static str {
@@ -54,9 +59,9 @@ fn setup_vault(label: &str) -> (VaultStore, PathBuf) {
     (store, vault_path)
 }
 
-fn cleanup(store: &VaultStore, vault_path: &PathBuf) {
+fn cleanup(store: &VaultStore, vault_path: &std::path::Path) {
     let _ = store.lock();
-    let _ = std::fs::remove_file(vault_path);
+    remove_temp_vault(vault_path);
 }
 
 #[test]
@@ -457,7 +462,7 @@ fn vault_store_init_creates_file() {
         .expect("init should succeed");
     assert!(vault_path.exists());
 
-    let _ = std::fs::remove_file(&vault_path);
+    remove_temp_vault(&vault_path);
 }
 
 #[test]
@@ -466,7 +471,7 @@ fn vault_store_init_rejects_weak_passphrase() {
     let store = VaultStore::new(vault_path.clone());
     let result = store.init("abc", false);
     assert!(result.is_err());
-    let _ = std::fs::remove_file(&vault_path);
+    remove_temp_vault(&vault_path);
 }
 
 #[test]
@@ -479,7 +484,7 @@ fn vault_store_init_no_overwrite_without_force() {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("already exists"));
 
-    let _ = std::fs::remove_file(&vault_path);
+    remove_temp_vault(&vault_path);
 }
 
 #[test]
@@ -611,7 +616,7 @@ fn vault_store_unlock_wrong_passphrase() {
     let result = store.unlock("wrong-passphrase-entirely", 60);
     assert!(result.is_err());
 
-    let _ = std::fs::remove_file(&vault_path);
+    remove_temp_vault(&vault_path);
 }
 
 #[test]
@@ -687,7 +692,7 @@ fn vault_store_status_lifecycle() {
     assert!(status.exists);
     assert!(!status.unlocked);
 
-    let _ = std::fs::remove_file(&vault_path);
+    remove_temp_vault(&vault_path);
 }
 
 #[test]
@@ -852,39 +857,41 @@ fn resolve_with_env_ignores_hint_without_workspace_vault() {
 }
 
 #[test]
-fn vault_store_init_writes_v4_on_disk() {
-    let vault_path = temp_vault_path("v4-on-disk");
+fn vault_store_init_writes_v5_on_disk() {
+    let vault_path = temp_vault_path("v5-on-disk");
     let store = VaultStore::new(vault_path.clone());
     store.init(strong_passphrase(), false).expect("init");
 
     let bytes = std::fs::read(&vault_path).expect("read vault file");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
-    assert_eq!(value["version"], 4, "newly-initialized vault should be v4");
+    assert_eq!(value["version"], 5, "newly-initialized vault should be v5");
     assert!(
         value.get("vault_id").is_some(),
-        "v4 vault must contain a vault id"
+        "manifest must contain a vault id"
     );
-    assert!(
-        value.get("kdf").is_some(),
-        "v4 vault must contain kdf header"
-    );
-    assert!(
-        value.get("wrapped_dk").is_some(),
-        "v4 vault must contain wrapped_dk header"
-    );
+    let slots = value["keyslots"]
+        .as_object()
+        .expect("manifest must carry key slots");
+    assert_eq!(slots.len(), 1, "a new vault has exactly one key slot");
+    let slot = slots.values().next().expect("slot");
+    assert!(slot.get("kdf").is_some() && slot.get("wrapped_dk").is_some());
     assert!(
         value
             .get("mac")
             .and_then(serde_json::Value::as_str)
             .is_some(),
-        "v4 vault must carry an authenticating MAC"
+        "manifest must carry an authenticating MAC"
+    );
+    assert!(
+        kyz_core::vault_v5::entries_dir_for(&vault_path).is_dir(),
+        "init must create the entries directory"
     );
 
-    let _ = std::fs::remove_file(&vault_path);
+    remove_temp_vault(&vault_path);
 }
 
 #[test]
-fn vault_store_unlock_migrates_v2_to_v4() {
+fn vault_store_unlock_migrates_v2_to_v5() {
     let vault_path = temp_vault_path("migrate-v2");
     let pass = SecretString::from(strong_passphrase().to_string());
 
@@ -895,7 +902,7 @@ fn vault_store_unlock_migrates_v2_to_v4() {
     let json = serde_json::to_vec_pretty(&v2).expect("serialize v2");
     std::fs::write(&vault_path, &json).expect("write v2 file");
 
-    // Unlock should auto-migrate V2 → V4.
+    // Unlock should auto-migrate V2 → V5.
     let store = VaultStore::new(vault_path.clone());
     store.unlock(strong_passphrase(), 60).expect("unlock");
 
@@ -905,7 +912,7 @@ fn vault_store_unlock_migrates_v2_to_v4() {
 
     let bytes = std::fs::read(&vault_path).expect("read vault file");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
-    assert_eq!(value["version"], 4, "vault should be v4 after migration");
+    assert_eq!(value["version"], 5, "vault should be v5 after migration");
 
     cleanup(&store, &vault_path);
 }

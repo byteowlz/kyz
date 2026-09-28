@@ -303,13 +303,32 @@ impl fmt::Debug for SnapshotPlain {
     }
 }
 
-/// Vault file format v4: entry operation logs plus an authenticating MAC.
+/// The operation log of one vault, keyed by compound `service/key`.
+///
+/// This is the storage-independent core of the v4 model — projection, history, merge and canonicalization all work on
+/// it — whether it was read from a single v4 file or assembled from
+/// per-entry v5 files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpLog {
+    /// Stable vault identity (shared by all replicas of one vault).
+    pub vault_id: String,
+    /// Operation logs per `"service/key"`, each sorted by op id.
+    #[serde(default)]
+    pub entries: BTreeMap<String, Vec<Op>>,
+}
+
+/// Legacy single-file vault format v4.
+///
+/// The whole operation log plus key material and an authenticating MAC
+/// in one file. Superseded by the v5
+/// directory layout; still parsed so v4 files can be migrated and merged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultFileV4 {
     /// Schema version. Always 4.
     pub version: u32,
-    /// Stable vault identity (shared by all replicas of one vault).
-    pub vault_id: String,
+    /// Vault identity and operation logs.
+    #[serde(flatten)]
+    pub log: OpLog,
     /// KDF parameters (unchanged from v3).
     pub kdf: KdfParams,
     /// DK wrapped under the passphrase KEK (unchanged from v3).
@@ -317,12 +336,35 @@ pub struct VaultFileV4 {
     /// Whether passphrase strength policy has already been checked.
     #[serde(default = "default_true")]
     pub passphrase_policy_checked: bool,
-    /// Operation logs per `"service/key"`, each sorted by op id.
-    #[serde(default)]
-    pub entries: BTreeMap<String, Vec<Op>>,
     /// Hex HMAC-SHA256 over the canonical serialization of everything else.
     #[serde(default)]
     pub mac: String,
+}
+
+/// Borrowed legacy-ordered serialization of [`VaultFileV4`].
+#[derive(Serialize)]
+struct LegacyView<'a> {
+    version: u32,
+    vault_id: &'a str,
+    kdf: &'a KdfParams,
+    wrapped_dk: &'a str,
+    passphrase_policy_checked: bool,
+    entries: &'a BTreeMap<String, Vec<Op>>,
+    mac: &'a str,
+}
+
+impl std::ops::Deref for VaultFileV4 {
+    type Target = OpLog;
+
+    fn deref(&self) -> &OpLog {
+        &self.log
+    }
+}
+
+impl std::ops::DerefMut for VaultFileV4 {
+    fn deref_mut(&mut self) -> &mut OpLog {
+        &mut self.log
+    }
 }
 
 const fn default_true() -> bool {
@@ -575,9 +617,86 @@ pub(crate) fn validate_hex_id(label: &str, id: &str, len: usize) -> Result<(), C
     Ok(())
 }
 
-impl VaultFileV4 {
-    /// Current schema version.
-    pub const CURRENT_VERSION: u32 = 4;
+impl OpLog {
+    /// Create an empty log for `vault_id`.
+    #[must_use]
+    pub fn new(vault_id: &str) -> Self {
+        Self {
+            vault_id: vault_id.to_string(),
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Structural validation of every entry log without the DK: op id
+    /// encodings, parent resolution, duplicate-id content equality, and
+    /// cycle-freedom (cycles surface through the frontier computation).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing the first violation found.
+    pub fn validate_entries(&self) -> Result<(), CoreError> {
+        validate_hex_id("vault_id", &self.vault_id, VAULT_ID_LEN)?;
+        for (ck, ops) in &self.entries {
+            let mut seen: BTreeMap<OpId, &Op> = BTreeMap::new();
+            for op in ops {
+                op.id.validate()?;
+                if let Some(prev) = seen.get(&op.id) {
+                    if !prev.header_eq(op) || prev.blob != op.blob {
+                        return Err(CoreError::Secret(format!(
+                            "duplicate op id {} with different content in entry '{ck}'",
+                            op.id
+                        )));
+                    }
+                } else {
+                    seen.insert(op.id.clone(), op);
+                }
+                let mut parents: BTreeSet<&OpId> = BTreeSet::new();
+                for parent in &op.parents {
+                    if !parents.insert(parent) {
+                        return Err(CoreError::Secret(format!(
+                            "duplicate parent {} on op {}",
+                            parent, op.id
+                        )));
+                    }
+                }
+                match op.kind {
+                    OpKind::Delete => {
+                        if op.meta.is_some() || op.blob.is_some() {
+                            return Err(CoreError::Secret(format!(
+                                "delete op {} must not carry metadata or a blob",
+                                op.id
+                            )));
+                        }
+                    }
+                    OpKind::Put => {
+                        if op.meta.is_none() {
+                            return Err(CoreError::Secret(format!(
+                                "put op {} is missing its metadata projection",
+                                op.id
+                            )));
+                        }
+                    }
+                }
+            }
+            // Parent resolution against the full op set: ids sort by
+            // actor/counter, not causality, so a parent may legitimately
+            // appear later in the list. The graph walk below then rejects
+            // unresolvable parents and cycles.
+            let all_ids: BTreeSet<&OpId> = ops.iter().map(|op| &op.id).collect();
+            for op in ops {
+                for parent in &op.parents {
+                    if !all_ids.contains(&parent) {
+                        return Err(CoreError::Secret(format!(
+                            "op {} in entry '{ck}' references unknown parent {parent}",
+                            op.id
+                        )));
+                    }
+                }
+            }
+            frontier(ops)?;
+        }
+        Ok(())
+    }
 
     /// Percent-escape `/` and `%` so a compound key splits unambiguously
     /// at the first `/` even when the service name itself contains one
@@ -643,166 +762,6 @@ impl VaultFileV4 {
             .map(|(svc, key)| (Self::unescape_key_part(svc), Self::unescape_key_part(key)))
     }
 
-    /// Assemble a v4 file from existing identity parts (used by `create`
-    /// and by the v3 migration; the MAC is not yet computed).
-    #[must_use]
-    pub fn new_unfinalized(vault_id: &str, kdf: KdfParams, wrapped_dk: &str) -> Self {
-        Self {
-            version: Self::CURRENT_VERSION,
-            vault_id: vault_id.to_string(),
-            kdf,
-            wrapped_dk: wrapped_dk.to_string(),
-            passphrase_policy_checked: true,
-            entries: BTreeMap::new(),
-            mac: String::new(),
-        }
-    }
-
-    /// Structural validation without the DK: header fields, op id encodings,
-    /// parent resolution, duplicate-id content equality, and cycle-freedom
-    /// (cycles surface through the frontier computation).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error describing the first violation found.
-    pub fn validate_structure(&self) -> Result<(), CoreError> {
-        if self.version != Self::CURRENT_VERSION {
-            return Err(CoreError::Secret(format!(
-                "unsupported vault format version {}",
-                self.version
-            )));
-        }
-        validate_hex_id("vault_id", &self.vault_id, VAULT_ID_LEN)?;
-        self.kdf.validate_params()?;
-        for (ck, ops) in &self.entries {
-            let mut seen: BTreeMap<OpId, &Op> = BTreeMap::new();
-            for op in ops {
-                op.id.validate()?;
-                if let Some(prev) = seen.get(&op.id) {
-                    if !prev.header_eq(op) || prev.blob != op.blob {
-                        return Err(CoreError::Secret(format!(
-                            "duplicate op id {} with different content in entry '{ck}'",
-                            op.id
-                        )));
-                    }
-                } else {
-                    seen.insert(op.id.clone(), op);
-                }
-                let mut parents: BTreeSet<&OpId> = BTreeSet::new();
-                for parent in &op.parents {
-                    if !parents.insert(parent) {
-                        return Err(CoreError::Secret(format!(
-                            "duplicate parent {} on op {}",
-                            parent, op.id
-                        )));
-                    }
-                }
-                match op.kind {
-                    OpKind::Delete => {
-                        if op.meta.is_some() || op.blob.is_some() {
-                            return Err(CoreError::Secret(format!(
-                                "delete op {} must not carry metadata or a blob",
-                                op.id
-                            )));
-                        }
-                    }
-                    OpKind::Put => {
-                        if op.meta.is_none() {
-                            return Err(CoreError::Secret(format!(
-                                "put op {} is missing its metadata projection",
-                                op.id
-                            )));
-                        }
-                    }
-                }
-            }
-            // Parent resolution against the full op set: ids sort by
-            // actor/counter, not causality, so a parent may legitimately
-            // appear later in the list. The graph walk below then rejects
-            // unresolvable parents and cycles.
-            let all_ids: BTreeSet<&OpId> = ops.iter().map(|op| &op.id).collect();
-            for op in ops {
-                for parent in &op.parents {
-                    if !all_ids.contains(&parent) {
-                        return Err(CoreError::Secret(format!(
-                            "op {} in entry '{ck}' references unknown parent {parent}",
-                            op.id
-                        )));
-                    }
-                }
-            }
-            frontier(ops)?;
-        }
-        Ok(())
-    }
-
-    /// Canonical MAC body: the file serialized compactly with an empty
-    /// `mac` field. Field order is fixed by the struct definition and all
-    /// maps are ordered, so this is byte-stable for equal op sets.
-    fn mac_body_bytes(&self) -> Result<Vec<u8>, CoreError> {
-        // Borrowed mirror of `VaultFileV4` (same field order) so the MAC
-        // body serializes without cloning the whole file; only the `mac`
-        // field is substituted. Keep the field list in sync with
-        // `VaultFileV4`.
-        #[derive(Serialize)]
-        struct MacBody<'a> {
-            version: u32,
-            vault_id: &'a str,
-            kdf: &'a KdfParams,
-            wrapped_dk: &'a str,
-            passphrase_policy_checked: bool,
-            entries: &'a BTreeMap<String, Vec<Op>>,
-            mac: &'a str,
-        }
-        let body = MacBody {
-            version: self.version,
-            vault_id: &self.vault_id,
-            kdf: &self.kdf,
-            wrapped_dk: &self.wrapped_dk,
-            passphrase_policy_checked: self.passphrase_policy_checked,
-            entries: &self.entries,
-            mac: "",
-        };
-        serde_json::to_vec(&body)
-            .map_err(|e| CoreError::Serialization(format!("serializing MAC body: {e}")))
-    }
-
-    /// Compute the hex HMAC-SHA256 over the canonical body, keyed via
-    /// HKDF from the DK.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on serialization failure.
-    pub fn compute_mac(&self, dk: &[u8; DK_LEN]) -> Result<String, CoreError> {
-        let bytes = self.mac_body_bytes()?;
-        let key = derive_mac_key(dk);
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key.as_slice())
-            .map_err(|e| CoreError::Secret(format!("MAC init: {e}")))?;
-        <HmacSha256 as Mac>::update(&mut mac, &bytes);
-        Ok(hex::encode(mac.finalize().into_bytes()))
-    }
-
-    /// Verify the file MAC against the DK (constant-time tag comparison).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the MAC is malformed or does not match.
-    pub fn verify_mac(&self, dk: &[u8; DK_LEN]) -> Result<(), CoreError> {
-        let bytes = self.mac_body_bytes()?;
-        let decoded = hex::decode(&self.mac)
-            .ok()
-            .ok_or_else(|| CoreError::Secret("vault MAC is not valid hex".to_string()))?;
-        let key = derive_mac_key(dk);
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key.as_slice())
-            .map_err(|e| CoreError::Secret(format!("MAC init: {e}")))?;
-        <HmacSha256 as Mac>::update(&mut mac, &bytes);
-        mac.verify_slice(&decoded).map_err(|_| {
-            CoreError::Secret(
-                "vault MAC verification failed (vault corrupt, tampered, or wrong key)".to_string(),
-            )
-        })
-    }
-
     /// Canonicalize in place: sort each op log by id, sort parents, and
     /// prune put blobs that can never be reached again.
     ///
@@ -862,51 +821,6 @@ impl VaultFileV4 {
         Ok(())
     }
 
-    /// Finalize for writing: canonicalize, then compute and set the MAC.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on graph violations or serialization failure.
-    pub fn finalize(&mut self, dk: &[u8; DK_LEN]) -> Result<(), CoreError> {
-        self.canonicalize()?;
-        self.mac = self.compute_mac(dk)?;
-        Ok(())
-    }
-
-    /// Serialize canonically (compact JSON, deterministic field order).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on serialization failure.
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, CoreError> {
-        serde_json::to_vec(self)
-            .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))
-    }
-
-    /// Serialize for disk (pretty JSON). The MAC is computed over the
-    /// compact body, so both forms authenticate the same content.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on serialization failure.
-    pub fn to_bytes_pretty(&self) -> Result<Vec<u8>, CoreError> {
-        serde_json::to_string_pretty(self)
-            .map(String::into_bytes)
-            .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))
-    }
-
-    /// Parse and structurally validate v4 bytes (no MAC check).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the bytes are not a valid v4 file.
-    pub fn parse(raw: &[u8]) -> Result<Self, CoreError> {
-        let file: Self = serde_json::from_slice(raw)
-            .map_err(|e| CoreError::Serialization(format!("parsing v4 vault: {e}")))?;
-        file.validate_structure()?;
-        Ok(file)
-    }
-
     /// The entry operation log for `service/key`, if any.
     #[must_use]
     pub fn ops(&self, service: &str, key: &str) -> Option<&[Op]> {
@@ -947,15 +861,6 @@ impl VaultFileV4 {
             .flatten()
             .map(|op| op.changed_at)
             .fold(Hlc::zero(), Hlc::max)
-    }
-
-    /// Whether two files are replicas of the same vault (same identity and
-    /// key material). Independent vaults never merge.
-    #[must_use]
-    pub fn same_origin_as(&self, other: &Self) -> bool {
-        self.vault_id == other.vault_id
-            && self.kdf == other.kdf
-            && self.wrapped_dk == other.wrapped_dk
     }
 
     /// Append a put operation: encrypts the full snapshot under the DK with
@@ -1150,6 +1055,150 @@ impl VaultFileV4 {
     }
 }
 
+impl VaultFileV4 {
+    /// Current schema version.
+    pub const CURRENT_VERSION: u32 = 4;
+
+    /// Assemble a v4 file from existing identity parts (used by `create`
+    /// and by the v3 migration; the MAC is not yet computed).
+    #[must_use]
+    pub fn new_unfinalized(vault_id: &str, kdf: KdfParams, wrapped_dk: &str) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            log: OpLog::new(vault_id),
+            kdf,
+            wrapped_dk: wrapped_dk.to_string(),
+            passphrase_policy_checked: true,
+            mac: String::new(),
+        }
+    }
+
+    /// Structural validation without the DK: header fields, op id encodings,
+    /// parent resolution, duplicate-id content equality, and cycle-freedom
+    /// (cycles surface through the frontier computation).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing the first violation found.
+    pub fn validate_structure(&self) -> Result<(), CoreError> {
+        if self.version != Self::CURRENT_VERSION {
+            return Err(CoreError::Secret(format!(
+                "unsupported vault format version {}",
+                self.version
+            )));
+        }
+        validate_hex_id("vault_id", &self.vault_id, VAULT_ID_LEN)?;
+        self.kdf.validate_params()?;
+        self.log.validate_entries()
+    }
+
+    /// The file in its legacy on-disk field order (`version`, `vault_id`,
+    /// `kdf`, `wrapped_dk`, `passphrase_policy_checked`, `entries`, `mac`)
+    /// with `mac` substituted. Both the MAC body and the serialized file go
+    /// through this one view, so they can never drift apart and existing
+    /// v4 MACs keep verifying.
+    fn legacy_view<'a>(&'a self, mac: &'a str) -> LegacyView<'a> {
+        LegacyView {
+            version: self.version,
+            vault_id: &self.log.vault_id,
+            kdf: &self.kdf,
+            wrapped_dk: &self.wrapped_dk,
+            passphrase_policy_checked: self.passphrase_policy_checked,
+            entries: &self.log.entries,
+            mac,
+        }
+    }
+
+    /// Canonical MAC body: the legacy view serialized compactly with an
+    /// empty `mac` field. All maps are ordered, so this is byte-stable for
+    /// equal op sets.
+    fn mac_body_bytes(&self) -> Result<Vec<u8>, CoreError> {
+        serde_json::to_vec(&self.legacy_view(""))
+            .map_err(|e| CoreError::Serialization(format!("serializing MAC body: {e}")))
+    }
+
+    /// Compute the hex HMAC-SHA256 over the canonical body, keyed via
+    /// HKDF from the DK.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on serialization failure.
+    pub fn compute_mac(&self, dk: &[u8; DK_LEN]) -> Result<String, CoreError> {
+        let bytes = self.mac_body_bytes()?;
+        let key = derive_mac_key(dk);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(key.as_slice())
+            .map_err(|e| CoreError::Secret(format!("MAC init: {e}")))?;
+        <HmacSha256 as Mac>::update(&mut mac, &bytes);
+        Ok(hex::encode(mac.finalize().into_bytes()))
+    }
+
+    /// Verify the file MAC against the DK (constant-time tag comparison).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the MAC is malformed or does not match.
+    pub fn verify_mac(&self, dk: &[u8; DK_LEN]) -> Result<(), CoreError> {
+        let bytes = self.mac_body_bytes()?;
+        let decoded = hex::decode(&self.mac)
+            .ok()
+            .ok_or_else(|| CoreError::Secret("vault MAC is not valid hex".to_string()))?;
+        let key = derive_mac_key(dk);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(key.as_slice())
+            .map_err(|e| CoreError::Secret(format!("MAC init: {e}")))?;
+        <HmacSha256 as Mac>::update(&mut mac, &bytes);
+        mac.verify_slice(&decoded).map_err(|_| {
+            CoreError::Secret(
+                "vault MAC verification failed (vault corrupt, tampered, or wrong key)".to_string(),
+            )
+        })
+    }
+
+    /// Finalize for writing: canonicalize, then compute and set the MAC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on graph violations or serialization failure.
+    pub fn finalize(&mut self, dk: &[u8; DK_LEN]) -> Result<(), CoreError> {
+        self.canonicalize()?;
+        self.mac = self.compute_mac(dk)?;
+        Ok(())
+    }
+
+    /// Serialize canonically (compact JSON, deterministic field order).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on serialization failure.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, CoreError> {
+        serde_json::to_vec(&self.legacy_view(&self.mac))
+            .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))
+    }
+
+    /// Serialize for disk (pretty JSON). The MAC is computed over the
+    /// compact body, so both forms authenticate the same content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on serialization failure.
+    pub fn to_bytes_pretty(&self) -> Result<Vec<u8>, CoreError> {
+        serde_json::to_string_pretty(&self.legacy_view(&self.mac))
+            .map(String::into_bytes)
+            .map_err(|e| CoreError::Serialization(format!("serializing vault: {e}")))
+    }
+
+    /// Parse and structurally validate v4 bytes (no MAC check).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes are not a valid v4 file.
+    pub fn parse(raw: &[u8]) -> Result<Self, CoreError> {
+        let file: Self = serde_json::from_slice(raw)
+            .map_err(|e| CoreError::Serialization(format!("parsing v4 vault: {e}")))?;
+        file.validate_structure()?;
+        Ok(file)
+    }
+}
+
 /// Role of an operation in the history listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1276,9 +1325,13 @@ pub struct MergeReport {
     pub source_ops: usize,
     /// Whether the merged file differs from the target (would be written).
     pub changed: bool,
+    /// Whether the source contributed key slot changes (v5 manifests:
+    /// new slots or removals).
+    #[serde(default)]
+    pub keyslots_changed: bool,
 }
 
-fn projection_states(file: &VaultFileV4) -> Result<BTreeMap<String, Projection>, CoreError> {
+fn projection_states(file: &OpLog) -> Result<BTreeMap<String, Projection>, CoreError> {
     let mut out = BTreeMap::new();
     for (ck, ops) in &file.entries {
         out.insert(ck.clone(), project(ops)?);
@@ -1286,17 +1339,18 @@ fn projection_states(file: &VaultFileV4) -> Result<BTreeMap<String, Projection>,
     Ok(out)
 }
 
-/// Gate for merges: `source` must be a replica of `target` (same identity
-/// and key material); independent vaults can never merge.
+/// Gate for merges: `source` must be a replica of `target` (same vault
+/// identity); independent vaults can never merge.
+///
+/// Key material is deliberately not compared: replicas may wrap the DK
+/// under different key slots. Callers prove both sides share the DK by
+/// MAC-verifying each with the session DK before merging.
 ///
 /// # Errors
 ///
 /// Returns an error naming both vault ids when the origins differ.
-pub(crate) fn ensure_same_origin(
-    target: &VaultFileV4,
-    source: &VaultFileV4,
-) -> Result<(), CoreError> {
-    if !target.same_origin_as(source) {
+pub(crate) fn ensure_same_origin(target: &OpLog, source: &OpLog) -> Result<(), CoreError> {
+    if target.vault_id != source.vault_id {
         return Err(CoreError::Secret(format!(
             "source vault {} is not a replica of target vault {} (independent vaults cannot be merged)",
             source.vault_id, target.vault_id
@@ -1307,8 +1361,8 @@ pub(crate) fn ensure_same_origin(
 
 /// Merge the union of `source` operations into `target` in place.
 ///
-/// Verification is the caller's job: both files must already be
-/// structurally valid and MAC-verified. This function checks same-origin,
+/// Verification is the caller's job: both logs must already be
+/// structurally valid and MAC-verified under the same DK. This function checks same-origin,
 /// unions the operation logs and canonicalizes the target so pruning and
 /// ordering are applied deterministically. The MAC is not recomputed here.
 ///
@@ -1324,8 +1378,8 @@ pub(crate) fn ensure_same_origin(
 /// blob cannot be decrypted under `dk`, or an op id arrives with genuinely
 /// different content.
 pub fn merge_ops(
-    target: &mut VaultFileV4,
-    source: &VaultFileV4,
+    target: &mut OpLog,
+    source: &OpLog,
     dk: &[u8; DK_LEN],
 ) -> Result<MergeReport, CoreError> {
     ensure_same_origin(target, source)?;
@@ -1408,13 +1462,7 @@ pub fn merge_ops(
     // The write decision cannot rely on `ops_added` alone: a re-delivered
     // op can still change bytes (e.g. restoring a blob variant an earlier
     // canonicalization pruned on another replica).
-    let changed = {
-        let mut before_body = before_file;
-        before_body.mac = String::new();
-        let mut after_body = target.clone();
-        after_body.mac = String::new();
-        before_body != after_body
-    };
+    let changed = before_file != *target;
 
     let report = build_merge_report(
         target,
@@ -1432,6 +1480,7 @@ pub fn merge_ops(
             source_vault_id: source.vault_id.clone(),
             source_ops,
             changed,
+            keyslots_changed: false,
         },
     );
     Ok(report)
@@ -1440,7 +1489,7 @@ pub fn merge_ops(
 /// Diff the pre/post projections of a merged target and fill in the
 /// per-entry sections of the report.
 fn build_merge_report(
-    target: &VaultFileV4,
+    target: &OpLog,
     before: &BTreeMap<String, Projection>,
     after: &BTreeMap<String, Projection>,
     mut report: MergeReport,
@@ -2224,9 +2273,9 @@ mod tests {
 
     #[test]
     fn mac_body_matches_legacy_clone_serialization() {
-        // The borrowed `MacBody` mirror must serialize byte-identically to
-        // the old clone-and-clear-mac approach; any field-order or type
-        // drift here would invalidate every existing on-disk MAC.
+        // The MAC body must serialize byte-identically to the file written
+        // with an empty MAC; any field-order or type drift between the two
+        // would invalidate every existing on-disk MAC.
         let mut file = test_file();
         put_op(&mut file, "svc", "k", "v1", op_id(1, 1), vec![], 10);
         put_op(&mut file, "svc", "other", "v2", op_id(2, 1), vec![], 12);
@@ -2235,7 +2284,12 @@ mod tests {
 
         let mut legacy = file.clone();
         legacy.mac = String::new();
-        let legacy_bytes = serde_json::to_vec(&legacy).expect("legacy serialize");
+        let legacy_bytes = legacy.canonical_bytes().expect("legacy serialize");
+        let expected_prefix = br#"{"version":4,"vault_id":""#;
+        assert!(
+            legacy_bytes.starts_with(expected_prefix),
+            "legacy field order"
+        );
         assert_eq!(file.mac_body_bytes().expect("mac body"), legacy_bytes);
     }
 
@@ -2522,14 +2576,14 @@ mod tests {
             ("100%", "%2F"),
             ("plain", "plain"),
         ] {
-            let ck = VaultFileV4::compound_key(service, key);
+            let ck = OpLog::compound_key(service, key);
             assert_eq!(
-                VaultFileV4::split_compound_key(&ck),
+                OpLog::split_compound_key(&ck),
                 Some((service.to_string(), key.to_string())),
                 "roundtrip failed for {service}/{key}"
             );
         }
-        assert_eq!(VaultFileV4::split_compound_key("no-service"), None);
+        assert_eq!(OpLog::split_compound_key("no-service"), None);
     }
 
     #[test]
@@ -2550,14 +2604,14 @@ mod tests {
             entries,
         };
         let v4 = migrate_v3_to_v4(&v3, &dk).expect("migrate");
-        let ck = VaultFileV4::compound_key("team/api", "token");
+        let ck = OpLog::compound_key("team/api", "token");
         assert!(
             v4.entries.contains_key(&ck),
             "entry must live under the escaped key {ck}, got {:?}",
             v4.entries.keys().collect::<Vec<_>>()
         );
         assert_eq!(
-            VaultFileV4::split_compound_key(&ck),
+            OpLog::split_compound_key(&ck),
             Some(("team/api".to_string(), "token".to_string()))
         );
         assert!(v4.ops("team/api", "token").is_some());

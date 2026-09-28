@@ -15,7 +15,7 @@
 //! detection and metadata derivation, and the error taxonomy.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret as _, SecretString};
@@ -66,10 +66,19 @@ fn temp_vault_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    std::env::temp_dir().join(format!(
-        "kyz-runtime-test-{label}-{}-{nanos}.json",
+    let dir = std::env::temp_dir().join(format!(
+        "kyz-runtime-test-{label}-{}-{nanos}",
         std::process::id()
-    ))
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp vault dir");
+    dir.join("vault.json")
+}
+
+/// Remove a vault created by [`temp_vault_path`] (manifest, entries, lock).
+fn remove_vault(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 fn new_unlocked_vault(label: &str) -> (Vault, PathBuf) {
@@ -91,9 +100,9 @@ fn set_simple(vault: &Vault, service: &str, key: &str, value: &str) {
         .expect("set should succeed");
 }
 
-fn cleanup(vault: &Vault, path: &PathBuf) {
+fn cleanup(vault: &Vault, path: &Path) {
     let _ = vault.lock();
-    let _ = std::fs::remove_file(path);
+    remove_vault(path);
 }
 
 #[test]
@@ -102,6 +111,7 @@ fn open_explicit_path_infers_custom_source() {
     let vault = Vault::open_path(&path);
     assert_eq!(vault.source().kind(), &VaultKind::Custom);
     assert_eq!(vault.source().path(), Some(path.as_path()));
+    remove_vault(&path);
 }
 
 #[test]
@@ -149,6 +159,7 @@ fn remote_approval_mode_reports_locked_requestable() {
         vault.unlock_state().expect("unlock state"),
         UnlockState::LockedRequestable,
     );
+    remove_vault(&path);
 }
 
 #[test]
@@ -342,8 +353,8 @@ fn cleanup_paths(l: &Layered) {
     for v in l.vault.layers() {
         let _ = v.lock();
     }
-    let _ = std::fs::remove_file(&l.workspace_path);
-    let _ = std::fs::remove_file(&l.personal_path);
+    remove_vault(&l.workspace_path);
+    remove_vault(&l.personal_path);
 }
 
 fn ssh_entry_with_private_key(service: &str, key: &str) -> SecretEntry {
@@ -497,7 +508,7 @@ fn locked_vault_returns_vault_locked_error() {
     // lock condition. Either is acceptable; the important property is
     // that it is not a NotFound.
     assert!(!matches!(err, Error::NotFound { .. }));
-    let _ = std::fs::remove_file(&path);
+    remove_vault(&path);
 }
 
 #[test]
@@ -588,6 +599,6 @@ fn locked_workspace_layer_does_not_poison_resolution() {
         other => panic!("expected VaultLocked, got: {other:?}"),
     }
 
-    let _ = std::fs::remove_file(&workspace_path);
-    let _ = std::fs::remove_file(&personal_path);
+    remove_vault(&workspace_path);
+    remove_vault(&personal_path);
 }

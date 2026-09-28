@@ -8,29 +8,82 @@
         reason = "tests assert outcomes: expect/unwrap/panic are the failure mechanism"
     )
 )]
-//! End-to-end v4 vault lifecycle tests over real files: creation, forked
-//! replicas, explicit merge, delete-wins, explicit rebuild, rollback, and
-//! merge-input rejection (tampering, independent vaults, idempotent
-//! re-merge without writes).
+//! End-to-end vault lifecycle tests over real files (v5 layout: manifest
+//! plus one file per entry): creation, forked replicas, explicit merge,
+//! delete-wins, explicit rebuild, rollback, merge-input rejection
+//! (tampering, independent vaults, idempotent re-merge without writes),
+//! key slots and passphrase changes across replicas, sync conflict copies,
+//! and migration from v3 and single-file v4.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kyz_core::store::{VaultContents, VaultStore, detect_vault_version};
-use kyz_core::{Projection, SecretEntry, SecretStore, VaultFileV3, VaultFileV4};
+use kyz_core::store::{VaultStore, detect_vault_version};
+use kyz_core::vault_v5::entries_dir_for;
+use kyz_core::{SecretEntry, SecretStore, VaultFileV3, VaultFileV4};
 use secrecy::SecretString;
 
 mod common;
 
+/// Fresh directory per vault; returns `<dir>/vault.json` (the manifest
+/// path — entries live next to it in `vault.entries/`).
 fn temp_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    std::env::temp_dir().join(format!(
-        "kyz-v4-e2e-{label}-{}-{nanos}.json",
+    let dir = std::env::temp_dir().join(format!(
+        "kyz-sync-e2e-{label}-{}-{nanos}",
         std::process::id()
-    ))
+    ));
+    std::fs::create_dir_all(&dir).expect("create vault dir");
+    dir.join("vault.json")
+}
+
+fn cleanup(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Copy a vault replica: manifest plus entries directory.
+fn copy_vault(from: &Path, to: &Path) {
+    std::fs::copy(from, to).expect("copy manifest");
+    let (src, dst) = (entries_dir_for(from), entries_dir_for(to));
+    std::fs::create_dir_all(&dst).expect("create entries dir");
+    for item in std::fs::read_dir(&src).expect("read entries") {
+        let item = item.expect("entry");
+        std::fs::copy(item.path(), dst.join(item.file_name())).expect("copy entry");
+    }
+}
+
+/// Every file of a vault (manifest and entries) by name, for no-write
+/// assertions.
+fn snapshot(path: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    out.insert(
+        "vault.json".to_string(),
+        std::fs::read(path).expect("read manifest"),
+    );
+    if let Ok(items) = std::fs::read_dir(entries_dir_for(path)) {
+        for item in items {
+            let item = item.expect("entry");
+            out.insert(
+                format!("entries/{}", item.file_name().to_string_lossy()),
+                std::fs::read(item.path()).expect("read entry"),
+            );
+        }
+    }
+    out
+}
+
+fn entry_files(path: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(entries_dir_for(path))
+        .expect("read entries")
+        .map(|i| i.expect("entry").path())
+        .collect();
+    out.sort();
+    out
 }
 
 const PASS: &str = "a-very-strong-passphrase-123";
@@ -63,21 +116,10 @@ fn set_recreate(store: &VaultStore, service: &str, key: &str, value: &str) {
 
 /// Winning snapshot's `value` field, or `None` when the entry is hidden.
 fn current_value(store: &VaultStore, service: &str, key: &str) -> Option<String> {
-    let dk = store.require_session_pub().expect("session");
-    let VaultContents::V4(vault) = store.read_contents_pub().expect("contents") else {
-        panic!("vault must be v4 after unlock");
-    };
-    match vault.projection(service, key).expect("projection") {
-        Projection::Hidden => None,
-        Projection::Visible { .. } => Some(
-            vault
-                .decrypt_current(&dk, service, key)
-                .expect("decrypt")
-                .fields
-                .get("value")
-                .cloned()
-                .unwrap_or_default(),
-        ),
+    match store.get(service, key) {
+        Ok(entry) => Some(entry.value().unwrap_or_default().to_string()),
+        Err(kyz_core::CoreError::SecretNotFound(_)) => None,
+        Err(e) => panic!("get {service}/{key}: {e}"),
     }
 }
 
@@ -90,7 +132,7 @@ fn forked_replicas_merge_with_conflict_delete_wins_and_rebuild() {
     // Fork: replica B starts from A's bytes (as Syncthing would before the
     // conflict) and both sides diverge.
     let path_b = temp_path("fork-b");
-    std::fs::copy(&path_a, &path_b).expect("copy replica");
+    copy_vault(&path_a, &path_b);
     let b = VaultStore::new(path_b.clone());
     b.unlock(PASS, 60).expect("unlock b");
 
@@ -127,19 +169,37 @@ fn forked_replicas_merge_with_conflict_delete_wins_and_rebuild() {
         Some("b-value")
     );
 
-    // Re-merge is a no-op that does not touch the file.
-    let bytes_before = std::fs::read(&path_a).expect("read a");
+    // Re-merge is a no-op that does not touch any file.
+    let bytes_before = snapshot(&path_a);
     let report = a.merge_vault_from(&path_b, false, false).expect("re-merge");
     assert!(!report.changed);
     assert_eq!(report.ops_added, 0);
-    let bytes_after = std::fs::read(&path_a).expect("re-read a");
-    assert_eq!(bytes_before, bytes_after, "idempotent merge must not write");
+    assert_eq!(
+        bytes_before,
+        snapshot(&path_a),
+        "idempotent merge must not write"
+    );
 
     // Dry-run computes the same report without writing.
     let report = a.merge_vault_from(&path_b, true, false).expect("dry merge");
     assert!(!report.changed);
-    let bytes_after = std::fs::read(&path_a).expect("re-read a");
-    assert_eq!(bytes_before, bytes_after);
+    assert_eq!(bytes_before, snapshot(&path_a));
+
+    // The reverse merge converges B to exactly A's state.
+    b.merge_vault_from(&path_a, false, false)
+        .expect("reverse merge");
+    let (sa, sb) = (snapshot(&path_a), snapshot(&path_b));
+    let entries = |s: &BTreeMap<String, Vec<u8>>| {
+        s.iter()
+            .filter(|(k, _)| k.starts_with("entries/"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        entries(&sa),
+        entries(&sb),
+        "replicas must converge byte-identically"
+    );
 
     // Plain set on the deleted entry refuses; deleting it again keeps
     // SecretNotFound semantics; the explicit rebuild then succeeds.
@@ -186,8 +246,8 @@ fn forked_replicas_merge_with_conflict_delete_wins_and_rebuild() {
 
     let _ = a.lock();
     let _ = b.lock();
-    let _ = std::fs::remove_file(&path_a);
-    let _ = std::fs::remove_file(&path_b);
+    cleanup(&path_a);
+    cleanup(&path_b);
 }
 
 #[test]
@@ -226,7 +286,7 @@ fn rollback_rejects_out_of_range_seq_and_refreshes_updated_at() {
     );
 
     let _ = store.lock();
-    let _ = std::fs::remove_file(&path);
+    cleanup(&path);
 }
 
 #[test]
@@ -258,8 +318,8 @@ fn merge_gates_v3_era_resurrections_behind_explicit_yes() {
     let b = VaultStore::new(path_b.clone());
     b.unlock(PASS, 60).expect("unlock b migrates");
 
-    // Refused without --yes, file untouched.
-    let bytes_before = std::fs::read(&path_a).expect("read a");
+    // Refused without --yes, vault untouched.
+    let bytes_before = snapshot(&path_a);
     let err = a
         .merge_vault_from(&path_b, false, false)
         .expect_err("resurrection must be refused");
@@ -268,7 +328,7 @@ fn merge_gates_v3_era_resurrections_behind_explicit_yes() {
         "error must name the entry: {err}"
     );
     assert_eq!(
-        std::fs::read(&path_a).expect("re-read"),
+        snapshot(&path_a),
         bytes_before,
         "refused merge must not write"
     );
@@ -278,11 +338,7 @@ fn merge_gates_v3_era_resurrections_behind_explicit_yes() {
         .merge_vault_from(&path_b, true, false)
         .expect("dry-run reports");
     assert_eq!(report.legacy_resurrections, vec!["svc/api-key".to_string()]);
-    assert_eq!(
-        std::fs::read(&path_a).expect("re-read"),
-        bytes_before,
-        "dry-run must not write"
-    );
+    assert_eq!(snapshot(&path_a), bytes_before, "dry-run must not write");
 
     // With the explicit acceptance the merge proceeds; common history
     // (svc/keep) deduplicates without being flagged.
@@ -299,8 +355,8 @@ fn merge_gates_v3_era_resurrections_behind_explicit_yes() {
 
     let _ = a.lock();
     let _ = b.lock();
-    let _ = std::fs::remove_file(&path_a);
-    let _ = std::fs::remove_file(&path_b);
+    cleanup(&path_a);
+    cleanup(&path_b);
 }
 
 #[test]
@@ -319,49 +375,55 @@ fn merge_rejects_tampered_and_foreign_sources() {
         "unexpected error: {err}"
     );
 
-    // Tampered source metadata (tags projection) fails the MAC.
+    // Tampered replica entries fail verification: metadata projection
+    // and ciphertext are both MAC-covered.
     let tampered_path = temp_path("guard-tampered");
-    let write_tampered = |mutate: &dyn Fn(&mut VaultFileV4)| {
-        let raw = std::fs::read(&path_a).expect("read a");
-        let mut vault: VaultFileV4 = serde_json::from_slice(&raw).expect("parse");
-        mutate(&mut vault);
-        std::fs::write(
-            &tampered_path,
-            serde_json::to_string_pretty(&vault).expect("ser"),
-        )
-        .expect("write tampered");
+    let write_tampered = |mutate: &dyn Fn(&mut serde_json::Value)| {
+        cleanup(&tampered_path);
+        std::fs::create_dir_all(tampered_path.parent().expect("parent")).expect("dir");
+        copy_vault(&path_a, &tampered_path);
+        let file = entry_files(&tampered_path).remove(0);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("read entry")).expect("parse");
+        mutate(&mut value);
+        std::fs::write(&file, serde_json::to_vec_pretty(&value).expect("ser")).expect("write");
     };
 
-    write_tampered(&|vault| {
-        vault.entries.get_mut("svc/k").expect("entry")[0]
-            .meta
-            .as_mut()
-            .expect("meta")
-            .field_names
-            .push("injected".to_string());
+    write_tampered(&|v| {
+        v["ops"][0]["meta"]["field_names"]
+            .as_array_mut()
+            .expect("field names")
+            .push("injected".into());
     });
     let err = a
         .merge_vault_from(&tampered_path, false, false)
         .expect_err("tampered meta");
     assert!(format!("{err}").contains("MAC"), "unexpected error: {err}");
 
-    write_tampered(&|vault| {
-        let blob = vault.entries.get_mut("svc/k").expect("entry")[0]
-            .blob
-            .as_mut()
-            .expect("blob");
-        blob.insert(0, 'A');
+    write_tampered(&|v| {
+        let blob = v["ops"][0]["blob"].as_str().expect("blob").to_string();
+        v["ops"][0]["blob"] = format!("A{blob}").into();
     });
     let err = a
         .merge_vault_from(&tampered_path, false, false)
         .expect_err("tampered blob");
     assert!(format!("{err}").contains("MAC"), "unexpected error: {err}");
 
+    // A tampered entry file in the vault itself fails reads the same way.
+    let file = entry_files(&path_a).remove(0);
+    let original = std::fs::read(&file).expect("read");
+    let mut value: serde_json::Value = serde_json::from_slice(&original).expect("parse");
+    value["ops"][0]["changed_at"]["phys"] = 1.into();
+    std::fs::write(&file, serde_json::to_vec_pretty(&value).expect("ser")).expect("write");
+    let err = a.get("svc", "k").expect_err("tampered entry");
+    assert!(format!("{err}").contains("MAC"), "unexpected error: {err}");
+    std::fs::write(&file, original).expect("restore");
+
     let _ = a.lock();
     let _ = other.lock();
-    let _ = std::fs::remove_file(&path_a);
-    let _ = std::fs::remove_file(&path_other);
-    let _ = std::fs::remove_file(&tampered_path);
+    cleanup(&path_a);
+    cleanup(&path_other);
+    cleanup(&tampered_path);
 }
 
 #[test]
@@ -383,7 +445,7 @@ fn v3_vault_unlock_migrates_and_keeps_everything_readable() {
     store.unlock(PASS, 60).expect("unlock migrates");
     assert_eq!(
         detect_vault_version(&std::fs::read(&path).expect("read")),
-        4
+        5
     );
 
     let entry = store.get("app", "legacy").expect("get after migrate");
@@ -394,11 +456,11 @@ fn v3_vault_unlock_migrates_and_keeps_everything_readable() {
     assert!(!items.is_empty());
 
     let _ = store.lock();
-    let _ = std::fs::remove_file(&path);
+    cleanup(&path);
 }
 
 #[test]
-fn delete_on_v3_vault_upgrades_the_file_to_v4() {
+fn delete_on_v3_vault_upgrades_the_vault_to_v5() {
     common::isolate_state_dir();
     let path = temp_path("v3-delete-upgrade");
     let pass = SecretString::from(PASS.to_string());
@@ -429,18 +491,18 @@ fn delete_on_v3_vault_upgrades_the_file_to_v4() {
         3
     );
 
-    // A successful delete upgrades the file to v4 in the same transaction.
+    // A successful delete upgrades the vault to v5 in the same transaction.
     store.delete("app", "gone").expect("delete upgrades");
     assert_eq!(
         detect_vault_version(&std::fs::read(&path).expect("read")),
-        4
+        5
     );
     assert!(store.get("app", "gone").is_err());
     let kept = store.get("app", "keep").expect("kept entry survives");
     assert_eq!(kept.value(), Some("kept"));
 
     let _ = store.lock();
-    let _ = std::fs::remove_file(&path);
+    cleanup(&path);
 }
 
 #[test]
@@ -479,5 +541,242 @@ fn rollback_on_v3_vault_uses_v3_versions_and_stays_v3() {
     assert!(err.to_string().contains("numeric versions only"));
 
     let _ = store.lock();
-    let _ = std::fs::remove_file(&path);
+    cleanup(&path);
+}
+
+const NEW_PASS: &str = "another-very-strong-passphrase-456";
+
+#[test]
+fn passphrase_change_on_one_replica_keeps_merging_both_ways() {
+    let (a, path_a) = fresh_unlocked("slots-a");
+    set(&a, "svc", "k", "base");
+    let path_b = temp_path("slots-b");
+    copy_vault(&path_a, &path_b);
+    let b = VaultStore::new(path_b.clone());
+    b.unlock(PASS, 60).expect("unlock b");
+
+    // A changes its passphrase; both sides keep writing.
+    a.change_passphrase(PASS, NEW_PASS)
+        .expect("change passphrase");
+    set(&a, "svc", "from-a", "a");
+    set(&b, "svc", "from-b", "b");
+
+    // B merges A: entries flow and the slot change (new slot, old slot
+    // removed) propagates.
+    let report = b
+        .merge_vault_from(&path_a, false, false)
+        .expect("merge a into b");
+    assert!(
+        report.keyslots_changed,
+        "slot change must propagate: {report:?}"
+    );
+    assert_eq!(current_value(&b, "svc", "from-a").as_deref(), Some("a"));
+
+    // A merges B the other way round.
+    let report = a
+        .merge_vault_from(&path_b, false, false)
+        .expect("merge b into a");
+    assert!(!report.keyslots_changed);
+    assert_eq!(current_value(&a, "svc", "from-b").as_deref(), Some("b"));
+
+    // After merging, both replicas open with the new passphrase only.
+    for path in [&path_a, &path_b] {
+        let store = VaultStore::new(path.clone());
+        store.lock().expect("lock");
+        assert!(store.unlock(PASS, 60).is_err(), "old passphrase must fail");
+        store.unlock(NEW_PASS, 60).expect("new passphrase unlocks");
+        let slots = store.key_slots().expect("slots");
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots.iter().filter(|s| s.removed_at.is_none()).count(), 1);
+        assert_eq!(current_value(&store, "svc", "k").as_deref(), Some("base"));
+        let _ = store.lock();
+    }
+
+    cleanup(&path_a);
+    cleanup(&path_b);
+}
+
+#[test]
+fn wrong_current_passphrase_and_last_slot_are_refused() {
+    let (a, path) = fresh_unlocked("slots-guard");
+    let before = snapshot(&path);
+    assert!(a.change_passphrase("not-the-passphrase", NEW_PASS).is_err());
+    assert!(
+        a.change_passphrase(PASS, "short").is_err(),
+        "strength policy applies"
+    );
+    assert_eq!(before, snapshot(&path), "refused changes must not write");
+    let _ = a.lock();
+    cleanup(&path);
+}
+
+#[test]
+fn tampered_manifest_is_rejected_on_unlock() {
+    let (a, path) = fresh_unlocked("manifest-tamper");
+    a.lock().expect("lock");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+    let slots = value["keyslots"].as_object_mut().expect("slots");
+    let (_, slot) = slots.iter_mut().next().expect("one slot");
+    slot["label"] = "attacker".into();
+    std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("ser")).expect("write");
+    let err = a.unlock(PASS, 60).expect_err("tampered manifest");
+    assert!(format!("{err}").contains("MAC"), "unexpected error: {err}");
+    cleanup(&path);
+}
+
+#[test]
+fn entry_names_are_not_visible_on_disk() {
+    let (a, path) = fresh_unlocked("hidden-names");
+    set(&a, "github-service", "deploy-token-name", "ghp_value");
+    let files = entry_files(&path);
+    assert_eq!(files.len(), 1);
+    let name = files[0]
+        .file_name()
+        .expect("name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        !name.contains("github") && !name.contains("deploy"),
+        "{name}"
+    );
+    let body = std::fs::read_to_string(&files[0]).expect("read");
+    for needle in ["github-service", "deploy-token-name", "ghp_value"] {
+        assert!(!body.contains(needle), "entry file leaks {needle}");
+    }
+    assert!(
+        !std::fs::read_to_string(&path)
+            .expect("manifest")
+            .contains("github")
+    );
+    let _ = a.lock();
+    cleanup(&path);
+}
+
+#[test]
+fn sync_conflict_copies_are_read_and_absorbed() {
+    let (a, path_a) = fresh_unlocked("conflict-a");
+    set(&a, "svc", "k", "base");
+    let path_b = temp_path("conflict-b");
+    copy_vault(&path_a, &path_b);
+    let b = VaultStore::new(path_b.clone());
+    b.unlock(PASS, 60).expect("unlock b");
+    set(&a, "svc", "k", "from-a");
+    set(&b, "svc", "k", "from-b");
+
+    // Simulate Syncthing: B's version of the entry lands next to A's as a
+    // conflict copy.
+    let b_file = entry_files(&path_b).remove(0);
+    let id = b_file
+        .file_stem()
+        .expect("stem")
+        .to_string_lossy()
+        .into_owned();
+    let copy =
+        entries_dir_for(&path_a).join(format!("{id}.sync-conflict-20260928-120000-ABCDEFG.json"));
+    std::fs::copy(&b_file, &copy).expect("plant conflict copy");
+
+    // Reads already see both versions: one wins, the other is a conflict.
+    let items = a.history_v4("svc", "k").expect("history");
+    assert!(
+        items
+            .iter()
+            .any(|i| i.role == kyz_core::HistoryRole::Conflict),
+        "conflict copy must surface as a conflict version: {items:?}"
+    );
+    assert!(copy.exists(), "reads never delete");
+
+    // The next write of the entry absorbs and removes the copy.
+    set(&a, "svc", "k", "resolved");
+    assert!(!copy.exists(), "write must absorb the conflict copy");
+    assert_eq!(current_value(&a, "svc", "k").as_deref(), Some("resolved"));
+
+    // Unlock absorbs copies of entries nobody writes.
+    set(&b, "svc", "other", "b-only");
+    let other_file = entry_files(&path_b)
+        .into_iter()
+        .find(|f| f.file_name() != b_file.file_name())
+        .expect("other entry");
+    let other_id = other_file
+        .file_stem()
+        .expect("stem")
+        .to_string_lossy()
+        .into_owned();
+    let copy2 = entries_dir_for(&path_a).join(format!("{other_id}.sync-conflict-x.json"));
+    std::fs::copy(&other_file, &copy2).expect("plant second copy");
+    a.lock().expect("lock");
+    a.unlock(PASS, 60).expect("unlock absorbs");
+    assert!(!copy2.exists());
+    assert!(
+        entries_dir_for(&path_a)
+            .join(format!("{other_id}.json"))
+            .exists()
+    );
+    assert_eq!(current_value(&a, "svc", "other").as_deref(), Some("b-only"));
+
+    // A copy from another vault is ignored and left alone.
+    let (foreign, path_f) = fresh_unlocked("conflict-foreign");
+    set(&foreign, "svc", "k", "foreign");
+    let foreign_file = entry_files(&path_f).remove(0);
+    let bogus = entries_dir_for(&path_a).join(format!("{id}.sync-conflict-foreign.json"));
+    std::fs::copy(&foreign_file, &bogus).expect("plant foreign copy");
+    assert_eq!(current_value(&a, "svc", "k").as_deref(), Some("resolved"));
+    set(&a, "svc", "k", "after-foreign");
+    assert!(bogus.exists(), "unverifiable copies must never be deleted");
+
+    let _ = a.lock();
+    let _ = b.lock();
+    let _ = foreign.lock();
+    cleanup(&path_a);
+    cleanup(&path_b);
+    cleanup(&path_f);
+}
+
+#[test]
+fn single_file_v4_vault_migrates_and_merges() {
+    common::isolate_state_dir();
+    let pass = SecretString::from(PASS.to_string());
+    let (mut v4, dk) = VaultFileV4::create(&pass).expect("create v4");
+    v4.passphrase_policy_checked = true;
+    let snapshot_plain =
+        kyz_core::SnapshotPlain::from_entry(&SecretEntry::single("svc", "k", "v4-value"));
+    let id = kyz_core::OpId::new("0123456789abcdef0123456789abcdef", 1).expect("op id");
+    v4.append_put(
+        &snapshot_plain,
+        id,
+        Vec::new(),
+        kyz_core::Hlc::tick(None),
+        &dk,
+    )
+    .expect("append");
+    v4.finalize(&dk).expect("finalize");
+    let v4_bytes = v4.to_bytes_pretty().expect("bytes");
+
+    // A v4 file migrates on unlock.
+    let path = temp_path("v4-migrate");
+    std::fs::write(&path, &v4_bytes).expect("write v4");
+    let store = VaultStore::new(path.clone());
+    store.unlock(PASS, 60).expect("unlock migrates v4");
+    assert_eq!(
+        detect_vault_version(&std::fs::read(&path).expect("read")),
+        5
+    );
+    assert_eq!(
+        current_value(&store, "svc", "k").as_deref(),
+        Some("v4-value")
+    );
+    set(&store, "svc", "k2", "new");
+
+    // A v4 file of the same vault merges into the migrated v5 vault.
+    let v4_copy = temp_path("v4-source");
+    std::fs::write(&v4_copy, &v4_bytes).expect("write v4 copy");
+    let report = store
+        .merge_vault_from(&v4_copy, false, false)
+        .expect("merge v4");
+    assert_eq!(report.ops_added, 0, "migration keeps op ids: {report:?}");
+    assert_eq!(current_value(&store, "svc", "k2").as_deref(), Some("new"));
+
+    let _ = store.lock();
+    cleanup(&path);
+    cleanup(&v4_copy);
 }
