@@ -421,60 +421,45 @@ fn ops_by_id(ops: &[Op]) -> BTreeMap<&OpId, &Op> {
     ops.iter().map(|op| (&op.id, op)).collect()
 }
 
-/// Collect every ancestor id of `start` (transitive parents closure).
+/// Every transitive ancestor of the given ops, in one shared walk.
 ///
-/// Cycles are detected because any cycle through `start` must revisit it.
-fn collect_ancestors(
-    by_id: &BTreeMap<&OpId, &Op>,
-    start: &OpId,
-    out: &mut BTreeSet<OpId>,
-) -> Result<(), CoreError> {
-    let start_op = by_id
-        .get(start)
-        .ok_or_else(|| CoreError::Secret(format!("op {start} referenced but not present")))?;
-    let mut stack: Vec<OpId> = start_op.parents.clone();
+/// A single visited set across all starting points keeps this
+/// O(ops + parents) however many starts there are; parents that do not
+/// resolve are skipped (graph errors are reported by [`frontier`]).
+fn ancestors_of<'a>(
+    by_id: &BTreeMap<&OpId, &'a Op>,
+    starts: impl Iterator<Item = &'a Op>,
+) -> BTreeSet<OpId> {
+    let mut stack: Vec<&OpId> = starts.flat_map(|op| op.parents.iter()).collect();
     let mut visited: BTreeSet<OpId> = BTreeSet::new();
     while let Some(id) = stack.pop() {
-        if id == *start {
-            return Err(CoreError::Secret(format!(
-                "causality cycle detected at op {start}"
-            )));
+        if visited.insert(id.clone())
+            && let Some(op) = by_id.get(id)
+        {
+            stack.extend(op.parents.iter());
         }
-        if !visited.insert(id.clone()) {
-            continue;
-        }
-        let op = by_id.get(&id).ok_or_else(|| {
-            CoreError::Secret(format!("parent op {id} referenced but not present"))
-        })?;
-        stack.extend(op.parents.iter().cloned());
     }
-    out.extend(visited);
-    Ok(())
+    visited
 }
 
-/// Whether the op parent graph is acyclic (Kahn peeling): repeatedly
+/// An op on or behind a causality cycle, if any (Kahn peeling: repeatedly
 /// remove ops whose parents have all been removed; an acyclic graph
-/// empties completely, a cycle leaves its members stuck.
-fn parents_form_acyclic_graph(ops: &[Op]) -> bool {
-    // Duplicate op ids break the edge-count invariant below (their parent
-    // edges can decrement a counter another copy already consumed, which
-    // underflows); such sets bail to the per-op ancestor walk, which is
-    // duplicate-tolerant. `validate_structure` tolerates equal-content
-    // duplicates, so they genuinely reach this function.
-    let mut unique: BTreeSet<&OpId> = BTreeSet::new();
-    for op in ops {
-        if !unique.insert(&op.id) {
-            return false;
-        }
-    }
+/// empties completely, a cycle leaves its members stuck).
+///
+/// Works on the id-deduplicated map, so equal-content duplicate ids
+/// (tolerated by `validate_structure`) cannot skew the edge counts.
+/// Every parent must resolve in `by_id`.
+fn stuck_in_cycle<'a>(by_id: &BTreeMap<&'a OpId, &'a Op>) -> Option<&'a OpId> {
     // Remaining unresolved-parent count per op.
-    let mut remaining: BTreeMap<&OpId, usize> =
-        ops.iter().map(|op| (&op.id, op.parents.len())).collect();
+    let mut remaining: BTreeMap<&OpId, usize> = by_id
+        .iter()
+        .map(|(id, op)| (*id, op.parents.len()))
+        .collect();
     // Reverse edges: which ops list each id as a parent.
     let mut children: BTreeMap<&OpId, Vec<&OpId>> = BTreeMap::new();
-    for op in ops {
+    for (id, op) in by_id {
         for parent in &op.parents {
-            children.entry(parent).or_default().push(&op.id);
+            children.entry(parent).or_default().push(*id);
         }
     }
     let mut ready: Vec<&OpId> = remaining
@@ -482,64 +467,57 @@ fn parents_form_acyclic_graph(ops: &[Op]) -> bool {
         .filter(|(_, n)| **n == 0)
         .map(|(id, _)| *id)
         .collect();
-    let mut peeled = 0usize;
     while let Some(id) = ready.pop() {
-        peeled += 1;
-        if let Some(kids) = children.get(id) {
-            for kid in kids {
-                if let Some(n) = remaining.get_mut(*kid) {
-                    *n -= 1;
-                    if *n == 0 {
-                        ready.push(*kid);
-                    }
+        for kid in children.get(id).into_iter().flatten() {
+            if let Some(n) = remaining.get_mut(*kid) {
+                *n -= 1;
+                if *n == 0 {
+                    ready.push(*kid);
                 }
             }
         }
     }
-    peeled == ops.len()
+    remaining
+        .into_iter()
+        .find(|(_, n)| *n > 0)
+        .and_then(|(id, _)| by_id.get_key_value(id).map(|(k, _)| *k))
 }
 
 /// The causal frontier: ids of operations that are not an ancestor of any
 /// other operation in the set (the maximal elements of the DAG).
 ///
-/// Fast path: in an acyclic set where every parent resolves, the dominated
-/// set is exactly the union of direct parent ids — every transitive
-/// ancestor is reached through one direct parent edge — so a single
-/// O(ops + parents) pass replaces an ancestor walk per op. Corrupt shapes
-/// (dangling parents, cycles) fall back to the per-op ancestor walk so the
-/// reported error is unchanged.
+/// In an acyclic set where every parent resolves, the dominated set is
+/// exactly the union of direct parent ids — every transitive ancestor is
+/// reached through one direct parent edge — so one O(ops + parents) pass
+/// suffices. Dangling parents and cycles are rejected up front, also in
+/// linear time: this runs on untrusted files before their MAC is checked,
+/// so it must never degrade to a per-op ancestor walk (trx-dgqe.5).
 ///
 /// # Errors
 ///
 /// Returns an error on unresolvable parents or causality cycles.
 pub fn frontier(ops: &[Op]) -> Result<BTreeSet<OpId>, CoreError> {
     let by_id = ops_by_id(ops);
-    let mut dominated: BTreeSet<OpId> = BTreeSet::new();
-    let mut resolvable = true;
-    'scan: for op in ops {
+    let mut dominated: BTreeSet<&OpId> = BTreeSet::new();
+    for op in by_id.values() {
         for parent in &op.parents {
             if !by_id.contains_key(parent) {
-                resolvable = false;
-                break 'scan;
+                return Err(CoreError::Secret(format!(
+                    "parent op {parent} referenced but not present"
+                )));
             }
-            dominated.insert(parent.clone());
+            dominated.insert(parent);
         }
     }
-    if resolvable && parents_form_acyclic_graph(ops) {
-        return Ok(ops
-            .iter()
-            .map(|op| op.id.clone())
-            .filter(|id| !dominated.contains(id))
-            .collect());
+    if let Some(id) = stuck_in_cycle(&by_id) {
+        return Err(CoreError::Secret(format!(
+            "causality cycle detected at op {id}"
+        )));
     }
-    let mut dominated: BTreeSet<OpId> = BTreeSet::new();
-    for op in ops {
-        collect_ancestors(&by_id, &op.id, &mut dominated)?;
-    }
-    Ok(ops
-        .iter()
-        .map(|op| op.id.clone())
-        .filter(|id| !dominated.contains(id))
+    Ok(by_id
+        .keys()
+        .filter(|id| !dominated.contains(*id))
+        .map(|id| (*id).clone())
         .collect())
 }
 
@@ -790,15 +768,13 @@ impl OpLog {
                 if ops.iter().all(|op| op.kind != OpKind::Delete) {
                     BTreeSet::new()
                 } else {
+                    // Graph errors (cycles, dangling parents) as before.
+                    frontier(ops)?;
                     let by_id = ops_by_id(ops);
                     // Every op a delete dominates (directly or transitively):
                     // these puts are permanently out of the frontier.
-                    let mut shadowed: BTreeSet<OpId> = BTreeSet::new();
-                    for op in &*ops {
-                        if op.kind == OpKind::Delete {
-                            collect_ancestors(&by_id, &op.id, &mut shadowed)?;
-                        }
-                    }
+                    let shadowed =
+                        ancestors_of(&by_id, ops.iter().filter(|op| op.kind == OpKind::Delete));
                     ops.iter()
                         .filter(|op| {
                             op.kind == OpKind::Put && op.blob.is_some() && shadowed.contains(&op.id)
@@ -2591,6 +2567,48 @@ mod tests {
             }
             assert!(merged.validate_structure().is_ok());
         }
+    }
+
+    /// trx-dgqe.5: a hostile file of N ops (a long chain with duplicate
+    /// ids, or a chain of deletes) must stay linear. Before the fix the
+    /// duplicate disabled the fast path and each op walked all its
+    /// ancestors, and canonicalize walked once per delete: O(N^2), which
+    /// at 20k ops took minutes; now well under a second even in debug.
+    #[test]
+    fn hostile_long_chains_stay_linear() {
+        const N: u64 = 20_000;
+        let chain = |kind: OpKind| -> Vec<Op> {
+            (1..=N)
+                .map(|c| Op {
+                    id: op_id(1, c),
+                    parents: if c == 1 {
+                        vec![]
+                    } else {
+                        vec![op_id(1, c - 1)]
+                    },
+                    kind,
+                    changed_at: Hlc::zero(),
+                    meta: None,
+                    blob: None,
+                })
+                .collect()
+        };
+        let started = std::time::Instant::now();
+        let mut ops = chain(OpKind::Put);
+        ops.push(ops[0].clone());
+        assert_eq!(
+            frontier(&ops).expect("frontier"),
+            BTreeSet::from([op_id(1, N)])
+        );
+        let mut log = OpLog::new(&test_file().vault_id);
+        log.entries
+            .insert("svc/k".to_string(), chain(OpKind::Delete));
+        log.canonicalize().expect("canonicalize");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

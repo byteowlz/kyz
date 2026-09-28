@@ -31,6 +31,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Hostile op logs could force quadratic CPU before MAC verification: a duplicate op id disabled the linear frontier path (per-op ancestor walks), and canonicalization walked ancestors once per delete. Both are now O(ops + parents); cycles and dangling parents are detected by the same linear pass.
 - `kyz history` labeled an edit as `current` while a concurrent delete hid the entry (`get` reported it missing). History now follows the projection: a deleted entry has no current version, and edits hidden by the delete are shown as conflicts (rollback-able). The human view notes that the entry is deleted.
 - `kyz vault merge` gave no hint when an incoming edit lost to a delete already present in the target. The report now lists such entries under `lost_to_delete` (entry, tombstones, hidden edits).
 - v3→v4 migration minted identical op ids for two snapshots with identical content inside the same unix second (`set A; set B; set A`); canonicalization's dedup then dropped the current version's op and `kyz get` silently returned the superseded value. Op id derivation now includes the snapshot's chain position.
