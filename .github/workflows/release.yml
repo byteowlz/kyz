@@ -145,66 +145,91 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # === Package Manager Publishing ===
-  # Uncomment the sections below to enable automatic publishing.
-  # Required secrets: TAP_GITHUB_TOKEN, AUR_SSH_PRIVATE_KEY, AUR_EMAIL
+  # All publish jobs run only on the upstream repo; forks lack the secrets.
+  # Required secrets:
+  #   WINGET_TOKEN        - classic PAT (public_repo + workflow scopes) able to
+  #                         fork microsoft/winget-pkgs and open PRs
+  #   TAP_GITHUB_TOKEN    - PAT with repo scope on the tap repo
+  #   AUR_SSH_PRIVATE_KEY - SSH key registered with the AUR account
+  #   AUR_EMAIL           - commit email for AUR
 
-  # publish-homebrew:
-  #   name: Publish to Homebrew
-  #   needs: release
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Update Homebrew tap
-  #       uses: peter-evans/repository-dispatch@v3
-  #       with:
-  #         token: ${{ secrets.TAP_GITHUB_TOKEN }}
-  #         repository: byteowlz/homebrew-tap
-  #         event-type: update-formula
-  #         client-payload: |
-  #           {
-  #             "formula": "${{ env.BINARY_NAME }}",
-  #             "version": "${{ env.RELEASE_TAG }}",
-  #             "repo": "${{ github.repository }}"
-  #           }
+  publish-winget:
+    name: Publish to WinGet
+    needs: release
+    runs-on: ubuntu-latest
+    if: github.repository == 'byteowlz/kyz'
+    steps:
+      # The package must already exist in microsoft/winget-pkgs before this job
+      # can update it. Submit the first manifest once, e.g. with Komac:
+      #   komac new --id byteowlz.kyz --version <x.y.z> --urls <zip-url> --submit
+      - name: Update WinGet manifest
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: byteowlz.kyz
+          installers-regex: '-pc-windows-msvc\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}
 
-  # publish-aur:
-  #   name: Publish to AUR
-  #   needs: release
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         ref: ${{ env.RELEASE_TAG }}
-  #     - name: Generate PKGBUILD
-  #       run: |
-  #         VERSION="${{ env.RELEASE_TAG }}"
-  #         VERSION="${VERSION#v}"
-  #         curl -sL "https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/checksums.txt" -o checksums.txt
-  #         SHA256=$(grep "x86_64-unknown-linux-gnu.tar.gz" checksums.txt | cut -d' ' -f1)
-  #         cat > PKGBUILD << EOF
-  #         # Maintainer: byteowlz
-  #         pkgname=${{ env.BINARY_NAME }}
-  #         pkgver=${VERSION}
-  #         pkgrel=1
-  #         pkgdesc="Your description here"
-  #         arch=('x86_64')
-  #         url="https://github.com/${{ github.repository }}"
-  #         license=('MIT')
-  #         depends=('gcc-libs')
-  #         source=("\$pkgname-\$pkgver.tar.gz::https://github.com/${{ github.repository }}/releases/download/v\$pkgver/${{ env.BINARY_NAME }}-v\$pkgver-x86_64-unknown-linux-gnu.tar.gz")
-  #         sha256sums=('${SHA256}')
-  #         package() {
-  #             install -Dm755 ${{ env.BINARY_NAME }} "\$pkgdir/usr/bin/${{ env.BINARY_NAME }}"
-  #         }
-  #         EOF
-  #     - name: Publish to AUR
-  #       uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
-  #       with:
-  #         pkgname: ${{ env.BINARY_NAME }}
-  #         pkgbuild: ./PKGBUILD
-  #         commit_username: byteowlz
-  #         commit_email: ${{ secrets.AUR_EMAIL }}
-  #         ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-  #         commit_message: "Update to ${{ env.RELEASE_TAG }}"
+  publish-homebrew:
+    name: Publish to Homebrew
+    needs: release
+    runs-on: ubuntu-latest
+    if: github.repository == 'byteowlz/kyz'
+    steps:
+      # The tap repo (byteowlz/homebrew-tap) regenerates Formula/kyz.rb from
+      # checksums.txt on this event, so it can update every platform's sha256.
+      - name: Update Homebrew tap
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          repository: byteowlz/homebrew-tap
+          event-type: update-formula
+          client-payload: |
+            {
+              "formula": "${{ env.BINARY_NAME }}",
+              "version": "${{ env.RELEASE_TAG }}",
+              "repo": "${{ github.repository }}"
+            }
+
+  publish-aur:
+    name: Publish to AUR
+    needs: release
+    runs-on: ubuntu-latest
+    if: github.repository == 'byteowlz/kyz'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Generate PKGBUILD
+        run: |
+          VERSION="${{ env.RELEASE_TAG }}"
+          VERSION="${VERSION#v}"
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/checksums.txt" -o checksums.txt
+          SHA256=$(grep "x86_64-unknown-linux-gnu.tar.gz" checksums.txt | cut -d' ' -f1)
+          cat > PKGBUILD << EOF
+          # Maintainer: byteowlz
+          pkgname=${{ env.BINARY_NAME }}
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Cross-platform secrets manager with CLI, TUI, API server, and MCP server"
+          arch=('x86_64')
+          url="https://github.com/${{ github.repository }}"
+          license=('MIT')
+          depends=('gcc-libs')
+          source=("\$pkgname-\$pkgver.tar.gz::https://github.com/${{ github.repository }}/releases/download/v\$pkgver/${{ env.BINARY_NAME }}-v\$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+          sha256sums=('${SHA256}')
+          package() {
+              install -Dm755 -t "\$pkgdir/usr/bin" kyz kyz-tui kyz-api kyz-mcp
+          }
+          EOF
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: ${{ env.BINARY_NAME }}
+          pkgbuild: ./PKGBUILD
+          commit_username: byteowlz
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ env.RELEASE_TAG }}"
 
   # publish-scoop:
   #   name: Publish to Scoop
