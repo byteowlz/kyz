@@ -1,0 +1,11 @@
+{
+  "why": "params must match op",
+  "message": {
+    "v": 1,
+    "id": "t1",
+    "op": "token",
+    "resolve": {
+      "ref": "kyz:a/b"
+    }
+  }
+}

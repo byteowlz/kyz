@@ -1,0 +1,20 @@
+{
+  "why": "credentials only over HTTPS",
+  "message": {
+    "v": 1,
+    "id": "u3",
+    "op": "use",
+    "use": {
+      "kind": "http",
+      "http": {
+        "credential": {
+          "audience": "graph"
+        },
+        "request": {
+          "method": "GET",
+          "url": "http://graph.microsoft.com/v1.0/me"
+        }
+      }
+    }
+  }
+}

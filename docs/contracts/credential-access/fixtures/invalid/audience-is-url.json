@@ -1,0 +1,11 @@
+{
+  "why": "audiences are registered names, not URLs",
+  "message": {
+    "v": 1,
+    "id": "t1",
+    "op": "token",
+    "token": {
+      "audience": "https://graph.microsoft.com"
+    }
+  }
+}

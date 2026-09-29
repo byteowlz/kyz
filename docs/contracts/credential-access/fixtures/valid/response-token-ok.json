@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "id": "t1",
+  "status": "ok",
+  "result": {
+    "kind": "token",
+    "token": "eyJ.example",
+    "token_type": "bearer",
+    "audience": "owa-mail-calendar",
+    "scopes": [
+      "Mail.Read",
+      "Mail.Send"
+    ],
+    "expires_at": 1790668800,
+    "can_refresh": true
+  }
+}

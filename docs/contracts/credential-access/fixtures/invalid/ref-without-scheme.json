@@ -1,0 +1,11 @@
+{
+  "why": "references are backend-qualified",
+  "message": {
+    "v": 1,
+    "id": "r1",
+    "op": "resolve",
+    "resolve": {
+      "ref": "github/token"
+    }
+  }
+}

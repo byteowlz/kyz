@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "id": "u2",
+  "op": "use",
+  "use": {
+    "kind": "webauthn_get",
+    "webauthn_get": {
+      "origin": "https://github.com",
+      "rp_id": "github.com",
+      "client_data_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "user_verification": "required"
+    }
+  }
+}

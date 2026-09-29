@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": "r1",
+  "status": "ok",
+  "result": {
+    "kind": "resolve",
+    "secret": "ghp_example"
+  },
+  "receipt_id": "rc-1"
+}

@@ -1,0 +1,15 @@
+{
+  "why": "brokers strip credential-bearing response headers",
+  "message": {
+    "v": 1,
+    "id": "u3",
+    "status": "ok",
+    "result": {
+      "kind": "http",
+      "status": 200,
+      "headers": {
+        "Set-Cookie": "session=abc"
+      }
+    }
+  }
+}

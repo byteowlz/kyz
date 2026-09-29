@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "id": "u1",
+  "status": "ok",
+  "result": {
+    "kind": "fill",
+    "filled": [
+      "username",
+      "password"
+    ]
+  }
+}

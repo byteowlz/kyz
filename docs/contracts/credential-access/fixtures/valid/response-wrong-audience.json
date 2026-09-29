@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "t2",
+  "status": "unavailable",
+  "error": {
+    "reason": "audience_unavailable",
+    "message": "no provider for audience 'owa-mail-calendar'"
+  }
+}

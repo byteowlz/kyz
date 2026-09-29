@@ -49,3 +49,4 @@ zxcvbn.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 kyz-core = { path = ".", features = ["test-util"] }
+jsonschema = "0.58.2"

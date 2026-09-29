@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "t3",
+  "status": "unavailable",
+  "error": {
+    "reason": "cannot_refresh",
+    "retry_after_s": 600
+  }
+}

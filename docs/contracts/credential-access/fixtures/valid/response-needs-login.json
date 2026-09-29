@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "t1",
+  "status": "needs_interaction",
+  "error": {
+    "reason": "login_required",
+    "message": "Microsoft session expired",
+    "interaction": {
+      "hint": "Open Edge and sign in to Outlook",
+      "host": "mbp1"
+    }
+  }
+}

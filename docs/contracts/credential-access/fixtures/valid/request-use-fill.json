@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "id": "u1",
+  "op": "use",
+  "use": {
+    "kind": "fill",
+    "fill": {
+      "origin": "https://github.com",
+      "ref": "kyz:web/github.com",
+      "fields": [
+        "username",
+        "password"
+      ],
+      "browser_session": "tab-42"
+    }
+  }
+}
