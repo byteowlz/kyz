@@ -16,6 +16,7 @@ Files:
 - One JSON object per line, request then response, over a **local authenticated transport**: a Unix socket (mode `0600` or peer-credential checked) or a Windows named pipe with an owner-only ACL. The broker's address is advertised by the discovery record from the ecosystem contracts; that record is a hint, never authority.
 - **The caller is identified by the transport** (peer credentials, per-caller token established out of band), and grants are looked up for that identity. A message cannot name its caller: the schema rejects `caller`, `agent_ctx` and any other unknown field. `AGENT_CTX` may be logged as context, never used to authorize.
 - `purpose` is untrusted text shown in approval prompts.
+- Socket permissions and OS peer credentials alone do not distinguish agents running as the same OS user. Per-run authorization requires a runner-established channel/capability bound to the run; a caller-supplied session id is not sufficient. Do not expose parent credentials through readable config files while relying on an environment override to hide them.
 
 ## Operations
 
@@ -77,6 +78,10 @@ The schema checks message shape. Implementations must additionally pass these be
 - replayed or expired grant → `denied`;
 - borrowed token file is unchanged byte-for-byte after any number of requests (rule 1);
 - `use/http` to an origin not declared for that credential → `denied/policy`;
+- HTTP URLs are parsed and normalized at runtime: reject userinfo and ambiguous hosts, enforce configured destination/network policy after DNS resolution, and disable redirects by default. Any explicitly permitted redirect is reauthorized before credentials are attached; HTTPS syntax alone is not an SSRF defense;
+- WebAuthn origin/RP-id binding and the browser-observed ceremony are verified by the trusted integration; a caller-supplied hash does not establish that binding;
+- same-user callers cannot impersonate another run; revoked run capabilities and concurrent exhausted-use grants fail closed;
+- arbitrary remote response bodies may echo injected credentials. Header filtering does not guarantee secret-free HTTP results; restrict destinations to trusted profile endpoints and document this residual risk;
 - response `id` equals request `id`; `result.kind` matches the request `op`/`use.kind`;
 - broker unreachable → consumers treat it as `unavailable/backend_offline` and degrade; protected actions fail closed.
 
