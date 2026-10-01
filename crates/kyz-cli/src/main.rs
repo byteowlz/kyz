@@ -436,7 +436,7 @@ struct ExecCommand {
     alias: Option<String>,
 
     /// Explicit env mapping: `ENV_VAR=service/key:field` (repeatable).
-    #[arg(long = "env", short = 'e', value_name = "ENV=SERVICE/KEY:FIELD")]
+    #[arg(long = "map", short = 'e', value_name = "ENV=SERVICE/KEY:FIELD")]
     env_maps: Vec<String>,
 
     /// Include all secrets matching this tag (repeatable).
@@ -2335,14 +2335,14 @@ fn resolve_exec_env(
         }
     }
 
-    // 5. Explicit --env mappings (highest priority)
+    // 5. Explicit --map mappings (highest priority)
     for mapping in &cmd.env_maps {
         let (var, field_ref) = mapping.split_once('=').ok_or_else(|| {
-            anyhow!("invalid --env format '{mapping}', expected ENV=service/key:field")
+            anyhow!("invalid --map format '{mapping}', expected ENV=service/key:field")
         })?;
         if !kyz_core::is_safe_exec_env_name(var) {
             return Err(anyhow!(
-                "refusing to inject unsafe env var name '{var}' via --env"
+                "refusing to inject unsafe env var name '{var}' via --map"
             ));
         }
         let value = resolve_field_ref(store, field_ref)?;
@@ -2635,7 +2635,7 @@ fn resolve_exec_env_headless(ctx: &RuntimeContext, cmd: &ExecCommand) -> Result<
 
     if scopes.is_empty() {
         return Err(anyhow!(
-            "headless mode requires explicit secret scopes (--alias, --secret, or --env)"
+            "headless mode requires explicit secret scopes (--alias, --secret, or --map)"
         ));
     }
 
@@ -2664,12 +2664,12 @@ fn resolve_exec_env_headless(ctx: &RuntimeContext, cmd: &ExecCommand) -> Result<
         }
     }
 
-    // Apply explicit --env mappings
+    // Apply explicit --map mappings
     for mapping in &cmd.env_maps {
         if let Some((var, field_ref)) = mapping.split_once('=') {
             if !kyz_core::is_safe_exec_env_name(var) {
                 return Err(anyhow!(
-                    "refusing to inject unsafe env var name '{var}' via --env"
+                    "refusing to inject unsafe env var name '{var}' via --map"
                 ));
             }
             if let Some(values) = stashed.get(field_ref) {
@@ -2752,7 +2752,7 @@ fn handle_exec(ctx: &RuntimeContext, cmd: &ExecCommand) -> Result<()> {
         .map_err(|e| anyhow!("{e}"))?;
 
     // Policy sees EVERY secret resolved for this invocation, whatever flag
-    // supplied it (--secret/--tag/--alias/--env/--pick).
+    // supplied it (--secret/--tag/--alias/--map/--pick).
     if let Err(v) = pol.check_all(&program, &args, &secret_refs) {
         kyz_core::audit::audit_policy_violation(&program, &v.to_string());
         return Err(anyhow!("{v}"));
@@ -3577,10 +3577,45 @@ fn handle_wrap(ctx: &RuntimeContext, cmd: &WrapCommand) -> Result<()> {
 mod tests {
     use super::{allowlist_daemon_env_from, env_key_is_sensitive};
 
+    #[test]
+    fn clap_command_definition_is_valid() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
+
     #[cfg(unix)]
     use super::sanitized_ipc_output;
 
     use super::format_timestamp;
+
+    #[test]
+    fn exec_mapping_and_environment_flags_are_distinct() {
+        use clap::Parser;
+        for mapping_flag in ["--map", "-e"] {
+            let cli = super::Cli::try_parse_from([
+                "kyz",
+                "exec",
+                "--env",
+                "staging",
+                mapping_flag,
+                "FOO=svc/key:value",
+                "--",
+                "echo",
+                "ok",
+            ])
+            .expect("exec arguments parse");
+            let super::Command::Exec(exec) = cli.command else {
+                panic!("expected exec command");
+            };
+            assert_eq!(
+                (cli.common.env_name, exec.env_maps),
+                (
+                    Some("staging".to_owned()),
+                    vec!["FOO=svc/key:value".to_owned()]
+                )
+            );
+        }
+    }
 
     #[test]
     fn format_timestamp_clamps_out_of_range_values() {

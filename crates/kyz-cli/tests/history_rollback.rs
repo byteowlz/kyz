@@ -100,6 +100,55 @@ fn history_json(fixture: &HistoryFixture, vault: &Path, secret: &str) -> serde_j
 }
 
 #[test]
+#[cfg(unix)]
+fn exec_explicit_mapping_reaches_the_child() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let fixture = HistoryFixture {
+        base: temp.path().to_owned(),
+        config_path: temp.path().join("config.toml"),
+    };
+    std::fs::write(&fixture.config_path, "profile = \"default\"\n").expect("config");
+    let vault = fixture.vault_path("vault");
+    for args in [["vault", "create"], ["vault", "unlock"]] {
+        HistoryFixture::assert_ok(&fixture.run_with_passphrase(&vault, &args), "prepare vault");
+    }
+    HistoryFixture::assert_ok(
+        &fixture.run(
+            &vault,
+            &[
+                "set",
+                "--service",
+                "svc",
+                "--field",
+                "value=fixture-only",
+                "key",
+            ],
+        ),
+        "set fixture secret",
+    );
+    for flag in ["--map", "-e"] {
+        let output = fixture.run(
+            &vault,
+            &[
+                "exec",
+                "--no-policy",
+                flag,
+                "TEST_MAPPED_SECRET=svc/key:value",
+                "--",
+                "sh",
+                "-c",
+                "printf '%s' \"$TEST_MAPPED_SECRET\"",
+            ],
+        );
+        HistoryFixture::assert_ok(&output, "exec mapping");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8"),
+            "fixture-only"
+        );
+    }
+}
+
+#[test]
 fn v4_history_seqs_resolve_in_rollback() {
     let fixture = HistoryFixture::new();
     let vault = fixture.vault_path("vault");

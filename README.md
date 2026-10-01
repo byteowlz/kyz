@@ -61,7 +61,7 @@ kyz exec --alias deploy -- make deploy
 kyz exec --secret github/deploy-key --secret aws/prod -- ./deploy.sh
 
 # Explicit env-var mapping
-kyz exec --env GITHUB_TOKEN=github/deploy-key:token -- gh pr create
+kyz exec --map GITHUB_TOKEN=github/deploy-key:token -- gh pr create
 
 # Tag-based: inject all secrets tagged "dev"
 kyz exec --tag dev -- cargo test

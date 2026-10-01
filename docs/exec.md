@@ -27,12 +27,12 @@ kyz exec --secret github/deploy-key -- env
 # → TOKEN=ghp_xxx  USERNAME=bot
 ```
 
-### Explicit mapping (`--env`)
+### Explicit mapping (`--map`, `-e`)
 
 Map a specific field to a named env var:
 
 ```bash
-kyz exec --env GITHUB_TOKEN=github/deploy-key:token -- gh pr create
+kyz exec --map GITHUB_TOKEN=github/deploy-key:token -- gh pr create
 ```
 
 Format: `ENV_VAR=service/key:field`
@@ -72,7 +72,7 @@ All modes can be combined. Resolution order (later wins on conflict):
 4. `--secret` flags
 5. `--tag` flags
 6. `--pick` selection
-7. `--env` flags (highest priority)
+7. `--map` flags (highest priority)
 
 ## Dry run
 
