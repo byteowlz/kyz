@@ -21,6 +21,13 @@ pub enum CoreError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// Preserve-first access requires an explicit migration of a legacy vault.
+    #[error("vault format v{version} requires explicit migration")]
+    MigrationRequired {
+        /// On-disk legacy format version.
+        version: u32,
+    },
+
     /// A secret store operation failed.
     #[error("secret store error: {0}")]
     Secret(String),
