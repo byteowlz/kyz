@@ -51,8 +51,8 @@ fn config_serialization_roundtrip() {
 #[test]
 fn alias_config_default_is_empty() {
     let alias = AliasConfig::default();
-    assert!(alias.secrets.is_empty());
-    assert!(alias.tags.is_empty());
+    assert_eq!(alias.secrets, [] as [std::string::String; 0]);
+    assert_eq!(alias.tags, [] as [std::string::String; 0]);
     assert!(alias.env_map.is_empty());
 }
 

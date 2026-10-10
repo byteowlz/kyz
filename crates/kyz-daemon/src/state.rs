@@ -440,8 +440,11 @@ mod tests {
             vec![r"machine\user".to_string()]
         );
         // Non-ACE text yields nothing.
-        assert!(parse_ace_trustees("Successfully processed 1 files").is_empty());
-        assert!(parse_ace_trustees("").is_empty());
+        assert_eq!(
+            parse_ace_trustees("Successfully processed 1 files"),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(parse_ace_trustees(""), [] as [std::string::String; 0]);
     }
 
     #[test]
