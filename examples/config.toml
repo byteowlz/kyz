@@ -10,7 +10,6 @@ history_retention = 10
 level = "info"
 
 [runtime]
-timeout = 60
 fail_fast = true
 
 [paths]

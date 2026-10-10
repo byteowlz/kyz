@@ -22,6 +22,9 @@ the API key: it exists only in the encrypted vault and daemon memory.
 - `CONNECT` and `TRACE` are always rejected.
 - Every request is audited to `state_dir/daemon/audit.log` (rule name,
   host, outcome; never secret values).
+- Upstream connections are direct unless `proxy.upstream_proxy` is
+  configured; `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables
+  are never inherited.
 
 ## Store the credential
 
@@ -87,6 +90,26 @@ Authorization = "Basic {{tinify.value}}"
 `credentials` is an explicit allowlist: templates may reference only the
 listed `alias.field` pairs. Image or file uploads may need
 `[daemon] request_body_limit_bytes` raised above the 10 MiB default.
+
+## Reach upstreams through an outbound proxy
+
+When upstream APIs are only reachable via an egress proxy (corporate
+networks), set `proxy.upstream_proxy`:
+
+```toml
+[proxy]
+auth = "token"
+upstream_proxy = "http://proxy.corp:3128"          # no path/query allowed
+# Proxy authentication goes in the URL userinfo:
+# upstream_proxy = "http://user:pass@proxy.corp:3128"
+```
+
+Every upstream connection is then tunneled through the proxy with HTTP
+`CONNECT`. Because rule upstreams must be `https://`, the proxy only
+relays the TLS tunnel — it never sees the injected credentials. The
+setting applies to all rules and is fixed at daemon startup: changing it
+requires a restart, not just `kyz daemon reload`. Only `http://` and
+`https://` proxies are accepted (no SOCKS).
 
 ## Start the daemon
 

@@ -21,7 +21,7 @@ fn default_config_has_sane_values() {
     assert_eq!(cfg.profile, "default");
     assert!(matches!(cfg.logging.level, LogLevel::Info));
     assert!(cfg.runtime.fail_fast);
-    assert_eq!(cfg.runtime.timeout, Some(60));
+    assert_eq!(cfg.runtime.timeout, None);
     assert_eq!(cfg.history_retention, 10);
     assert!(cfg.aliases.is_empty());
 }
@@ -75,7 +75,7 @@ fn alias_config_serialization_roundtrip() {
 fn runtime_config_defaults() {
     let rt = RuntimeConfig::default();
     assert!(rt.parallelism.is_none());
-    assert_eq!(rt.timeout, Some(60));
+    assert_eq!(rt.timeout, None);
     assert!(rt.fail_fast);
 }
 

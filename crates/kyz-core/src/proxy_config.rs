@@ -551,6 +551,41 @@ pub fn upstream_host(url: &str) -> Result<String, String> {
     normalize_host(authority).map_err(|e| format!("upstream host is invalid: {e}"))
 }
 
+/// Validate an outbound proxy URL: `http://` or `https://` scheme,
+/// optional `user:pass@` userinfo (proxy authentication), non-empty host,
+/// legal port, and no path, query, or fragment.
+///
+/// Unlike rule `upstream` URLs, userinfo is allowed: proxies commonly
+/// authenticate with credentials carried in the URL.
+///
+/// # Errors
+///
+/// Returns a human-readable reason (never echoes userinfo).
+pub fn validate_upstream_proxy(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.chars().any(char::is_whitespace) {
+        return Err("upstream_proxy must not contain whitespace".to_string());
+    }
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .ok_or_else(|| "upstream_proxy must be an http:// or https:// URL".to_string())?;
+    if rest.is_empty() {
+        return Err("upstream_proxy has an empty host".to_string());
+    }
+    if rest.contains(['/', '?', '#']) {
+        return Err("upstream_proxy must not contain a path, query, or fragment".to_string());
+    }
+    let authority = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    if authority.is_empty() {
+        return Err("upstream_proxy has an empty host".to_string());
+    }
+    normalize_host(authority)
+        .map(|_| ())
+        .map_err(|e| format!("upstream_proxy host is invalid: {e}"))
+}
+
 /// Whether `name` is a valid HTTP header name (RFC 7230 token).
 #[must_use]
 pub fn valid_header_name(name: &str) -> bool {
@@ -645,6 +680,7 @@ pub fn validate_app_config(cfg: &AppConfig) -> Result<(), ConfigValidationError>
     let mut issues = Vec::new();
 
     validate_daemon(cfg, &mut issues);
+    validate_proxy(cfg, &mut issues);
     validate_rules(cfg, &mut issues);
     validate_scripts(cfg, &mut issues);
 
@@ -691,6 +727,14 @@ fn validate_daemon(cfg: &AppConfig, issues: &mut Vec<String>) {
             "daemon.response_body_limit_bytes must be at least 1 (0 would fail every response body)"
                 .to_string(),
         );
+    }
+}
+
+fn validate_proxy(cfg: &AppConfig, issues: &mut Vec<String>) {
+    if let Some(url) = cfg.proxy.upstream_proxy.as_deref()
+        && let Err(e) = validate_upstream_proxy(url)
+    {
+        issues.push(format!("proxy.upstream_proxy: {e}"));
     }
 }
 
@@ -1133,6 +1177,39 @@ mod tests {
     }
 
     #[test]
+    fn upstream_proxy_validation() {
+        assert!(validate_upstream_proxy("http://proxy.corp:3128").is_ok());
+        // Proxy credentials in the URL are allowed, unlike rule upstreams.
+        assert!(validate_upstream_proxy("http://user:pass@proxy.corp:3128").is_ok());
+        assert!(validate_upstream_proxy("https://proxy.corp:3128").is_ok());
+        assert!(validate_upstream_proxy("socks5://proxy.corp:1080").is_err());
+        assert!(validate_upstream_proxy("http://proxy.corp/connector").is_err());
+        assert!(validate_upstream_proxy("http://proxy.corp:3128?x=1").is_err());
+        assert!(validate_upstream_proxy("http://").is_err());
+        assert!(validate_upstream_proxy("http://user:pass@").is_err());
+        // Failures must never echo the userinfo (proxy credentials).
+        let err =
+            validate_upstream_proxy("http://user:secret@*.corp:3128").expect_err("wildcard host");
+        assert!(
+            !err.contains("secret"),
+            "error leaked the proxy password: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_upstream_proxy_is_reported_at_config_level() {
+        let mut cfg = base_config(Vec::new());
+        cfg.proxy.upstream_proxy = Some("socks5://proxy.corp:1080".to_string());
+        let err = validate_app_config(&cfg).expect_err("socks proxy must fail");
+        assert!(
+            err.issues
+                .iter()
+                .any(|i| i.contains("proxy.upstream_proxy")),
+            "missing upstream_proxy issue: {err}"
+        );
+    }
+
+    #[test]
     fn reserved_and_invalid_injected_headers_are_rejected() {
         let mut r = make_rule("sophify", "api.sophify.com");
         r.headers = BTreeMap::from([("Host".to_string(), "{{app.token}}".to_string())]);
@@ -1203,6 +1280,7 @@ mod tests {
         AppConfig {
             proxy: ProxyConfig {
                 auth: ProxyAuthMode::Token,
+                upstream_proxy: None,
                 rules,
             },
             ..AppConfig::default()

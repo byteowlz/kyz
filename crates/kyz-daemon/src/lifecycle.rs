@@ -52,20 +52,20 @@ const SHUTDOWN_DRAIN_SLACK: Duration = Duration::from_secs(5);
 /// How long shutdown may wait for the serving tasks (and their in-flight
 /// requests): at least as long as one worst-case in-flight proxy request
 /// (body-read deadline + upstream deadline + slack), so a graceful stop
-/// does not cancel requests whose audit events would then be lost.
+/// does not cancel requests whose audit events would then be lost. When
+/// upstream requests are unbounded (`runtime.timeout` unset or 0) there is
+/// no worst case to cover; draining falls back to the floor and requests
+/// still running past the budget are cut short.
 fn shutdown_drain_budget(state: &DaemonState) -> Duration {
-    let upstream_secs = state
+    state
         .snapshots
         .current()
         .ok()
-        .and_then(|s| s.config.runtime.timeout)
-        .unwrap_or(crate::upstream::DEFAULT_UPSTREAM_TIMEOUT_SECS)
-        .max(1);
-    SHUTDOWN_DRAIN_TIMEOUT.max(
-        crate::proxy::REQUEST_BODY_READ_TIMEOUT
-            + Duration::from_secs(upstream_secs)
-            + SHUTDOWN_DRAIN_SLACK,
-    )
+        .and_then(|s| s.config.runtime.effective_timeout())
+        .map_or(SHUTDOWN_DRAIN_TIMEOUT, |upstream| {
+            SHUTDOWN_DRAIN_TIMEOUT
+                .max(crate::proxy::REQUEST_BODY_READ_TIMEOUT + upstream + SHUTDOWN_DRAIN_SLACK)
+        })
 }
 
 /// Take the serving tasks and wait (bounded) for them to unwind, so their
