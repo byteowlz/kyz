@@ -267,10 +267,13 @@ async fn strips_hostile_headers_and_injects_credentials() {
     // transport may add its own `Connection: close` for our close-framed
     // request; that is local framing, not a forwarded header.)
     assert!(!response.header_values("connection").contains(&"keep-alive"));
-    assert!(response.header_values("keep-alive").is_empty());
-    assert!(response.header_values("transfer-encoding").is_empty());
-    assert!(response.header_values("proxy-authenticate").is_empty());
-    assert!(response.header_values("trailer").is_empty());
+    assert_eq!(response.header_values("keep-alive"), [] as [&str; 0]);
+    assert_eq!(response.header_values("transfer-encoding"), [] as [&str; 0]);
+    assert_eq!(
+        response.header_values("proxy-authenticate"),
+        [] as [&str; 0]
+    );
+    assert_eq!(response.header_values("trailer"), [] as [&str; 0]);
     // End-to-end headers pass through untouched.
     assert_eq!(response.header_values("x-custom"), vec!["end-to-end"]);
     assert_eq!(response.header_values("content-type"), vec!["text/plain"]);
@@ -283,14 +286,17 @@ async fn strips_hostile_headers_and_injects_credentials() {
     // client's values (including duplicates) never made it upstream.
     let api_keys = recorded.header_values("x-api-key");
     assert_eq!(api_keys, vec![pf.fixture.secret_value.as_str()]);
-    assert!(recorded.header_values("authorization").is_empty());
-    assert!(recorded.header_values("proxy-authorization").is_empty());
-    assert!(recorded.header_values("keep-alive").is_empty());
-    assert!(recorded.header_values("connection").is_empty());
-    assert!(recorded.header_values("x-nominated").is_empty());
-    assert!(recorded.header_values("upgrade").is_empty());
-    assert!(recorded.header_values("transfer-encoding").is_empty());
-    assert!(recorded.header_values("x-kyz-proxy-token").is_empty());
+    assert_eq!(recorded.header_values("authorization"), [] as [&str; 0]);
+    assert_eq!(
+        recorded.header_values("proxy-authorization"),
+        [] as [&str; 0]
+    );
+    assert_eq!(recorded.header_values("keep-alive"), [] as [&str; 0]);
+    assert_eq!(recorded.header_values("connection"), [] as [&str; 0]);
+    assert_eq!(recorded.header_values("x-nominated"), [] as [&str; 0]);
+    assert_eq!(recorded.header_values("upgrade"), [] as [&str; 0]);
+    assert_eq!(recorded.header_values("transfer-encoding"), [] as [&str; 0]);
+    assert_eq!(recorded.header_values("x-kyz-proxy-token"), [] as [&str; 0]);
     // Static headers flow; query and body pass through untouched.
     assert_eq!(recorded.header_values("x-rule"), vec!["sophify"]);
     assert_eq!(recorded.target, "/v1/items?a=secret-query");
@@ -343,7 +349,7 @@ async fn token_authentication_gate() {
     assert_eq!(ok.status, 200);
     let requests = pf.mock.wait_for_requests(1).await;
     let recorded = requests.last().expect("recorded");
-    assert!(recorded.header_values("x-kyz-proxy-token").is_empty());
+    assert_eq!(recorded.header_values("x-kyz-proxy-token"), [] as [&str; 0]);
 
     // Auth failures never reach the upstream.
     assert_eq!(
@@ -650,6 +656,59 @@ async fn upstream_timeout_maps_to_504() {
 }
 
 #[tokio::test]
+async fn upstream_traffic_flows_through_configured_http_proxy() {
+    let pf = ProxyFixture::new();
+    let proxy = support::MockConnectProxy::start();
+    let proxy_url = format!("http://{}", proxy.addr);
+    // The config exercises the daemon-side parse/validation of
+    // `upstream_proxy`; the seam client carries the same proxy because it
+    // replaces the production client (and must trust the mock CA).
+    pf.write_config_with_proxy(
+        &proxy_url,
+        &rule_toml("sophify", "api.sophify.com", None, &pf.mock.url, None),
+    );
+    let client = pf.test_client(30, u64::MAX, Some(&proxy_url));
+    let daemon = pf.fixture.start_with_client(None, Some(client)).await;
+    let addr = pf.proxy_addr().await;
+
+    pf.mock
+        .push_response(ScriptedResponse::with_body(200, b"via-proxy"));
+    let response = pf
+        .send(addr, "GET", "api.sophify.com", "/tunnel", &[], b"")
+        .await;
+    assert_eq!(
+        response.status, 200,
+        "request must succeed through the proxy"
+    );
+    assert_eq!(response.body, b"via-proxy".to_vec());
+
+    // The upstream saw the full request — credentials were injected as
+    // usual (TLS is end-to-end through the CONNECT tunnel).
+    let recorded = pf.mock.requests();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].target, "/tunnel");
+    assert_eq!(
+        recorded[0].header_values("x-api-key"),
+        vec![pf.fixture.secret_value.as_str()],
+        "credential injection is unchanged through the tunnel"
+    );
+
+    // And the connection really went through the CONNECT proxy: exactly
+    // one tunnel, dialed to the rule's upstream authority.
+    let mock_authority = pf.mock.url.trim_start_matches("https://").to_string();
+    assert_eq!(
+        proxy.connect_targets(),
+        vec![mock_authority],
+        "upstream must be reached via exactly one CONNECT to the rule's upstream"
+    );
+
+    daemon.shutdown().await;
+    pf.fixture.assert_no_secret_leaks();
+    pf.mock.stop();
+    proxy.stop();
+}
+
+#[tokio::test]
 async fn body_and_concurrency_limits() {
     let pf = ProxyFixture::new();
     pf.write_config_with(
@@ -886,7 +945,7 @@ async fn proxy_bind_failure_allows_retry_on_same_state_dir() {
     let guard = common::daemon_test_lock().await;
     let error = kyz_daemon::run_daemon_with_upstream(
         pf.fixture.options(None),
-        pf.test_client(30, u64::MAX),
+        pf.test_client(30, u64::MAX, None),
     )
     .await
     .expect_err("occupied port must fail startup");
@@ -960,7 +1019,7 @@ async fn non_loopback_listen_fails_startup() {
     let guard = common::daemon_test_lock().await;
     let error = kyz_daemon::run_daemon_with_upstream(
         pf.fixture.options(None),
-        pf.test_client(30, u64::MAX),
+        pf.test_client(30, u64::MAX, None),
     )
     .await
     .expect_err("non-loopback listen must fail closed");
@@ -1102,9 +1161,10 @@ fn env_proxy_variables_are_ignored() {
 fn child_direct_request() {
     let mock = support::MockUpstream::start();
     let client = kyz_daemon::UpstreamClient::with_root_certs(
-        Duration::from_secs(15),
+        Some(Duration::from_secs(15)),
         u64::MAX,
         &mock.ca_pem,
+        None,
     );
     let request = kyz_daemon::UpstreamRequest {
         method: "GET".to_string(),

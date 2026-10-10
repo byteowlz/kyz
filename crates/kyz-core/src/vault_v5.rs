@@ -1143,7 +1143,7 @@ mod tests {
         assert!(a.merge_from(&b).unwrap());
         assert_eq!(a.keyslots, b.keyslots);
         assert!(!a.keyslots[&legacy_id].is_active());
-        assert!(a.keyslots[&legacy_id].wrapped_dk.is_empty());
+        assert_eq!(a.keyslots[&legacy_id].wrapped_dk, "");
         assert!(a.keyslots[&new_id].is_active());
         // Idempotent.
         assert!(!a.merge_from(&b).unwrap());

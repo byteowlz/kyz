@@ -92,16 +92,22 @@ impl ProxyShared {
             })?),
             ProxyAuthMode::None => None,
         };
-        let timeout_secs = snapshot
+        // `runtime.timeout` unset or 0 leaves upstream requests unbounded.
+        let timeout = snapshot.config.runtime.effective_timeout();
+        // The outbound proxy is operator-configured only; environment
+        // proxies are never inherited.
+        let proxy = snapshot
             .config
-            .runtime
-            .timeout
-            .unwrap_or(crate::upstream::DEFAULT_UPSTREAM_TIMEOUT_SECS)
-            .max(1);
+            .proxy
+            .upstream_proxy
+            .as_deref()
+            .map(parse_upstream_proxy)
+            .transpose()?;
         let client = client_override.unwrap_or_else(|| {
             UpstreamClient::new(
-                Duration::from_secs(timeout_secs),
+                timeout,
                 snapshot.config.daemon.response_body_limit_bytes,
+                proxy,
             )
         });
         Ok(Self {
@@ -317,6 +323,9 @@ pub(crate) fn reload_runtime_compat(
     let mut fixed: Vec<&str> = Vec::new();
     if active.proxy.auth != candidate.proxy.auth {
         fixed.push("proxy.auth");
+    }
+    if active.proxy.upstream_proxy != candidate.proxy.upstream_proxy {
+        fixed.push("proxy.upstream_proxy");
     }
     if active.daemon.listen != candidate.daemon.listen {
         fixed.push("daemon.listen");
@@ -559,6 +568,22 @@ fn single_header_value(headers: &HeaderMap, name: &str) -> TokenHeader {
     }
     first.to_str().map_or(TokenHeader::Invalid, |value| {
         TokenHeader::Present(value.to_string())
+    })
+}
+
+/// Parse the configured outbound proxy URL into a `ureq::Proxy`.
+///
+/// Config validation (`validate_upstream_proxy`) already rejected
+/// malformed URLs at load time, so a parse failure here is a fail-closed
+/// configuration error. The message never echoes the URL: it may carry
+/// proxy credentials in its userinfo.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::Config`] when the URL does not parse.
+fn parse_upstream_proxy(url: &str) -> Result<ureq::Proxy> {
+    ureq::Proxy::new(url).map_err(|_| {
+        DaemonError::Config("proxy.upstream_proxy is not a usable proxy URL".to_string())
     })
 }
 
@@ -877,5 +902,17 @@ mod tests {
             single_header_value(&headers, "x-a"),
             TokenHeader::Invalid
         ));
+    }
+
+    #[test]
+    fn upstream_proxy_url_parses_or_fails_closed() {
+        let proxy =
+            parse_upstream_proxy("http://user:pass@proxy.corp:3128").expect("valid proxy URL");
+        assert!(format!("{proxy:?}").contains("proxy.corp"));
+        let err = parse_upstream_proxy("not a url").expect_err("garbage must fail closed");
+        assert!(
+            !format!("{err}").contains("not a url"),
+            "error must not echo the configured URL: {err}"
+        );
     }
 }

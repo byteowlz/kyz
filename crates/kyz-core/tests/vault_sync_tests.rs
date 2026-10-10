@@ -453,7 +453,7 @@ fn v3_vault_unlock_migrates_and_keeps_everything_readable() {
 
     // The v3 archived snapshot remains in the derived history view.
     let items = store.history_v4("app", "legacy").expect("history");
-    assert!(!items.is_empty());
+    assert_ne!(items, [] as [kyz_core::HistoryItem; 0]);
 
     let _ = store.lock();
     cleanup(&path);
@@ -806,7 +806,7 @@ fn edits_lost_to_a_concurrent_delete_are_reported_in_both_directions() {
     let report = a
         .merge_vault_from(&path_b, false, false)
         .expect("merge b into a");
-    assert!(report.deleted_entries.is_empty());
+    assert_eq!(report.deleted_entries, [] as [std::string::String; 0]);
     assert_eq!(report.lost_to_delete.len(), 1, "{report:?}");
 
     // Neither side calls a hidden version current.
@@ -823,7 +823,7 @@ fn edits_lost_to_a_concurrent_delete_are_reported_in_both_directions() {
 
     // Re-merging reports nothing new.
     let report = a.merge_vault_from(&path_b, false, false).expect("re-merge");
-    assert!(report.lost_to_delete.is_empty());
+    assert_eq!(report.lost_to_delete, [] as [kyz_core::LostToDelete; 0]);
 
     let _ = a.lock();
     let _ = b.lock();

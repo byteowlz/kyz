@@ -10,10 +10,16 @@
 //!   responses, not errors;
 //! - `https_only`: belt-and-suspenders behind the rule-level `https://`
 //!   validation;
-//! - `proxy = None`: `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment
-//!   variables are never inherited (`ureq` reads them by default);
-//! - certificate validation left enabled (rustls `WebPki` roots);
-//! - a bounded global request timeout.
+//! - no proxy unless the operator configures one: `HTTP_PROXY`/
+//!   `HTTPS_PROXY`/`ALL_PROXY` environment variables are never inherited
+//!   (`ureq` reads them by default), and the configured
+//!   `proxy.upstream_proxy` is the only proxy ever used. Because every
+//!   upstream must be `https://`, a configured HTTP proxy is a CONNECT
+//!   tunnel: it relays ciphertext and never sees the injected
+//!   credentials;
+//! - certificate validation left enabled (rustls `WebPKi` roots);
+//! - an optional global request timeout (unbounded unless the config sets
+//!   `runtime.timeout`).
 //!
 //! All calls are synchronous (`ureq` is blocking); proxy handlers wrap
 //! them in `tokio::task::spawn_blocking`.
@@ -22,11 +28,8 @@ use std::io::Read as _;
 use std::time::Duration;
 
 use bytes::Bytes;
+use ureq::Proxy;
 use ureq::tls::{RootCerts, TlsConfig};
-
-/// Default upstream request timeout (seconds) when the config carries
-/// none.
-pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 60;
 
 /// Error kinds mapped to client-facing statuses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,10 +91,12 @@ pub struct UpstreamClient {
 }
 
 impl UpstreamClient {
-    /// Build the production client: system roots, bounded timeout.
+    /// Build the production client: system roots, optional timeout
+    /// (`None` leaves upstream requests unbounded), optional outbound
+    /// proxy (`None` connects directly and ignores env proxies).
     #[must_use]
-    pub fn new(timeout: Duration, response_limit: u64) -> Self {
-        Self::build(timeout, response_limit, None)
+    pub fn new(timeout: Option<Duration>, response_limit: u64, proxy: Option<Proxy>) -> Self {
+        Self::build(timeout, response_limit, None, proxy)
     }
 
     /// Test seam: identical hardening, but trusting only
@@ -99,7 +104,12 @@ impl UpstreamClient {
     /// exposed through user configuration.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_root_certs(timeout: Duration, response_limit: u64, ca_pem: &str) -> Self {
+    pub fn with_root_certs(
+        timeout: Option<Duration>,
+        response_limit: u64,
+        ca_pem: &str,
+        proxy: Option<Proxy>,
+    ) -> Self {
         // The seam trusts exactly the mock CA: a single anchor is all it
         // needs, and an unparseable PEM yields an empty root set (fail
         // closed) rather than falling back to system roots.
@@ -107,10 +117,15 @@ impl UpstreamClient {
             |_| RootCerts::from(Vec::new()),
             |cert| RootCerts::from(vec![cert]),
         );
-        Self::build(timeout, response_limit, Some(root_certs))
+        Self::build(timeout, response_limit, Some(root_certs), proxy)
     }
 
-    fn build(timeout: Duration, response_limit: u64, roots: Option<RootCerts>) -> Self {
+    fn build(
+        timeout: Option<Duration>,
+        response_limit: u64,
+        roots: Option<RootCerts>,
+        proxy: Option<Proxy>,
+    ) -> Self {
         let mut tls = TlsConfig::builder();
         if let Some(roots) = roots {
             tls = tls.root_certs(roots);
@@ -119,11 +134,14 @@ impl UpstreamClient {
             .http_status_as_error(false)
             .max_redirects(0)
             .https_only(true)
-            // ureq's default config inherits HTTP(S)_PROXY/ALL_PROXY from
-            // the environment; the daemon's upstream traffic must always
-            // be direct.
-            .proxy(None)
-            .timeout_global(Some(timeout.max(Duration::from_secs(1))))
+            // Only the operator-configured `proxy.upstream_proxy` is ever
+            // set; ureq's default config would additionally inherit
+            // HTTP(S)_PROXY/ALL_PROXY from the environment.
+            .proxy(proxy)
+            // Configured timeouts are floored at 1s so a stray `0` can't
+            // produce an instantly-expiring deadline; `None` disables the
+            // deadline entirely.
+            .timeout_global(timeout.map(|t| t.max(Duration::from_secs(1))))
             .tls_config(tls.build())
             .build();
         Self {
@@ -132,14 +150,25 @@ impl UpstreamClient {
         }
     }
 
-    /// Whether the agent resolved any proxy from the environment.
+    /// The proxy installed on the agent, if any.
     ///
-    /// Always `false` by construction; tests assert this so a regression
-    /// to ureq's default env inheritance cannot land silently.
+    /// Only ever the operator-configured `proxy.upstream_proxy`. Tests
+    /// assert `None` for unconfigured clients so a regression to ureq's
+    /// env-var inheritance cannot land silently.
     #[doc(hidden)]
     #[must_use]
-    pub fn agent_uses_no_proxy(&self) -> bool {
-        self.agent.config().proxy().is_none()
+    pub fn agent_proxy(&self) -> Option<&Proxy> {
+        self.agent.config().proxy()
+    }
+
+    /// The configured global request timeout, if any.
+    ///
+    /// Tests assert this so the unbounded-by-default contract cannot
+    /// regress silently.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn agent_global_timeout(&self) -> Option<Duration> {
+        self.agent.config().timeouts().global
     }
 
     /// Execute one request synchronously, consuming it.
@@ -241,21 +270,43 @@ mod tests {
 
     #[test]
     fn production_agent_never_uses_a_proxy() {
-        let client = UpstreamClient::new(Duration::from_secs(DEFAULT_UPSTREAM_TIMEOUT_SECS), 1024);
+        let client = UpstreamClient::new(Some(Duration::from_secs(60)), 1024, None);
         assert!(
-            client.agent_uses_no_proxy(),
-            "upstream agent must not resolve env proxies"
+            client.agent_proxy().is_none(),
+            "unconfigured upstream agent must not resolve env proxies"
         );
     }
 
     #[test]
     fn test_seam_agent_also_direct() {
-        let client = UpstreamClient::with_root_certs(
-            Duration::from_secs(DEFAULT_UPSTREAM_TIMEOUT_SECS),
-            1024,
-            "",
+        let client = UpstreamClient::with_root_certs(Some(Duration::from_secs(60)), 1024, "", None);
+        assert!(client.agent_proxy().is_none());
+    }
+
+    #[test]
+    fn configured_proxy_is_installed() {
+        let proxy = Proxy::new("http://127.0.0.1:3128").expect("valid proxy URL");
+        let client = UpstreamClient::new(Some(Duration::from_secs(60)), 1024, Some(proxy));
+        assert!(
+            client.agent_proxy().is_some(),
+            "configured proxy must be used"
         );
-        assert!(client.agent_uses_no_proxy());
+    }
+
+    #[test]
+    fn no_timeout_configured_leaves_requests_unbounded() {
+        let client = UpstreamClient::new(None, 1024, None);
+        assert_eq!(
+            client.agent_global_timeout(),
+            None,
+            "unset runtime.timeout must not install a deadline"
+        );
+    }
+
+    #[test]
+    fn configured_timeout_is_floored_at_one_second() {
+        let client = UpstreamClient::new(Some(Duration::ZERO), 1024, None);
+        assert_eq!(client.agent_global_timeout(), Some(Duration::from_secs(1)));
     }
 
     #[test]
