@@ -119,6 +119,15 @@ setting applies to all rules and is fixed at daemon startup: changing it
 requires a restart, not just `kyz daemon reload`. Only `http://` and
 `https://` proxies are accepted (no SOCKS).
 
+## Upstream timeout and shutdown
+
+Upstream requests default to a 60-second deadline. Set `runtime.timeout` to
+another positive number to bound long requests. Explicit `0` disables the
+upstream deadline, but is unsafe for predictable shutdown: started blocking
+HTTP work cannot be cancelled by timing out its async waiter. A stalled
+upstream can keep the process alive after shutdown removes its PID file.
+Keep a finite timeout until cancellable upstream shutdown is implemented.
+
 ## Start the daemon
 
 ```bash

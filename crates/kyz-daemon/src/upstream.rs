@@ -18,8 +18,8 @@
 //!   tunnel: it relays ciphertext and never sees the injected
 //!   credentials;
 //! - certificate validation left enabled (rustls `WebPKi` roots);
-//! - an optional global request timeout (unbounded unless the config sets
-//!   `runtime.timeout`).
+//! - a global request timeout (60 seconds by default); only explicit
+//!   `runtime.timeout = 0` opts out.
 //!
 //! All calls are synchronous (`ureq` is blocking); proxy handlers wrap
 //! them in `tokio::task::spawn_blocking`.
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn production_agent_never_uses_a_proxy() {
-        let client = UpstreamClient::new(Some(Duration::from_secs(60)), 1024, None);
+        let client = UpstreamClient::new(Some(Duration::from_mins(1)), 1024, None);
         assert!(
             client.agent_proxy().is_none(),
             "unconfigured upstream agent must not resolve env proxies"
@@ -279,14 +279,14 @@ mod tests {
 
     #[test]
     fn test_seam_agent_also_direct() {
-        let client = UpstreamClient::with_root_certs(Some(Duration::from_secs(60)), 1024, "", None);
+        let client = UpstreamClient::with_root_certs(Some(Duration::from_mins(1)), 1024, "", None);
         assert!(client.agent_proxy().is_none());
     }
 
     #[test]
     fn configured_proxy_is_installed() {
         let proxy = Proxy::new("http://127.0.0.1:3128").expect("valid proxy URL");
-        let client = UpstreamClient::new(Some(Duration::from_secs(60)), 1024, Some(proxy));
+        let client = UpstreamClient::new(Some(Duration::from_mins(1)), 1024, Some(proxy));
         assert!(
             client.agent_proxy().is_some(),
             "configured proxy must be used"

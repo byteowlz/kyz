@@ -92,7 +92,7 @@ impl ProxyShared {
             })?),
             ProxyAuthMode::None => None,
         };
-        // `runtime.timeout` unset or 0 leaves upstream requests unbounded.
+        // Default upstream deadline is 60s; explicit 0 opts out.
         let timeout = snapshot.config.runtime.effective_timeout();
         // The outbound proxy is operator-configured only; environment
         // proxies are never inherited.

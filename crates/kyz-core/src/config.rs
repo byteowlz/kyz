@@ -129,6 +129,7 @@ impl AppConfig {
             .set_default("profile", "default")?
             .set_default("logging.level", "info")?
             .set_default("runtime.parallelism", default_parallelism() as i64)?
+            .set_default("runtime.timeout", 60_i64)?
             .set_default("runtime.fail_fast", true)?
             .add_source(file)
             .add_source(Environment::with_prefix(env_prefix.as_str()).separator("__"))
@@ -232,8 +233,8 @@ pub struct RuntimeConfig {
     #[schemars(range(min = 1))]
     pub parallelism: Option<usize>,
 
-    /// Timeout in seconds for long-running operations; unset or `0` means
-    /// no timeout.
+    /// Timeout in seconds for long-running operations (default: 60).
+    /// Explicit `0` disables the deadline; see the shutdown caveat in docs/proxy.md.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
     pub timeout: Option<u64>,
@@ -246,18 +247,18 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             parallelism: None,
-            timeout: None,
+            timeout: Some(60),
             fail_fast: true,
         }
     }
 }
 
 impl RuntimeConfig {
-    /// The effective long-running-operation timeout: `timeout` unset or
-    /// `0` means no timeout (`None`).
+    /// The effective timeout: absent means 60 seconds; explicit `0`
+    /// disables the deadline (`None`).
     #[must_use]
     pub fn effective_timeout(&self) -> Option<std::time::Duration> {
-        self.timeout
+        Some(self.timeout.unwrap_or(60))
             .filter(|secs| *secs > 0)
             .map(std::time::Duration::from_secs)
     }

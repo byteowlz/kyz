@@ -237,7 +237,7 @@ fn concurrent_threads_preserve_all_overlaid_fields() {
             std::thread::spawn(move || {
                 vault
                     .set("app", "key", &entry(&format!("f{n}"), &format!("v{n}")))
-                    .expect("set")
+                    .expect("set");
             })
         })
         .collect();

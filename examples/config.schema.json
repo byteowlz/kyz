@@ -82,7 +82,8 @@
         }
       ],
       "default": {
-        "fail_fast": true
+        "fail_fast": true,
+        "timeout": 60
       }
     },
     "scripts": {
@@ -397,12 +398,13 @@
           "minimum": 1
         },
         "timeout": {
-          "description": "Timeout in seconds for long-running operations; unset or `0` means\nno timeout.",
+          "description": "Timeout in seconds for long-running operations (default: 60).\nExplicit `0` disables the deadline; see the shutdown caveat in docs/proxy.md.",
           "type": [
             "integer",
             "null"
           ],
           "format": "uint64",
+          "default": 60,
           "minimum": 0
         }
       }
