@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "r1",
+  "op": "resolve",
+  "resolve": {
+    "ref": "kyz:github/deploy-token:value"
+  },
+  "purpose": "push release tag"
+}

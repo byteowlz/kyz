@@ -235,7 +235,7 @@ impl ProxyShared {
         // only a corrupt snapshot can fail, and the audit field then just
         // comes out empty.
         let audit_upstream_host = upstream_host(&rule.upstream).unwrap_or_default();
-        self.forward(upstream_request, &rule.name, &audit_upstream_host, started)
+        self.forward(upstream_request, rule, &audit_upstream_host, started)
             .await
     }
 
@@ -244,10 +244,12 @@ impl ProxyShared {
     async fn forward(
         &self,
         request: UpstreamRequest,
-        rule: &str,
+        rule_config: &ProxyRuleConfig,
         upstream_host: &str,
         started: Instant,
     ) -> Response {
+        let rule = rule_config.name.as_str();
+        let credential_headers: Vec<String> = rule_config.headers.keys().cloned().collect();
         let audit = &self.state.audit;
         let audit_method = request.method.clone();
         let client = self.client.clone();
@@ -264,7 +266,8 @@ impl ProxyShared {
             Ok(upstream) => {
                 let status =
                     StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
-                let clean_headers = sanitize_response_headers(&upstream.headers);
+                let clean_headers =
+                    sanitize_response_headers(&upstream.headers, &credential_headers);
                 let mut builder = Response::builder().status(status);
                 for (name, value) in &clean_headers {
                     builder = builder.header(name.clone(), value.clone());
@@ -644,13 +647,29 @@ fn sanitize_request_headers(
 /// mark hop-by-hop, symmetric with the request direction (RFC 7230 §6.1);
 /// kyz regenerates the client response framing, so `Content-Length` is
 /// dropped too.
-fn sanitize_response_headers(headers: &HeaderMap) -> HeaderMap {
+/// Strip session/auth material and headers used for credential injection.
+/// Challenges are dropped wholesale: opaque provider challenge formats may
+/// carry tokens. This deliberately does not promise secret-free response bodies.
+fn sanitize_response_headers(headers: &HeaderMap, credential_headers: &[String]) -> HeaderMap {
     let connection_nominated = connection_nominated(headers);
     let mut out = HeaderMap::new();
     for (name, value) in headers {
         if !HOP_BY_HOP_HEADERS.contains(&name.as_str())
             && !connection_nominated.iter().any(|n| n == name.as_str())
             && name != "content-length"
+            && !matches!(
+                name.as_str(),
+                "set-cookie"
+                    | "set-cookie2"
+                    | "cookie"
+                    | "authorization"
+                    | "proxy-authorization"
+                    | "www-authenticate"
+                    | "proxy-authenticate"
+            )
+            && !credential_headers
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name.as_str()))
         {
             out.append(name.clone(), value.clone());
         }
@@ -788,6 +807,33 @@ mod tests {
     }
 
     #[test]
+    fn response_sanitizer_drops_auth_and_custom_credential_headers() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "set-cookie",
+            "set-cookie2",
+            "cookie",
+            "authorization",
+            "proxy-authorization",
+            "www-authenticate",
+            "proxy-authenticate",
+            "x-provider-token",
+        ] {
+            headers.append(name, HeaderValue::from_static("synthetic-secret"));
+            headers.append(name, HeaderValue::from_static("duplicate-secret"));
+        }
+        headers.append("content-type", HeaderValue::from_static("application/json"));
+        headers.append("x-request-id", HeaderValue::from_static("safe-id"));
+        let mut expected = HeaderMap::new();
+        expected.append("content-type", HeaderValue::from_static("application/json"));
+        expected.append("x-request-id", HeaderValue::from_static("safe-id"));
+        assert_eq!(
+            sanitize_response_headers(&headers, &["X-Provider-Token".to_owned()]),
+            expected
+        );
+    }
+
+    #[test]
     fn response_sanitizer_drops_hop_by_hop_and_length() {
         let mut headers = HeaderMap::new();
         headers.append("connection", HeaderValue::from_static("close"));
@@ -797,7 +843,7 @@ mod tests {
         headers.append("trailer", HeaderValue::from_static("X-Some-Trailer"));
         headers.append("x-custom", HeaderValue::from_static("end-to-end"));
 
-        let out = sanitize_response_headers(&headers);
+        let out = sanitize_response_headers(&headers, &[]);
         let mut names: Vec<&str> = out.keys().map(axum::http::HeaderName::as_str).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["content-type", "x-custom"]);
@@ -820,7 +866,7 @@ mod tests {
         headers.append("x-upstream-internal", HeaderValue::from_static("hop-state"));
         headers.append("x-keep", HeaderValue::from_static("end-to-end"));
 
-        let out = sanitize_response_headers(&headers);
+        let out = sanitize_response_headers(&headers, &[]);
         assert!(out.get("x-upstream-internal").is_none());
         assert_eq!(
             out.get("x-keep"),

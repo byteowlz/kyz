@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "id": "t1",
+  "op": "token",
+  "token": {
+    "audience": "owa-mail-calendar",
+    "scopes": [
+      "Mail.Read"
+    ],
+    "min_ttl_s": 300
+  }
+}

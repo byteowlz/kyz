@@ -1,0 +1,14 @@
+{
+  "why": "AGENT_CTX is descriptive, not authentication",
+  "message": {
+    "v": 1,
+    "id": "r1",
+    "op": "resolve",
+    "agent_ctx": {
+      "session": "x"
+    },
+    "resolve": {
+      "ref": "kyz:a/b"
+    }
+  }
+}

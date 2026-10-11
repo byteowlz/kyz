@@ -1,0 +1,11 @@
+{
+  "why": "reason must belong to the status",
+  "message": {
+    "v": 1,
+    "id": "r1",
+    "status": "denied",
+    "error": {
+      "reason": "login_required"
+    }
+  }
+}

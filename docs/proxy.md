@@ -2,8 +2,10 @@
 
 Route requests to an upstream API through the kyz credential daemon. The
 daemon listens on loopback, resolves credentials from the unlocked vault,
-injects them as upstream headers, and forwards over HTTPS. Clients never see
-the API key: it exists only in the encrypted vault and daemon memory.
+injects them as upstream headers, and forwards over HTTPS. The proxy does not
+return resolved credentials directly. Use trusted upstreams: an upstream can
+echo a credential in a response body, redirect URL, or unrelated custom header;
+header filtering is not a guarantee of secret-free responses.
 
 ## How it works
 
@@ -19,6 +21,12 @@ the API key: it exists only in the encrypted vault and daemon memory.
   even with `strip = []`. `strip` adds further names (default: `X-Api-Key`).
   Header values are templates of literal text plus `{{alias.field}}`
   substitutions — no functions, no encoding.
+- Responses strip `Set-Cookie`, `Set-Cookie2`, `Cookie`, `Authorization`,
+  `Proxy-Authorization`, `WWW-Authenticate`, `Proxy-Authenticate`, and every
+  header named in the rule's injected `headers`, case-insensitively and including
+  duplicates. Authentication challenges are removed wholesale, so clients cannot
+  use upstream challenge-based authentication through this proxy. Safe headers,
+  status and body are preserved; redirects are returned but never followed.
 - `CONNECT` and `TRACE` are always rejected.
 - Every request is audited to `state_dir/daemon/audit.log` (rule name,
   host, outcome; never secret values).

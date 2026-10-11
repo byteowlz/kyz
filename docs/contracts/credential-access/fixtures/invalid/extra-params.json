@@ -1,0 +1,14 @@
+{
+  "why": "exactly one params object",
+  "message": {
+    "v": 1,
+    "id": "t1",
+    "op": "token",
+    "token": {
+      "audience": "graph"
+    },
+    "resolve": {
+      "ref": "kyz:a/b"
+    }
+  }
+}

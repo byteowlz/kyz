@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "u3",
+  "status": "ok",
+  "result": {
+    "kind": "http",
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body_b64": "e30="
+  }
+}

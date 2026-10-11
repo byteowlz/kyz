@@ -1,0 +1,16 @@
+{
+  "why": "tokens always state expires_at",
+  "message": {
+    "v": 1,
+    "id": "t1",
+    "status": "ok",
+    "result": {
+      "kind": "token",
+      "token": "eyJ",
+      "token_type": "bearer",
+      "audience": "graph",
+      "scopes": [],
+      "can_refresh": false
+    }
+  }
+}

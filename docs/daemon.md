@@ -30,6 +30,29 @@ kyz daemon stop
   file lock on `state_dir/daemon/daemon.lock`; the PID file is diagnostics
   only. After a `kill -9`, the next `start` recovers stale files.
 
+## Trusted-service library integration
+
+A service can use `kyz_core::VaultStore::open_in_memory(&passphrase)` instead of
+launching a daemon. It opens an explicitly configured v5 vault without migrating,
+updating policy flags, cleaning conflict copies, or persisting an unlock session.
+Legacy formats return `CoreError::MigrationRequired { version }`; obtain approval
+and preserve a backup before using the separate, migrating `unlock_in_memory` API.
+File-lock artifacts may be created; reads do not rewrite vault contents.
+
+The returned `UnlockedVault` supports `get`, `resolve_fields`, `list`,
+`list_services`, `set`, `set_with_options` and `delete`. Metadata excludes field
+values, but names and tags still require access control. Writes use the same
+exclusive transactions as CLI writers and preserve input values exactly. `set`
+overlays fields and unions tags; it is not whole-entry replacement or CAS.
+Recreating a tombstoned entry requires `set_with_options(..., true)` and uses
+only the newly supplied fields. Dropping the handle zeroizes its DK; disk-session
+`vault lock` does not revoke independently held in-memory handles.
+
+This is an internal trusted-service seam, not an App/agent raw-secret API or grant
+issuer. The host owns authorization, source binding and protected placement;
+never expose this handle or resolved values to generated workloads. No Oqto
+runtime integration or released minimum version is implied by this API.
+
 ## State directory
 
 `$XDG_STATE_HOME/kyz/daemon/` (0700 on Unix, current-user-only ACL on

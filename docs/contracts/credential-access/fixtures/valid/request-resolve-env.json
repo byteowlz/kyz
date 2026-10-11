@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "id": "r2",
+  "op": "resolve",
+  "resolve": {
+    "ref": "env:HSTRY_INGEST_TOKEN"
+  }
+}

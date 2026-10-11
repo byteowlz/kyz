@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "id": "u2",
+  "status": "ok",
+  "result": {
+    "kind": "webauthn_get",
+    "credential_id": "Y3JlZA",
+    "authenticator_data": "YXV0aA",
+    "signature": "c2ln"
+  }
+}

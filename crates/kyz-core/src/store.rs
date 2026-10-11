@@ -1720,6 +1720,40 @@ impl VaultStore {
         }
     }
 
+    /// Open a v5 vault without migration, maintenance, or persisted unlock state.
+    ///
+    /// The data key is retained only in the returned handle. This path does not
+    /// update policy flags, fold/remove conflict copies, or access the OS keyring.
+    /// Legacy vaults require caller-approved migration and backup before using
+    /// [`Self::unlock_in_memory`]. File-lock artifacts may be created for coordination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::MigrationRequired`] for legacy formats, or an error
+    /// for missing, malformed, changed, or incorrectly authenticated vaults.
+    pub fn open_in_memory(&self, passphrase: &SecretString) -> Result<UnlockedVault, CoreError> {
+        let raw = fs::read(&self.vault_path)?;
+        let version = detect_vault_version(&raw);
+        if matches!(version, 1..=4) {
+            return Err(CoreError::MigrationRequired { version });
+        }
+        let manifest = Manifest::parse(&raw)?;
+        let (_, dk) = manifest.unwrap_dk(passphrase)?;
+        if !manifest.passphrase_policy_checked {
+            ensure_passphrase_strength(passphrase.expose_secret())?;
+        }
+        // Expensive KDF outside the lock; authenticate current bytes under it.
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        let current = VaultDir::new(&self.vault_path).read_verified_manifest(&dk)?;
+        if current.vault_id != manifest.vault_id {
+            return Err(CoreError::Secret("vault changed while opening".to_owned()));
+        }
+        Ok(UnlockedVault {
+            dk,
+            vault_path: self.vault_path.clone(),
+        })
+    }
+
     /// Unlock the vault into memory without persisting any session state.
     ///
     /// Returns an [`UnlockedVault`] whose data key lives only in process
@@ -1727,7 +1761,9 @@ impl VaultStore {
     /// [`VaultSession::save`], never writes to the OS keyring, and never
     /// creates a session file. Any vault migration (v1–v4 → v5, passphrase
     /// policy update) happens inside a single exclusive file-lock
-    /// transaction before the handle is returned.
+    /// transaction before the handle is returned. This is a mutating, explicitly
+    /// migrating API: obtain approval and preserve a backup before calling it for
+    /// a user-owned legacy vault. Prefer [`Self::open_in_memory`] for inspection.
     ///
     /// # Errors
     ///
@@ -1776,6 +1812,64 @@ impl UnlockedVault {
         &self.vault_path
     }
 
+    /// List value-free metadata for one service, without an unlock session.
+    /// Names and tags may still be sensitive; the caller must authorize access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O or vault authentication failure.
+    pub fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
+        VaultStore::new(self.vault_path.clone()).list_with_dk(&self.dk, service, false)
+    }
+
+    /// List service names without exposing field values or persisting a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O or vault authentication failure.
+    pub fn list_services(&self) -> Result<Vec<String>, CoreError> {
+        VaultStore::new(self.vault_path.clone()).list_services_with_dk(&self.dk, false)
+    }
+
+    /// Store exact supplied field values, overlaying existing fields and tags.
+    /// Writes are serialized with CLI and other service writers; no session is saved.
+    /// This is an overlay, not a whole-entry replacement or compare-and-swap API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on authentication/write failure or a tombstoned entry.
+    /// Legacy formats require explicit migration; this method never migrates.
+    pub fn set(&self, service: &str, key: &str, entry: &SecretEntry) -> Result<(), CoreError> {
+        self.set_with_options(service, key, entry, false)
+    }
+
+    /// Store fields, optionally recreating a deleted entry from supplied fields only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on authentication/write failure, a legacy format, or a
+    /// deleted entry when `recreate` is false.
+    pub fn set_with_options(
+        &self,
+        service: &str,
+        key: &str,
+        entry: &SecretEntry,
+        recreate: bool,
+    ) -> Result<(), CoreError> {
+        VaultStore::new(self.vault_path.clone())
+            .set_with_dk(&self.dk, service, key, entry, recreate, false)
+    }
+
+    /// Delete a live entry without persisting a session or migrating a vault.
+    /// Subsequent reads fail; already-delivered values cannot be retracted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing/deleted entries or on verification/write failure.
+    pub fn delete(&self, service: &str, key: &str) -> Result<(), CoreError> {
+        VaultStore::new(self.vault_path.clone()).delete_with_dk(&self.dk, service, key, false)
+    }
+
     /// Decrypt and return a full secret entry, reading the latest vault file.
     ///
     /// # Errors
@@ -1783,7 +1877,11 @@ impl UnlockedVault {
     /// Returns an error if the vault cannot be read, the entry is missing,
     /// or decryption fails.
     pub fn get(&self, service: &str, key: &str) -> Result<SecretEntry, CoreError> {
-        let contents = read_contents_at(&self.vault_path)?;
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        let contents = read_contents_no_lock(&self.vault_path)?;
+        if matches!(contents, VaultContents::V3(_)) {
+            return Err(CoreError::MigrationRequired { version: 3 });
+        }
         get_entry_from(&contents, &self.dk, service, key)
     }
 
@@ -2020,6 +2118,28 @@ impl SecretStore for VaultStore {
 
     fn delete(&self, service: &str, key: &str) -> Result<(), CoreError> {
         let dk = self.require_session()?;
+        self.delete_with_dk(&dk, service, key, true)
+    }
+
+    fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
+        let dk = self.require_session()?;
+        self.list_with_dk(&dk, service, true)
+    }
+
+    fn list_services(&self) -> Result<Vec<String>, CoreError> {
+        let dk = self.require_session()?;
+        self.list_services_with_dk(&dk, true)
+    }
+}
+
+impl VaultStore {
+    fn delete_with_dk(
+        &self,
+        dk: &Zeroizing<[u8; DK_LEN]>,
+        service: &str,
+        key: &str,
+        migrate: bool,
+    ) -> Result<(), CoreError> {
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
         // Writes upgrade a v3 vault inside the same transaction (matching
         // `set`), so a successful delete always leaves a v5 vault behind —
@@ -2031,8 +2151,8 @@ impl SecretStore for VaultStore {
                 "secret '{key}' not found in service '{service}'"
             )));
         }
-        let dir = self.v5_for_write(&dk)?;
-        let mut entry = read_entry_log(&dir, &dk, service, key)?;
+        let dir = self.v5_for_write(dk, migrate)?;
+        let mut entry = read_entry_log(&dir, dk, service, key)?;
         // Deleting a non-existent (never-written or already tombstoned)
         // entry keeps the historical CLI semantics and generates no
         // operation — and no write, so a failed delete leaves the vault
@@ -2046,15 +2166,23 @@ impl SecretStore for VaultStore {
             )));
         }
         Self::append_local_delete(&mut entry.log, service, key)?;
-        write_entry_log(&dir, &dk, entry, service, key)
+        write_entry_log(&dir, dk, entry, service, key)
     }
 
-    fn list(&self, service: &str) -> Result<Vec<SecretSummary>, CoreError> {
-        let dk = self.require_session()?;
-        match read_contents_at(&self.vault_path)? {
+    fn list_with_dk(
+        &self,
+        dk: &Zeroizing<[u8; DK_LEN]>,
+        service: &str,
+        allow_legacy: bool,
+    ) -> Result<Vec<SecretSummary>, CoreError> {
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        match read_contents_no_lock(&self.vault_path)? {
+            VaultContents::V3(_) if !allow_legacy => {
+                Err(CoreError::MigrationRequired { version: 3 })
+            }
             VaultContents::V3(vault) => Ok(vault.summaries(service)),
             VaultContents::V5(dir) => {
-                let log = load_log_with(&dir, &dk)?;
+                let log = load_log_with(&dir, dk)?;
                 let mut out = Vec::new();
                 for (ck, meta) in log.visible_metas()? {
                     // Compound keys split at the first `/` after both
@@ -2080,12 +2208,19 @@ impl SecretStore for VaultStore {
         }
     }
 
-    fn list_services(&self) -> Result<Vec<String>, CoreError> {
-        let dk = self.require_session()?;
-        match read_contents_at(&self.vault_path)? {
+    fn list_services_with_dk(
+        &self,
+        dk: &Zeroizing<[u8; DK_LEN]>,
+        allow_legacy: bool,
+    ) -> Result<Vec<String>, CoreError> {
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        match read_contents_no_lock(&self.vault_path)? {
+            VaultContents::V3(_) if !allow_legacy => {
+                Err(CoreError::MigrationRequired { version: 3 })
+            }
             VaultContents::V3(vault) => Ok(vault.services()),
             VaultContents::V5(dir) => {
-                let mut svcs: Vec<String> = load_log_with(&dir, &dk)?
+                let mut svcs: Vec<String> = load_log_with(&dir, dk)?
                     .visible_metas()?
                     .into_iter()
                     .filter_map(|(ck, _)| OpLog::split_compound_key(&ck).map(|(svc, _)| svc))
@@ -2123,9 +2258,21 @@ impl VaultStore {
         recreate: bool,
     ) -> Result<(), CoreError> {
         let dk = self.require_session()?;
+        self.set_with_dk(&dk, service, key, entry, recreate, true)
+    }
+
+    fn set_with_dk(
+        &self,
+        dk: &Zeroizing<[u8; DK_LEN]>,
+        service: &str,
+        key: &str,
+        entry: &SecretEntry,
+        recreate: bool,
+        migrate: bool,
+    ) -> Result<(), CoreError> {
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
-        let dir = self.v5_for_write(&dk)?;
-        let mut current = read_entry_log(&dir, &dk, service, key)?;
+        let dir = self.v5_for_write(dk, migrate)?;
+        let mut current = read_entry_log(&dir, dk, service, key)?;
         let vault = &mut current.log;
 
         // One causal walk serves both the overlay base and the new op's
@@ -2133,7 +2280,7 @@ impl VaultStore {
         // {current} ∪ conflicts (a frontier delete would have hidden it).
         let (snapshot, parents) = match vault.projection(service, key)? {
             Projection::Visible { current, conflicts } => {
-                let current_snapshot = vault.decrypt_current(&dk, service, key)?;
+                let current_snapshot = vault.decrypt_current(dk, service, key)?;
                 let mut fields = current_snapshot.fields;
                 for (name, value) in &entry.fields {
                     fields.insert(name.clone(), value.expose_secret().to_string());
@@ -2171,16 +2318,21 @@ impl VaultStore {
             }
         };
 
-        Self::append_local_put(vault, &snapshot, parents, &dk)?;
-        write_entry_log(&dir, &dk, current, service, key)
+        Self::append_local_put(vault, &snapshot, parents, dk)?;
+        write_entry_log(&dir, dk, current, service, key)
     }
 
-    /// The v5 vault for a write transaction. A v3 vault is migrated to v5
-    /// inside the caller's exclusive-lock transaction first, so every new
-    /// write produces the v5 format. Caller holds the exclusive lock.
-    fn v5_for_write(&self, dk: &Zeroizing<[u8; DK_LEN]>) -> Result<VaultDir, CoreError> {
+    /// The v5 vault for a write transaction. When explicitly permitted,
+    /// migrate v3 inside the caller's exclusive-lock transaction; otherwise
+    /// refuse legacy writes. Caller holds the exclusive lock.
+    fn v5_for_write(
+        &self,
+        dk: &Zeroizing<[u8; DK_LEN]>,
+        migrate: bool,
+    ) -> Result<VaultDir, CoreError> {
         match read_contents_no_lock(&self.vault_path)? {
             VaultContents::V5(dir) => Ok(dir),
+            VaultContents::V3(_) if !migrate => Err(CoreError::MigrationRequired { version: 3 }),
             VaultContents::V3(v3) => {
                 self.migrate_v3_and_write(&v3, dk)?;
                 Ok(VaultDir::new(&self.vault_path))
@@ -2305,7 +2457,7 @@ impl VaultStore {
     pub fn rollback_v4(&self, service: &str, key: &str, target: &str) -> Result<(), CoreError> {
         let dk = self.require_session()?;
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
-        let dir = self.v5_for_write(&dk)?;
+        let dir = self.v5_for_write(&dk, true)?;
         let mut entry = read_entry_log(&dir, &dk, service, key)?;
         rollback_v4_locked(&mut entry.log, &dk, service, key, target)?;
         write_entry_log(&dir, &dk, entry, service, key)

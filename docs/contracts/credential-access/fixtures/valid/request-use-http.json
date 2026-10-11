@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "id": "u3",
+  "op": "use",
+  "purpose": "list inbox",
+  "use": {
+    "kind": "http",
+    "http": {
+      "credential": {
+        "audience": "owa-mail-calendar"
+      },
+      "request": {
+        "method": "GET",
+        "url": "https://outlook.office.com/api/v2.0/me/messages?$top=10",
+        "headers": {
+          "Accept": "application/json"
+        }
+      }
+    }
+  }
+}

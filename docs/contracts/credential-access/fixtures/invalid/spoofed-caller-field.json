@@ -1,0 +1,12 @@
+{
+  "why": "caller identity comes from the transport, never from the message",
+  "message": {
+    "v": 1,
+    "id": "r1",
+    "op": "resolve",
+    "caller": "trusted-admin",
+    "resolve": {
+      "ref": "kyz:a/b"
+    }
+  }
+}

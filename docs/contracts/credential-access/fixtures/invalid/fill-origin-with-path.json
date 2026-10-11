@@ -1,0 +1,18 @@
+{
+  "why": "origins have no path",
+  "message": {
+    "v": 1,
+    "id": "u1",
+    "op": "use",
+    "use": {
+      "kind": "fill",
+      "fill": {
+        "origin": "https://github.com/login",
+        "ref": "kyz:web/github.com",
+        "fields": [
+          "password"
+        ]
+      }
+    }
+  }
+}

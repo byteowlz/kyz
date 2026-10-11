@@ -1,0 +1,11 @@
+{
+  "why": "unknown contract version",
+  "message": {
+    "v": 2,
+    "id": "r1",
+    "op": "resolve",
+    "resolve": {
+      "ref": "kyz:a/b"
+    }
+  }
+}

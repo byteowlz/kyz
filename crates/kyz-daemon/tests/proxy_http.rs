@@ -917,6 +917,73 @@ async fn proxy_bind_failure_allows_retry_on_same_state_dir() {
 /// are hop-by-hop and must not reach the local client — symmetric with the
 /// request direction.
 #[tokio::test]
+async fn response_credential_headers_are_stripped() {
+    let pf = ProxyFixture::new();
+    pf.write_config(&rule_toml(
+        "audit",
+        "api.example.com",
+        None,
+        &pf.mock.url,
+        None,
+    ));
+    let daemon = pf.start().await;
+    let addr = pf.proxy_addr().await;
+    let secret = &pf.fixture.secret_value;
+    let sensitive = [
+        "Set-Cookie",
+        "Set-Cookie2",
+        "Cookie",
+        "Authorization",
+        "Proxy-Authorization",
+        "WWW-Authenticate",
+        "Proxy-Authenticate",
+        "X-Api-Key",
+    ];
+    let mut headers = Vec::new();
+    for name in sensitive {
+        headers.push((name.to_string(), format!("dummy={secret}")));
+        headers.push((name.to_ascii_lowercase(), format!("duplicate={secret}")));
+    }
+    headers.push(("Content-Type".to_string(), "application/json".to_string()));
+    headers.push(("X-Request-Id".to_string(), "safe-correlation".to_string()));
+    let mut scripted = ScriptedResponse::with_headers(401, headers);
+    scripted.body = b"{\"error\":\"login_required\"}".to_vec();
+    pf.mock.push_response(scripted);
+    let response = pf.send(addr, "GET", "api.example.com", "/", &[], b"").await;
+    assert_eq!(response.status, 401);
+    assert_eq!(response.body, b"{\"error\":\"login_required\"}");
+    assert_eq!(
+        response.header_values("content-type"),
+        vec!["application/json"]
+    );
+    assert_eq!(
+        response.header_values("x-request-id"),
+        vec!["safe-correlation"]
+    );
+    // Clean up even when the old implementation leaks headers.
+    let leaked: Vec<&str> = sensitive
+        .into_iter()
+        .filter(|name| !response.header_values(name).is_empty())
+        .collect();
+    daemon.shutdown().await;
+    pf.fixture.assert_no_secret_leaks();
+    let root = pf
+        .fixture
+        .vault_path
+        .parent()
+        .expect("vault parent")
+        .parent()
+        .expect("fixture root")
+        .to_owned();
+    pf.mock.stop();
+    std::fs::remove_dir_all(root).expect("cleanup fixture");
+    assert!(
+        leaked.is_empty(),
+        "credential-bearing response header names: {leaked:?}"
+    );
+}
+
+#[tokio::test]
 async fn response_connection_nominated_headers_are_stripped() {
     let pf = ProxyFixture::new();
     pf.write_config(&rule_toml(
