@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -126,6 +127,61 @@ impl Drop for MockRuntime {
     }
 }
 
+/// Shared mock-server bootstrap: a named thread driving a single-threaded
+/// tokio runtime, bound to an OS-assigned loopback port, accepting
+/// connections until stopped and dispatching each one to `serve`.
+/// Returns the bound address and the [`MockRuntime`] controlling the
+/// thread.
+fn spawn_mock_server<F, Fut>(name: &str, serve: F) -> (SocketAddr, MockRuntime)
+where
+    F: Fn(TcpStream) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
+    let thread = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("mock runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .await
+                .expect("mock bind");
+                addr_tx
+                    .send(listener.local_addr().expect("mock local addr"))
+                    .expect("mock addr channel");
+                loop {
+                    if thread_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let accepted =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+                    let Ok(Ok((stream, _))) = accepted else {
+                        continue;
+                    };
+                    tokio::spawn(serve(stream));
+                }
+            });
+        })
+        .expect("spawn mock server thread");
+
+    let addr = addr_rx.recv().expect("mock server address");
+    (
+        addr,
+        MockRuntime {
+            thread: Some(thread),
+            stop,
+        },
+    )
+}
+
 /// Scripted HTTPS mock upstream trusted by the daemon under test via
 /// [`kyz_daemon::UpstreamClient::with_root_certs`].
 pub struct MockUpstream {
@@ -145,74 +201,38 @@ impl MockUpstream {
         let (cert_pem, server_config) = self_signed_config();
         let recorded: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let script: Arc<Mutex<VecDeque<ScriptedResponse>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-
-        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
-        let thread_recorded = Arc::clone(&recorded);
-        let thread_script = Arc::clone(&script);
-        let thread_stop = Arc::clone(&stop);
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let thread = std::thread::Builder::new()
-            .name("mock-upstream".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("mock runtime");
-                runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::LOCALHOST),
-                        0,
-                    ))
-                    .await
-                    .expect("mock bind");
-                    addr_tx
-                        .send(listener.local_addr().expect("mock local addr"))
-                        .expect("mock addr channel");
-                    loop {
-                        if thread_stop.load(Ordering::Acquire) {
-                            break;
+        let serve = {
+            let recorded = Arc::clone(&recorded);
+            let script = Arc::clone(&script);
+            move |stream: TcpStream| {
+                let recorded = Arc::clone(&recorded);
+                let script = Arc::clone(&script);
+                let acceptor = acceptor.clone();
+                async move {
+                    let Ok(Ok(tls)) =
+                        tokio::time::timeout(CONN_TIMEOUT, acceptor.accept(stream)).await
+                    else {
+                        return;
+                    };
+                    let (mut reader, mut writer) = tokio::io::split(tls);
+                    if let Some(response) = serve_one(&mut reader, &recorded, &script).await {
+                        if let Some(delay) = response.delay {
+                            tokio::time::sleep(delay).await;
                         }
-                        let accepted =
-                            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                                .await;
-                        let Ok(Ok((stream, _))) = accepted else {
-                            continue;
-                        };
-                        let acceptor = acceptor.clone();
-                        let recorded = Arc::clone(&thread_recorded);
-                        let script = Arc::clone(&thread_script);
-                        tokio::spawn(async move {
-                            let Ok(Ok(tls)) =
-                                tokio::time::timeout(CONN_TIMEOUT, acceptor.accept(stream)).await
-                            else {
-                                return;
-                            };
-                            let (mut reader, mut writer) = tokio::io::split(tls);
-                            if let Some(response) = serve_one(&mut reader, &recorded, &script).await
-                            {
-                                if let Some(delay) = response.delay {
-                                    tokio::time::sleep(delay).await;
-                                }
-                                let _ = writer.write_all(&encode_response(&response)).await;
-                                let _ = writer.shutdown().await;
-                            }
-                        });
+                        let _ = writer.write_all(&encode_response(&response)).await;
+                        let _ = writer.shutdown().await;
                     }
-                });
-            })
-            .expect("spawn mock upstream thread");
-
-        let addr = addr_rx.recv().expect("mock upstream address");
+                }
+            }
+        };
+        let (addr, runtime) = spawn_mock_server("mock-upstream", serve);
         Self {
             url: format!("https://{addr}"),
             ca_pem: cert_pem,
             recorded,
             script,
-            runtime: MockRuntime {
-                thread: Some(thread),
-                stop,
-            },
+            runtime,
         }
     }
 
@@ -256,18 +276,60 @@ impl MockUpstream {
     }
 }
 
-/// Read exactly one HTTP/1.1 request (headers + Content-Length body),
-/// record it, and return the scripted response for it.
-async fn serve_one(
-    reader: &mut ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
-    recorded: &Arc<Mutex<Vec<RecordedRequest>>>,
-    script: &Arc<Mutex<VecDeque<ScriptedResponse>>>,
-) -> Option<ScriptedResponse> {
+/// A scripted HTTP CONNECT proxy: answers `CONNECT host:port` with `200`
+/// and blindly splices both directions, recording every requested target.
+///
+/// Mirrors what an egress proxy sees: the tunnel bytes are ciphertext (the
+/// daemon's upstreams are always HTTPS), so the proxy observes the CONNECT
+/// target and nothing else.
+pub struct MockConnectProxy {
+    /// Bound loopback address for `upstream_proxy` URLs.
+    pub addr: SocketAddr,
+    connect_targets: Arc<Mutex<Vec<String>>>,
+    runtime: MockRuntime,
+}
+
+impl MockConnectProxy {
+    /// Start the proxy on an OS-assigned loopback port.
+    pub fn start() -> Self {
+        let connect_targets: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let serve = {
+            let targets = Arc::clone(&connect_targets);
+            move |stream: TcpStream| handle_connect(stream, Arc::clone(&targets))
+        };
+        let (addr, runtime) = spawn_mock_server("mock-connect-proxy", serve);
+        Self {
+            addr,
+            connect_targets,
+            runtime,
+        }
+    }
+
+    /// Every `CONNECT` target seen so far (`host:port`).
+    #[must_use]
+    pub fn connect_targets(&self) -> Vec<String> {
+        self.connect_targets
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default()
+    }
+
+    /// Stop the proxy thread.
+    pub fn stop(self) {
+        self.runtime.stop();
+    }
+}
+
+/// Read one HTTP/1.1 message head from `reader`: bytes up to and
+/// including the `\r\n\r\n` terminator (plus any body bytes that arrived
+/// with it), bounded by [`CONN_TIMEOUT`]. Returns `None` on EOF, read
+/// error, or timeout.
+async fn read_http_head<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Option<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+            return Some(buffer);
         }
         let read = tokio::time::timeout(CONN_TIMEOUT, reader.read(&mut chunk))
             .await
@@ -278,6 +340,58 @@ async fn serve_one(
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
+}
+
+/// Serve one CONNECT tunnel: read the request head, dial the target,
+/// answer `200`, and splice bytes both ways until either side closes.
+async fn handle_connect(mut stream: TcpStream, targets: Arc<Mutex<Vec<String>>>) {
+    let Some(buffer) = read_http_head(&mut stream).await else {
+        return;
+    };
+    let first_line = String::from_utf8_lossy(&buffer)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut parts = first_line.split(' ');
+    let (method, target) = (
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+    );
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        let _ = stream
+            .write_all(b"HTTP/1.1 405 Only CONNECT\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+    if let Ok(mut seen) = targets.lock() {
+        seen.push(target.to_string());
+    }
+    let dialed = tokio::time::timeout(CONN_TIMEOUT, TcpStream::connect(target)).await;
+    let Ok(Ok(mut upstream)) = dialed else {
+        let _ = stream
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    };
+    if stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+}
+
+/// Read exactly one HTTP/1.1 request (headers + Content-Length body),
+/// record it, and return the scripted response for it.
+async fn serve_one(
+    reader: &mut ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
+    recorded: &Arc<Mutex<Vec<RecordedRequest>>>,
+    script: &Arc<Mutex<VecDeque<ScriptedResponse>>>,
+) -> Option<ScriptedResponse> {
+    let buffer = read_http_head(reader).await?;
     let split = buffer
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -305,6 +419,7 @@ async fn serve_one(
         .find(|(n, _)| n == "content-length")
         .and_then(|(_, v)| v.parse::<usize>().ok())
         .unwrap_or(0);
+    let mut chunk = [0u8; 4096];
     while rest.len() < content_length {
         let read = tokio::time::timeout(CONN_TIMEOUT, reader.read(&mut chunk))
             .await
@@ -634,13 +749,22 @@ impl ProxyFixture {
         }
     }
 
-    /// An upstream client trusting the mock's CA (test seam).
+    /// An upstream client trusting the mock's CA (test seam); pass a
+    /// `proxy_url` to tunnel through an outbound proxy, mirroring a
+    /// configured `proxy.upstream_proxy`.
     #[must_use]
-    pub fn test_client(&self, timeout_secs: u64, response_limit: u64) -> UpstreamClient {
+    pub fn test_client(
+        &self,
+        timeout_secs: u64,
+        response_limit: u64,
+        proxy_url: Option<&str>,
+    ) -> UpstreamClient {
+        let proxy = proxy_url.map(|url| ureq::Proxy::new(url).expect("mock proxy URL"));
         UpstreamClient::with_root_certs(
-            Duration::from_secs(timeout_secs),
+            Some(Duration::from_secs(timeout_secs)),
             response_limit,
             &self.mock.ca_pem,
+            proxy,
         )
     }
 
@@ -668,6 +792,13 @@ impl ProxyFixture {
         std::fs::write(&self.fixture.config_path, config).expect("rewrite fixture config");
     }
 
+    /// A standard proxy config whose whole `[proxy]` section routes
+    /// upstream traffic through the given `upstream_proxy` URL.
+    pub fn write_config_with_proxy(&self, proxy_url: &str, rules_toml: &str) {
+        let proxy_rules = format!("upstream_proxy = \"{proxy_url}\"\n{rules_toml}");
+        self.write_config_raw("127.0.0.1:0", "token", &proxy_rules, "");
+    }
+
     /// Start the daemon with the mock-CA upstream client.
     pub async fn start(&self) -> crate::common::GuardedDaemon {
         self.start_with(30, u64::MAX).await
@@ -681,7 +812,10 @@ impl ProxyFixture {
         response_limit: u64,
     ) -> crate::common::GuardedDaemon {
         self.fixture
-            .start_with_client(None, Some(self.test_client(timeout_secs, response_limit)))
+            .start_with_client(
+                None,
+                Some(self.test_client(timeout_secs, response_limit, None)),
+            )
             .await
     }
 

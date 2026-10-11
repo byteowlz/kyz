@@ -129,7 +129,6 @@ impl AppConfig {
             .set_default("profile", "default")?
             .set_default("logging.level", "info")?
             .set_default("runtime.parallelism", default_parallelism() as i64)?
-            .set_default("runtime.timeout", 60_i64)?
             .set_default("runtime.fail_fast", true)?
             .add_source(file)
             .add_source(Environment::with_prefix(env_prefix.as_str()).separator("__"))
@@ -233,9 +232,10 @@ pub struct RuntimeConfig {
     #[schemars(range(min = 1))]
     pub parallelism: Option<usize>,
 
-    /// Timeout in seconds for long-running operations (default: 60).
+    /// Timeout in seconds for long-running operations; unset or `0` means
+    /// no timeout.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 0))]
     pub timeout: Option<u64>,
 
     /// Stop on first error.
@@ -246,9 +246,20 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             parallelism: None,
-            timeout: Some(60),
+            timeout: None,
             fail_fast: true,
         }
+    }
+}
+
+impl RuntimeConfig {
+    /// The effective long-running-operation timeout: `timeout` unset or
+    /// `0` means no timeout (`None`).
+    #[must_use]
+    pub fn effective_timeout(&self) -> Option<std::time::Duration> {
+        self.timeout
+            .filter(|secs| *secs > 0)
+            .map(std::time::Duration::from_secs)
     }
 }
 
@@ -375,6 +386,13 @@ pub enum ProxyAuthMode {
 pub struct ProxyConfig {
     /// Proxy authentication mode (default: token).
     pub auth: ProxyAuthMode,
+
+    /// Outbound proxy every upstream connection is tunneled through, e.g.
+    /// `http://proxy.corp:3128` (optional `user:pass@` userinfo for proxy
+    /// authentication). Unset means direct connections. Fixed at daemon
+    /// startup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy: Option<String>,
 
     /// Routing rules. Matching semantics and validation live in
     /// [`crate::proxy_config`].

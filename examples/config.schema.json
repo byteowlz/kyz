@@ -82,8 +82,7 @@
         }
       ],
       "default": {
-        "fail_fast": true,
-        "timeout": 60
+        "fail_fast": true
       }
     },
     "scripts": {
@@ -270,6 +269,13 @@
           "items": {
             "$ref": "#/definitions/ProxyRuleConfig"
           }
+        },
+        "upstream_proxy": {
+          "description": "Outbound proxy every upstream connection is tunneled through, e.g.\n`http://proxy.corp:3128` (optional `user:pass@` userinfo for proxy\nauthentication). Unset means direct connections. Fixed at daemon\nstartup.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -391,14 +397,13 @@
           "minimum": 1
         },
         "timeout": {
-          "description": "Timeout in seconds for long-running operations (default: 60).",
+          "description": "Timeout in seconds for long-running operations; unset or `0` means\nno timeout.",
           "type": [
             "integer",
             "null"
           ],
           "format": "uint64",
-          "default": 60,
-          "minimum": 1
+          "minimum": 0
         }
       }
     },

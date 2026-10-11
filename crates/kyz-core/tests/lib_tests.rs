@@ -71,7 +71,7 @@ fn schema_generation_produces_valid_json() {
 fn example_config_generation_produces_valid_toml() {
     let config = kyz_core::generate_example_config("kyz").expect("config generation");
     // Should be valid TOML (may have comments)
-    assert!(!config.is_empty());
+    assert_ne!(config, "");
     // The generated config should contain the app name
     assert!(config.contains("kyz") || config.contains("profile"));
 }

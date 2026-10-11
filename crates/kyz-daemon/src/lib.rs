@@ -41,9 +41,7 @@ pub use lifecycle::{
 };
 pub use proxy::{ProxyEndpoint, ProxyShared};
 pub use state::DaemonPaths;
-pub use upstream::{
-    DEFAULT_UPSTREAM_TIMEOUT_SECS, UpstreamClient, UpstreamError, UpstreamRequest, UpstreamResponse,
-};
+pub use upstream::{UpstreamClient, UpstreamError, UpstreamRequest, UpstreamResponse};
 
 /// Errors produced by the daemon crate.
 #[derive(Debug, thiserror::Error)]

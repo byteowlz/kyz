@@ -31,7 +31,7 @@ fn test_params() -> CreateAuthRequest {
 fn create_and_retrieve() {
     let store = AuthRequestStore::new();
     let req = store.create(&test_params()).expect("create");
-    assert!(!req.id.is_empty());
+    assert_ne!(req.id, "");
     assert_eq!(req.requester, "test-agent");
     assert_eq!(req.status, AuthRequestStatus::Pending);
 

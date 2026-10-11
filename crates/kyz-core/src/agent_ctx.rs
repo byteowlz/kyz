@@ -249,7 +249,7 @@ mod tests {
     fn absent_yields_empty() {
         let ctx = AgentContext::from_iter_str(Vec::<(&str, &str)>::new());
         assert!(ctx.is_empty());
-        assert!(ctx.audit_tags().is_empty());
+        assert_eq!(ctx.audit_tags(), [] as [(&str, std::string::String); 0]);
     }
 
     #[test]
