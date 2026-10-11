@@ -80,6 +80,29 @@ fn runtime_config_defaults() {
 }
 
 #[test]
+fn absent_timeout_is_finite_and_zero_is_explicit_opt_out() {
+    use std::time::Duration;
+    for (configured, expected) in [
+        (None, Some(Duration::from_mins(1))),
+        (Some(0), None),
+        (Some(2), Some(Duration::from_secs(2))),
+    ] {
+        let runtime = RuntimeConfig {
+            timeout: configured,
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(runtime.effective_timeout(), expected);
+    }
+    let config_file = tempfile::NamedTempFile::new().expect("config file");
+    std::fs::write(config_file.path(), "profile = \"default\"\n").expect("write config");
+    let loaded = AppConfig::load_from_path(config_file.path()).expect("load config");
+    assert_eq!(
+        loaded.runtime.effective_timeout(),
+        Some(Duration::from_mins(1))
+    );
+}
+
+#[test]
 fn paths_config_defaults_are_none() {
     let paths = PathsConfig::default();
     assert!(paths.data_dir.is_none());
