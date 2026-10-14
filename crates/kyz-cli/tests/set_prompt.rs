@@ -12,7 +12,7 @@
 //! stdin, `--interactive` edits existing fields, partial updates merge.
 
 use std::collections::BTreeMap;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -191,6 +191,7 @@ struct Terminal {
 #[cfg(target_os = "linux")]
 impl Terminal {
     fn spawn(fixture: &Fixture, args: &[&str]) -> Option<Self> {
+        use std::io::Read as _;
         if Command::new("script").arg("--version").output().is_err() {
             eprintln!("skipping: util-linux script unavailable");
             return None;

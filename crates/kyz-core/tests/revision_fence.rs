@@ -112,11 +112,12 @@ fn revision_fence_child_writer() {
     let vault = store
         .open_in_memory(&SecretString::from(PASS.to_owned()))
         .unwrap();
-    match vault.compare_set("app", "key", &entry("child"), Some(&revision)) {
-        Ok(()) => {}
-        Err(CoreError::RevisionConflict) => std::process::exit(3),
-        Err(_) => std::process::exit(4),
-    }
+    let outcome = match vault.compare_set("app", "key", &entry("child"), Some(&revision)) {
+        Ok(()) => "won",
+        Err(CoreError::RevisionConflict) => "conflict",
+        Err(_) => "error",
+    };
+    println!("FENCE_OUTCOME={outcome}");
 }
 
 #[test]
@@ -131,23 +132,37 @@ fn concurrent_processes_have_exactly_one_winner() {
         .compare_set("app", "key", &entry("initial"), None)
         .unwrap();
     let (_, revision) = vault.get_versioned("app", "key").unwrap();
+    // Spawn every child before waiting on any, so they race for the lock.
+    #[expect(
+        clippy::needless_collect,
+        reason = "all children must be running before the first wait"
+    )]
     let children: Vec<_> = (0..4)
         .map(|_| {
             std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "revision_fence_child_writer"])
+                .args(["--exact", "revision_fence_child_writer", "--nocapture"])
                 .env("KYZ_REVISION_FENCE_VAULT", store.vault_path())
                 .env("KYZ_REVISION_FENCE_REVISION", &revision)
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .unwrap()
         })
         .collect();
-    let mut codes: Vec<_> = children
+    let mut outcomes: Vec<String> = children
         .into_iter()
-        .map(|mut child| child.wait().unwrap().code())
+        .map(|child| {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("FENCE_OUTCOME="))
+                .unwrap()
+                .to_owned()
+        })
         .collect();
-    codes.sort_unstable();
-    assert_eq!(codes, vec![Some(0), Some(3), Some(3), Some(3)]);
+    outcomes.sort_unstable();
+    assert_eq!(outcomes, ["conflict", "conflict", "conflict", "won"]);
     assert_ne!(vault.get_versioned("app", "key").unwrap().1, revision);
 }
