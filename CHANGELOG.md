@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-15
+
+### Added
+
+- Revision-fenced credential updates on `UnlockedVault`: `get_versioned` returns an entry with an opaque revision (a hash of its authenticated operation log, not a timestamp); `compare_set` and `compare_delete` check it under the same exclusive lock as the write and return `CoreError::RevisionConflict` without writing if any writer, including the CLI, changed the entry. `compare_set(..., None)` creates only never-existing keys and never recreates a deleted entry. Revisions detect changes; they are not authorization or rollback-freshness proof.
+- `kyz set -f NAME` (no `=VALUE`) prompts for the field with hidden, confirmed input on a terminal, or reads one value from piped stdin, keeping secrets out of shell history and the process list. `kyz set KEY -i` edits each existing field (Enter keeps the current value); bare `kyz set KEY` on an existing multi-field entry does the same instead of adding a `value` field.
+
+### Changed
+
+- Release archives follow the byteowlz standard layout (ADR-0021): `kyz-vVERSION-TARGET.tar.gz` containing `kyz-vVERSION-TARGET/bin/` executables plus `LICENSE` and `README.md`, with no build-metadata files. Adds `aarch64-unknown-linux-gnu`; Linux binaries require glibc 2.28 or newer. The Windows archive is now `.tar.gz` in the same layout instead of a flat `.zip`.
+
+### Fixed
+
+- With `runtime.timeout = 0`, a stalled upstream no longer keeps the daemon process alive after shutdown. Shutdown releases the PID file and instance lock, waits at most 5 seconds for in-flight upstream calls, then exits; abandoned clients see the connection close.
+
 ## [0.10.0] - 2026-10-14
 
 ### Added
