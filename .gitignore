@@ -44,3 +44,4 @@ criterion/
 .cargo/
 !.cargo/config.toml
 .pi/todos/
+/dist
