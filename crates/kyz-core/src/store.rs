@@ -1805,7 +1805,78 @@ impl fmt::Debug for UnlockedVault {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RevisionFence<'a> {
+    Unchecked,
+    Absent,
+    Exact(&'a str),
+}
+
 impl UnlockedVault {
+    /// Read a secret and its opaque authenticated-log revision under one lock.
+    /// The revision is metadata, not a grant or rollback-freshness guarantee.
+    ///
+    /// # Errors
+    /// Refuses legacy formats, missing/deleted entries and failed verification.
+    pub fn get_versioned(
+        &self,
+        service: &str,
+        key: &str,
+    ) -> Result<(SecretEntry, String), CoreError> {
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        let store = VaultStore::new(self.vault_path.clone());
+        let dir = store.v5_for_write(&self.dk, false)?;
+        let entry = read_entry_log(&dir, &self.dk, service, key)?;
+        let value = entry
+            .log
+            .decrypt_current(&self.dk, service, key)?
+            .to_entry();
+        Ok((value, credential_revision(&entry.log)?))
+    }
+
+    /// Conditionally overlay fields under the vault's exclusive mutation lock.
+    /// `None` means create only if the key has NEVER existed; deleted keys are
+    /// not silently recreated. CLI writes participate in the same lock.
+    ///
+    /// # Errors
+    /// Returns `RevisionConflict` without writing for stale revisions; never migrates.
+    pub fn compare_set(
+        &self,
+        service: &str,
+        key: &str,
+        entry: &SecretEntry,
+        expected: Option<&str>,
+    ) -> Result<(), CoreError> {
+        VaultStore::new(self.vault_path.clone()).set_with_dk_guarded(
+            &self.dk,
+            service,
+            key,
+            entry,
+            false,
+            false,
+            expected.map_or(RevisionFence::Absent, RevisionFence::Exact),
+        )
+    }
+
+    /// Delete only the exact observed revision, under the mutation lock.
+    ///
+    /// # Errors
+    /// Returns `RevisionConflict` without writing for stale revisions; never migrates.
+    pub fn compare_delete(
+        &self,
+        service: &str,
+        key: &str,
+        expected: &str,
+    ) -> Result<(), CoreError> {
+        VaultStore::new(self.vault_path.clone()).delete_with_dk_guarded(
+            &self.dk,
+            service,
+            key,
+            false,
+            Some(expected),
+        )
+    }
+
     /// The vault file path backing this handle.
     #[must_use]
     pub fn vault_path(&self) -> &Path {
@@ -2005,6 +2076,15 @@ fn read_entry_log(
     })
 }
 
+// Hash only the authenticated ciphertext operation log, never plaintext or a
+// wall-clock timestamp. This detects same-second CLI writes and tombstones.
+fn credential_revision(log: &OpLog) -> Result<String, CoreError> {
+    use sha2::{Digest, Sha256};
+    let encoded = serde_json::to_vec(log)
+        .map_err(|_| CoreError::Serialization("credential revision".into()))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
 fn write_entry_log(
     dir: &VaultDir,
     dk: &Zeroizing<[u8; DK_LEN]>,
@@ -2140,6 +2220,17 @@ impl VaultStore {
         key: &str,
         migrate: bool,
     ) -> Result<(), CoreError> {
+        self.delete_with_dk_guarded(dk, service, key, migrate, None)
+    }
+
+    fn delete_with_dk_guarded(
+        &self,
+        dk: &Zeroizing<[u8; DK_LEN]>,
+        service: &str,
+        key: &str,
+        migrate: bool,
+        expected: Option<&str>,
+    ) -> Result<(), CoreError> {
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
         // Writes upgrade a v3 vault inside the same transaction (matching
         // `set`), so a successful delete always leaves a v5 vault behind —
@@ -2153,6 +2244,11 @@ impl VaultStore {
         }
         let dir = self.v5_for_write(dk, migrate)?;
         let mut entry = read_entry_log(&dir, dk, service, key)?;
+        if let Some(expected) = expected
+            && credential_revision(&entry.log)? != expected
+        {
+            return Err(CoreError::RevisionConflict);
+        }
         // Deleting a non-existent (never-written or already tombstoned)
         // entry keeps the historical CLI semantics and generates no
         // operation — and no write, so a failed delete leaves the vault
@@ -2270,9 +2366,42 @@ impl VaultStore {
         recreate: bool,
         migrate: bool,
     ) -> Result<(), CoreError> {
+        self.set_with_dk_guarded(
+            dk,
+            service,
+            key,
+            entry,
+            recreate,
+            migrate,
+            RevisionFence::Unchecked,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal transaction includes optional revision fence"
+    )]
+    fn set_with_dk_guarded(
+        &self,
+        dk: &Zeroizing<[u8; DK_LEN]>,
+        service: &str,
+        key: &str,
+        entry: &SecretEntry,
+        recreate: bool,
+        migrate: bool,
+        expected: RevisionFence<'_>,
+    ) -> Result<(), CoreError> {
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
         let dir = self.v5_for_write(dk, migrate)?;
         let mut current = read_entry_log(&dir, dk, service, key)?;
+        let matches = match expected {
+            RevisionFence::Unchecked => true,
+            RevisionFence::Absent => current.log.ops(service, key).is_none(),
+            RevisionFence::Exact(revision) => credential_revision(&current.log)? == revision,
+        };
+        if !matches {
+            return Err(CoreError::RevisionConflict);
+        }
         let vault = &mut current.log;
 
         // One causal walk serves both the overlay base and the new op's

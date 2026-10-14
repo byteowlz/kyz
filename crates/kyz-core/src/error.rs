@@ -32,6 +32,10 @@ pub enum CoreError {
     #[error("secret store error: {0}")]
     Secret(String),
 
+    /// A conditional mutation observed a different authenticated entry revision.
+    #[error("credential revision conflict")]
+    RevisionConflict,
+
     /// A requested secret was not found.
     #[error("secret not found: {0}")]
     SecretNotFound(String),
