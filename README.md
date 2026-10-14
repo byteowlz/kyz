@@ -28,8 +28,11 @@ kyz vault create
 # Store a secret
 kyz set my-api-key "sk-abc123" --service github
 
-# Store a multi-field secret
-kyz set db-creds --service postgres -f host=localhost -f user=admin -f password=secret
+# Store a multi-field secret (bare -f NAME prompts with hidden input)
+kyz set db-creds --service postgres -f host=localhost -f user=admin -f password
+
+# Edit existing fields interactively (Enter keeps a value; unlisted fields are kept)
+kyz set db-creds --service postgres -i
 
 # Retrieve a secret
 kyz get my-api-key --service github

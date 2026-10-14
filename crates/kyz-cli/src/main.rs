@@ -300,9 +300,13 @@ struct SetCommand {
     /// Service namespace for the secret.
     #[arg(long, default_value = DEFAULT_SERVICE)]
     service: String,
-    /// Set a named field (repeatable, format: name=value).
-    #[arg(long = "field", short = 'f', value_name = "NAME=VALUE")]
+    /// Set a named field (repeatable). `NAME=VALUE` sets it directly; a bare
+    /// `NAME` prompts with hidden input (or reads it from piped stdin).
+    #[arg(long = "field", short = 'f', value_name = "NAME[=VALUE]")]
     fields: Vec<String>,
+    /// Prompt for each existing field (hidden; Enter keeps the current value).
+    #[arg(long, short = 'i')]
+    interactive: bool,
     /// Assign a tag to this secret (repeatable).
     #[arg(long = "tag", short = 't', value_name = "TAG")]
     tags: Vec<String>,
@@ -1132,17 +1136,140 @@ fn handle_vault_status(ctx: &RuntimeContext) -> Result<()> {
     Ok(())
 }
 
-/// Parse --field arguments into a `BTreeMap`.
-fn parse_fields(raw: &[String]) -> Result<BTreeMap<String, SecretString>> {
+/// `NAME=VALUE` fields plus bare `NAME`s still to prompt for.
+type ParsedFields = (BTreeMap<String, SecretString>, Vec<String>);
+
+/// Parse --field arguments: `NAME=VALUE` pairs plus bare `NAME`s to prompt for.
+fn parse_fields(raw: &[String]) -> Result<ParsedFields> {
     let mut fields = BTreeMap::new();
+    let mut prompted = Vec::new();
     for f in raw {
         let (name, value) = f
             .split_once('=')
-            .ok_or_else(|| anyhow!("invalid field format '{f}', expected NAME=VALUE"))?;
+            .map_or((f.as_str(), None), |(n, v)| (n, Some(v)));
         if name.is_empty() {
             return Err(anyhow!("field name must not be empty"));
         }
-        fields.insert(name.to_string(), SecretString::from(value.to_string()));
+        match value {
+            Some(value) => {
+                fields.insert(name.to_string(), SecretString::from(value.to_string()));
+            }
+            None => prompted.push(name.to_string()),
+        }
+    }
+    Ok((fields, prompted))
+}
+
+/// Prompt for a field value with hidden input and confirmation. An empty
+/// first entry returns `None` when `allow_keep` is set (keep current value).
+fn prompt_field_value(name: &str, allow_keep: bool) -> Result<Option<SecretString>> {
+    let hint = if allow_keep {
+        " (Enter keeps current)"
+    } else {
+        ""
+    };
+    let value = rpassword::prompt_password(format!("{name}{hint}: "))
+        .with_context(|| format!("reading field '{name}'"))?;
+    if value.is_empty() {
+        if allow_keep {
+            return Ok(None);
+        }
+        return Err(anyhow!("field '{name}' must not be empty"));
+    }
+    let confirm = rpassword::prompt_password(format!("Confirm {name}: "))
+        .with_context(|| format!("reading field '{name}'"))?;
+    if value != confirm {
+        return Err(anyhow!(
+            "values for field '{name}' do not match; nothing stored"
+        ));
+    }
+    Ok(Some(SecretString::from(value)))
+}
+
+/// Fields to write for `kyz set`: explicit pairs, then hidden prompts for bare
+/// `-f NAME`s and (in interactive mode) every existing field.
+fn collect_set_fields(
+    ctx: &RuntimeContext,
+    cmd: &SetCommand,
+) -> Result<BTreeMap<String, SecretString>> {
+    let tty = io::stdin().is_terminal();
+    let existing = || -> Result<Option<SecretEntry>> {
+        match ctx.secret_store()?.get(&cmd.service, &cmd.key) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(kyz_core::CoreError::SecretNotFound(_)) => Ok(None),
+            Err(e) => Err(anyhow!("{e}")),
+        }
+    };
+
+    if cmd.fields.is_empty() && !cmd.interactive {
+        // Bare `kyz set KEY` on an existing multi-field entry edits its fields
+        // instead of silently adding a `value` field next to them.
+        if cmd.value.is_none()
+            && tty
+            && let Some(entry) = existing()?
+            && entry.fields.keys().any(|name| name != "value")
+        {
+            return prompt_existing_fields(&entry, &[]);
+        }
+        let value = read_secret_value(cmd.value.as_deref())?;
+        return Ok(BTreeMap::from([(
+            "value".to_string(),
+            SecretString::from(value),
+        )]));
+    }
+
+    let (mut fields, prompted) = parse_fields(&cmd.fields)?;
+    if cmd.interactive {
+        if !tty {
+            return Err(anyhow!("--interactive requires a terminal"));
+        }
+        let entry = existing()?.ok_or_else(|| {
+            anyhow!(
+                "secret '{}' not found in service '{}'; use -f NAME to create fields",
+                cmd.key,
+                cmd.service
+            )
+        })?;
+        let skip: Vec<&str> = fields.keys().chain(&prompted).map(String::as_str).collect();
+        let mut edited = prompt_existing_fields(&entry, &skip)?;
+        edited.append(&mut fields);
+        fields = edited;
+    }
+    for name in &prompted {
+        if fields.contains_key(name) {
+            continue;
+        }
+        let value = if tty {
+            prompt_field_value(name, false)?.ok_or_else(|| anyhow!("field '{name}' is empty"))?
+        } else if prompted.len() == 1 {
+            SecretString::from(read_secret_value(None)?)
+        } else {
+            return Err(anyhow!(
+                "piped stdin can supply only one bare -f NAME; use a terminal or NAME=VALUE"
+            ));
+        };
+        fields.insert(name.clone(), value);
+    }
+    Ok(fields)
+}
+
+fn prompt_existing_fields(
+    entry: &SecretEntry,
+    skip: &[&str],
+) -> Result<BTreeMap<String, SecretString>> {
+    eprintln!(
+        "Editing '{}' in service '{}' (input is hidden):",
+        entry.key, entry.service
+    );
+    let mut fields = BTreeMap::new();
+    for name in entry
+        .fields
+        .keys()
+        .filter(|name| !skip.contains(&name.as_str()))
+    {
+        if let Some(value) = prompt_field_value(name, true)? {
+            fields.insert(name.clone(), value);
+        }
     }
     Ok(fields)
 }
@@ -1231,14 +1358,13 @@ fn mask_sensitive_fields(
 }
 
 fn handle_set(ctx: &RuntimeContext, cmd: SetCommand) -> Result<()> {
-    let fields = if cmd.fields.is_empty() {
-        let value = read_secret_value(cmd.value.as_deref())?;
-        let mut m = BTreeMap::new();
-        m.insert("value".to_string(), SecretString::from(value));
-        m
-    } else {
-        parse_fields(&cmd.fields)?
-    };
+    let fields = collect_set_fields(ctx, &cmd)?;
+    if fields.is_empty() && cmd.tags.is_empty() {
+        if !ctx.common.quiet {
+            println!("No changes to '{}' in service '{}'", cmd.key, cmd.service);
+        }
+        return Ok(());
+    }
 
     let tags: BTreeSet<String> = cmd.tags.into_iter().collect();
     let entry = SecretEntry::new(&cmd.service, &cmd.key, fields).with_tags(tags);
