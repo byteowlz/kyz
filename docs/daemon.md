@@ -45,7 +45,16 @@ values, but names and tags still require access control. Writes use the same
 exclusive transactions as CLI writers and preserve input values exactly. `set`
 overlays fields and unions tags; it is not whole-entry replacement or CAS.
 Recreating a tombstoned entry requires `set_with_options(..., true)` and uses
-only the newly supplied fields. Dropping the handle zeroizes its DK; disk-session
+only the newly supplied fields.
+
+For stale-writer protection, `get_versioned` returns the entry with an opaque
+revision (a hash of its authenticated operation log, not a timestamp).
+`compare_set` and `compare_delete` check that revision under the same exclusive
+lock as the mutation and return `CoreError::RevisionConflict` without writing
+if any writer, including the CLI, changed the entry. `compare_set(..., None)`
+creates only keys that have never existed; it never recreates a deleted entry.
+A revision is change detection, not authorization or rollback-freshness proof.
+Dropping the handle zeroizes its DK; disk-session
 `vault lock` does not revoke independently held in-memory handles.
 
 This is an internal trusted-service seam, not an App/agent raw-secret API or grant

@@ -83,6 +83,14 @@ fn concurrent_handles_have_exactly_one_winner() {
         [worker.join().unwrap(), other]
     });
     assert_eq!(results.iter().filter(|v| v.is_ok()).count(), 1);
+    // Repeated reads of an unchanged entry yield a stable revision.
+    let third = store
+        .open_in_memory(&SecretString::from(PASS.to_owned()))
+        .unwrap();
+    assert_eq!(
+        third.get_versioned("app", "key").unwrap().1,
+        third.get_versioned("app", "key").unwrap().1
+    );
     assert_eq!(
         results
             .iter()
@@ -90,4 +98,56 @@ fn concurrent_handles_have_exactly_one_winner() {
             .count(),
         1
     );
+}
+
+#[test]
+fn revision_fence_child_writer() {
+    let (Ok(path), Ok(revision)) = (
+        std::env::var("KYZ_REVISION_FENCE_VAULT"),
+        std::env::var("KYZ_REVISION_FENCE_REVISION"),
+    ) else {
+        return;
+    };
+    let store = VaultStore::new(std::path::PathBuf::from(path));
+    let vault = store
+        .open_in_memory(&SecretString::from(PASS.to_owned()))
+        .unwrap();
+    match vault.compare_set("app", "key", &entry("child"), Some(&revision)) {
+        Ok(()) => {}
+        Err(CoreError::RevisionConflict) => std::process::exit(3),
+        Err(_) => std::process::exit(4),
+    }
+}
+
+#[test]
+fn concurrent_processes_have_exactly_one_winner() {
+    let root = tempfile::tempdir().unwrap();
+    let store = VaultStore::new(root.path().join("vault.json"));
+    store.init(PASS, false).unwrap();
+    let vault = store
+        .open_in_memory(&SecretString::from(PASS.to_owned()))
+        .unwrap();
+    vault
+        .compare_set("app", "key", &entry("initial"), None)
+        .unwrap();
+    let (_, revision) = vault.get_versioned("app", "key").unwrap();
+    let children: Vec<_> = (0..4)
+        .map(|_| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "revision_fence_child_writer"])
+                .env("KYZ_REVISION_FENCE_VAULT", store.vault_path())
+                .env("KYZ_REVISION_FENCE_REVISION", &revision)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let mut codes: Vec<_> = children
+        .into_iter()
+        .map(|mut child| child.wait().unwrap().code())
+        .collect();
+    codes.sort_unstable();
+    assert_eq!(codes, vec![Some(0), Some(3), Some(3), Some(3)]);
+    assert_ne!(vault.get_versioned("app", "key").unwrap().1, revision);
 }
