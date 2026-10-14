@@ -548,10 +548,27 @@ pub fn run_blocking(opts: DaemonOptions) -> Result<()> {
         .enable_all()
         .build()
         .map_err(|e| DaemonError::Internal(format!("creating tokio runtime: {e}")))?;
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         let handle = run_daemon(opts).await?;
         handle.wait().await
-    })
+    });
+    shutdown_runtime(runtime);
+    result
+}
+
+/// Upper bound for runtime teardown after the daemon has shut down.
+pub const RUNTIME_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tear down a daemon runtime without waiting indefinitely for blocking work.
+///
+/// Upstream HTTP calls run on Tokio's blocking pool and cannot be cancelled
+/// once started; dropping the runtime would wait for them, so a daemon with
+/// `runtime.timeout = 0` and a stalled upstream would never exit. This waits
+/// at most [`RUNTIME_TEARDOWN_TIMEOUT`] and then abandons the remaining
+/// threads; they end when the process exits. Runtime files and the instance
+/// lock are already released by graceful shutdown.
+pub fn shutdown_runtime(runtime: tokio::runtime::Runtime) {
+    runtime.shutdown_timeout(RUNTIME_TEARDOWN_TIMEOUT);
 }
 
 /// Wait until any shutdown trigger fires: lifecycle timeout, SIGINT,

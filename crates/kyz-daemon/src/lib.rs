@@ -37,7 +37,8 @@ pub use ipc::{
 };
 pub use kyz_core::proxy_config::PROXY_TOKEN_HEADER;
 pub use lifecycle::{
-    DaemonHandle, DaemonOptions, DaemonState, run_blocking, run_daemon, run_daemon_with_upstream,
+    DaemonHandle, DaemonOptions, DaemonState, RUNTIME_TEARDOWN_TIMEOUT, run_blocking, run_daemon,
+    run_daemon_with_upstream, shutdown_runtime,
 };
 pub use proxy::{ProxyEndpoint, ProxyShared};
 pub use state::DaemonPaths;

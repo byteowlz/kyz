@@ -123,10 +123,12 @@ requires a restart, not just `kyz daemon reload`. Only `http://` and
 
 Upstream requests default to a 60-second deadline. Set `runtime.timeout` to
 another positive number to bound long requests. Explicit `0` disables the
-upstream deadline, but is unsafe for predictable shutdown: started blocking
-HTTP work cannot be cancelled by timing out its async waiter. A stalled
-upstream can keep the process alive after shutdown removes its PID file.
-Keep a finite timeout until cancellable upstream shutdown is implemented.
+upstream deadline. Started upstream calls cannot be cancelled, so on shutdown
+the daemon drains for 5 seconds, releases its PID file and instance lock,
+waits at most 5 more seconds for in-flight upstream calls, then exits and
+abandons them; their clients
+see the connection close instead of a response. A finite timeout still gives
+clients a clean 504.
 
 ## Start the daemon
 

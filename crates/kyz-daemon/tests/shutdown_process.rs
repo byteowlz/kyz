@@ -27,6 +27,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const CHILD_MARKER: &str = "KYZ_SHUTDOWN_REGRESSION_MARKER";
+const CHILD_UNBOUNDED: &str = "KYZ_SHUTDOWN_REGRESSION_UNBOUNDED";
 
 #[test]
 fn finite_upstream_shutdown_child() {
@@ -34,6 +35,7 @@ fn finite_upstream_shutdown_child() {
         return;
     };
     let marker = PathBuf::from(marker);
+    let unbounded = std::env::var_os(CHILD_UNBOUNDED).is_some();
     // Keep the mock alive outside block_on and through Runtime::drop. Dropping
     // it early would close the upstream socket and hide stuck blocking work.
     let pf = support::ProxyFixture::new();
@@ -63,7 +65,13 @@ fn finite_upstream_shutdown_child() {
         .push_response(support::ScriptedResponse::status(200).delayed(Duration::from_mins(2)));
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     runtime.block_on(async {
-        let client = pf.test_client(1, 1024, None);
+        // Unbounded mirrors `runtime.timeout = 0`: the blocking call never
+        // returns before the mock's two-minute delay.
+        let client = if unbounded {
+            kyz_daemon::UpstreamClient::with_root_certs(None, 1024, &pf.mock.ca_pem, None)
+        } else {
+            pf.test_client(1, 1024, None)
+        };
         let daemon = pf.fixture.start_with_client(None, Some(client)).await;
         let addr = pf.proxy_addr().await;
         let token = pf.proxy_token();
@@ -80,18 +88,14 @@ fn finite_upstream_shutdown_child() {
         });
         pf.mock.wait_for_requests(1).await;
         daemon.shutdown().await;
-        assert_eq!(
-            request
-                .await
-                .expect("request join")
-                .expect("HTTP response")
-                .status,
-            504
-        );
+        let response = request.await.expect("request join");
+        if !unbounded {
+            assert_eq!(response.expect("HTTP response").status, 504);
+        }
         assert!(!pf.fixture.daemon_paths().pid_path().exists());
         std::fs::write(&marker, b"daemon wait completed").expect("shutdown marker");
     });
-    drop(runtime);
+    kyz_daemon::shutdown_runtime(runtime);
     std::fs::write(&marker, b"runtime dropped").expect("runtime marker");
     pf.fixture.assert_no_secret_leaks();
     pf.fixture.assert_no_session_artifacts();
@@ -100,11 +104,25 @@ fn finite_upstream_shutdown_child() {
 
 #[test]
 fn hanging_upstream_with_finite_timeout_allows_process_exit() {
+    assert_child_exits(false);
+}
+
+#[test]
+fn hanging_upstream_with_unbounded_timeout_allows_process_exit() {
+    assert_child_exits(true);
+}
+
+fn assert_child_exits(unbounded: bool) {
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("shutdown-marker");
-    let mut child = Command::new(std::env::current_exe().expect("test binary"))
+    let mut command = Command::new(std::env::current_exe().expect("test binary"));
+    command
         .args(["--exact", "finite_upstream_shutdown_child"])
-        .env(CHILD_MARKER, &marker)
+        .env(CHILD_MARKER, &marker);
+    if unbounded {
+        command.env(CHILD_UNBOUNDED, "1");
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
