@@ -23,8 +23,11 @@ use crate::reference::SecretRef;
 use crate::source::{VaultKind, VaultSource};
 use crate::unlock::{UnlockMode, UnlockState};
 
-/// Minimum session timeout we will ever request from the core layer.
-const DEFAULT_UNLOCK_TTL: Duration = Duration::from_mins(30);
+/// Minimum session timeout we will ever request from the core layer, in
+/// seconds. Not `Duration::from_mins`: release builds use an older toolchain
+/// where it is not yet const-stable.
+const DEFAULT_UNLOCK_TTL_SECS: u64 = 30 * 60;
+const DEFAULT_UNLOCK_TTL: Duration = Duration::from_secs(DEFAULT_UNLOCK_TTL_SECS);
 
 /// Runtime view of a vault's current state.
 #[derive(Debug, Clone)]

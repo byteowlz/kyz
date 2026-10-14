@@ -4,7 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-10-15
+## [0.11.1] - 2026-10-15
+
+First published release of the 0.11 changes below. The `v0.11.0` tag exists, but its release build failed before anything was published (`Duration::from_mins` in a `const` is not available on the release toolchain), so it has no assets.
+
+## [0.11.0] - 2026-10-15 (not published)
 
 ### Added
 
