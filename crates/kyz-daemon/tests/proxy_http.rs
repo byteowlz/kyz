@@ -1036,9 +1036,10 @@ async fn response_credential_headers_are_stripped() {
         .to_owned();
     pf.mock.stop();
     std::fs::remove_dir_all(root).expect("cleanup fixture");
-    assert!(
-        leaked.is_empty(),
-        "credential-bearing response header names: {leaked:?}"
+    assert_eq!(
+        leaked,
+        Vec::<&str>::new(),
+        "credential-bearing response header names"
     );
 }
 
@@ -1067,8 +1068,9 @@ async fn response_connection_nominated_headers_are_stripped() {
         .send(addr, "GET", "api.sophify.com", "/x", &[], b"")
         .await;
     assert_eq!(response.status, 200);
-    assert!(
-        response.header_values("x-upstream-internal").is_empty(),
+    assert_eq!(
+        response.header_values("x-upstream-internal"),
+        Vec::<&str>::new(),
         "connection-nominated headers must not reach the client"
     );
     assert_eq!(response.header_values("x-keep"), vec!["end-to-end"]);

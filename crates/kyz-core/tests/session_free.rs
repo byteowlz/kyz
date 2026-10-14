@@ -115,7 +115,10 @@ fn preserve_first_open_does_not_update_policy_or_remove_conflict_copy() {
     .expect("conflict fixture");
     let before = snapshot(temp.path());
     let vault = store.open_in_memory(&password()).expect("open");
-    assert!(vault.list_services().expect("services").is_empty());
+    assert_eq!(
+        vault.list_services().expect("services"),
+        Vec::<String>::new()
+    );
     assert_eq!(snapshot(temp.path()), before);
     assert_no_session(&store);
 }

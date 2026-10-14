@@ -4,7 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-14
+
 ### Added
+
+- Session-free trusted-service metadata and CRUD on `UnlockedVault`. `VaultStore::open_in_memory` opens v5 without migration, policy updates, conflict cleanup, or persisted unlock material; legacy formats return typed `MigrationRequired`. The explicitly migrating `unlock_in_memory` remains separate. Values are preserved exactly; writes share CLI transactions and retain overlay/tombstone semantics. This is not an Oqto grant system, CAS API, or accepted Oqto adapter.
+- Optional operator-configured HTTP(S) outbound proxy via `proxy.upstream_proxy`, using CONNECT for HTTPS upstreams. Ambient proxy environment variables remain ignored; changes require a daemon restart.
 
 - **Vault format v5 — one file per entry, mergeable key slots** (`crates/kyz-core/src/vault_v5.rs`):
   - `vault.json` becomes a small manifest (vault id, key slots, MAC); entries live in `vault.entries/<id>.json`, one file per entry, each with its own MAC bound to its file name. `get`/`set`/`delete` read one entry file, so latency no longer grows with vault size (1000 entries × 10 versions: `set` 127 ms → 1.2 ms, `get` 85 ms → 0.9 ms; `just bench-vault`).
@@ -22,6 +27,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Explicit exec mappings now use `--map` / `-e`; global `--env` continues to select a named environment.
+- Upstream requests retain a 60-second default timeout. Explicit `runtime.timeout = 0` disables it, but stalled blocking HTTP work can delay actual process exit after shutdown; keep a finite timeout for predictable shutdown.
 - New vaults are created as v5. Unlocking migrates v1/v2/v3 and single-file v4 vaults to v5 in the exclusive-lock transaction, preserving the DK and passphrase (the existing kdf/wrapped DK become the first key slot); migration ids derive deterministically from pre-migration data, so forked v3 copies migrating on different machines deduplicate their shared history on merge.
 - `kyz history` lists operations with stable op ids (`actor:counter`) and roles (current / conflict / ancestor / tombstone); `kyz rollback --to` accepts a sequence number (counted from the oldest operation, matching v3 version numbers so a literal `--to N` keeps its meaning across migration) or an op id and always creates a new write. Version dispatch for history/rollback moved into the store (`VaultStore::history` returning `HistoryView`, `VaultStore::rollback`), one locked read/write transaction per command; the v3-specific `read_vault_file_pub`/`write_vault_file_pub`/`detect_format` APIs were removed from `kyz-core`.
 - `kyz set` and `kyz delete` on a legacy v3 vault now upgrade it to v5 inside the same write transaction (a failed delete of a missing entry still writes nothing); rolling back a v3 vault keeps the v3 format until the next unlock/set/delete migrates it.
@@ -31,6 +38,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Credential proxy responses now strip auth/session/challenge headers and matched-rule injection-header names, including duplicate and mixed-case names. Safe headers, status and body remain unchanged; body/URL/unrelated-header echoes still require trusted destinations and bounded operations.
+- Exec's mapping flag no longer collides with global `--env`. Added CLI-definition, parsing and process-level injection regressions.
+- Added actual subprocess exit proof for a stalled upstream with a finite deadline, plus absent/explicit-zero timeout mapping tests.
+- Updated assertions for Rust 1.99 Clippy without relaxing lint rules.
 - Hostile op logs could force quadratic CPU before MAC verification: a duplicate op id disabled the linear frontier path (per-op ancestor walks), and canonicalization walked ancestors once per delete. Both are now O(ops + parents); cycles and dangling parents are detected by the same linear pass.
 - `kyz history` labeled an edit as `current` while a concurrent delete hid the entry (`get` reported it missing). History now follows the projection: a deleted entry has no current version, and edits hidden by the delete are shown as conflicts (rollback-able). The human view notes that the entry is deleted.
 - `kyz vault merge` gave no hint when an incoming edit lost to a delete already present in the target. The report now lists such entries under `lost_to_delete` (entry, tombstones, hidden edits).
