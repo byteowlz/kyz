@@ -147,7 +147,7 @@ fmt-check:
 
 # Run clippy on all crates
 clippy:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Alias for clippy
 lint: clippy
