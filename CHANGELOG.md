@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The Windows release asset is `.zip` again (`kyz-vVERSION-x86_64-pc-windows-msvc.zip`), keeping the standard `kyz-vVERSION-TARGET/bin/` layout. v0.11.1 shipped it as `.tar.gz`.
+
 ## [0.11.1] - 2026-10-15
 
 First published release of the 0.11 changes below. The `v0.11.0` tag exists, but its release build failed before anything was published (`Duration::from_mins` in a `const` is not available on the release toolchain), so it has no assets.

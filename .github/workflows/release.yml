@@ -2,7 +2,9 @@
 # It builds linux-gnu (glibc floor) in the byt container + macOS natively, then
 # publishes the GitHub release with checksums.txt. All release config lives in
 # byt.release.toml. byt has no Windows packaging, so the windows job adds the
-# Windows archive in the same layout and appends its checksum.
+# Windows archive and appends its checksum. Same name and bin/ layout, but .zip:
+# Windows tools expect zip and no automated consumer (oqto-setup is Linux-only)
+# installs it, so the ADR-0021 tar.gz rule buys nothing here.
 name: Release
 
 on:
@@ -57,12 +59,12 @@ jobs:
             cp "target/$TARGET/release/$bin.exe" "$stage/bin/"
           done
           cp LICENSE README.md "$stage/"
-          tar -czf "$stage.tar.gz" "$stage"
+          7z a -tzip "$stage.zip" "$stage"
           test "$("$stage/bin/kyz.exe" --version)" = "kyz-cli ${RELEASE_TAG#v}"
 
       - name: Upload archive and append checksum
         run: |
-          archive="kyz-${RELEASE_TAG}-${TARGET}.tar.gz"
+          archive="kyz-${RELEASE_TAG}-${TARGET}.zip"
           gh release upload "$RELEASE_TAG" "$archive"
           gh release download "$RELEASE_TAG" --pattern checksums.txt --dir published
           {
