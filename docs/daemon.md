@@ -53,6 +53,10 @@ revision (a hash of its authenticated operation log, not a timestamp).
 lock as the mutation and return `CoreError::RevisionConflict` without writing
 if any writer, including the CLI, changed the entry. `compare_set(..., None)`
 creates only keys that have never existed; it never recreates a deleted entry.
+`compare_set` returns the revision it wrote, read back under the same lock, so
+the next fence never needs a separate (racy) read. `list_versioned` returns one
+service's metadata and revisions as a single snapshot without decrypting values.
+Treat revisions as opaque strings; truncating them weakens change detection.
 A revision is change detection, not authorization or rollback-freshness proof.
 Dropping the handle zeroizes its DK; disk-session
 `vault lock` does not revoke independently held in-memory handles.

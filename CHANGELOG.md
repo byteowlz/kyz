@@ -4,7 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `UnlockedVault::list_versioned(service)`: entry metadata plus revisions as one snapshot under a single shared lock, without decrypting field values.
+
 ### Changed
+
+- **Breaking (library):** `UnlockedVault::compare_set` returns the new revision (`Result<String, CoreError>`), read back under the write lock, instead of `()`. Callers no longer need a follow-up `get_versioned`, which could observe another writer's change.
 
 - The Windows release asset is `.zip` again (`kyz-vVERSION-x86_64-pc-windows-msvc.zip`), keeping the standard `kyz-vVERSION-TARGET/bin/` layout. v0.11.1 shipped it as `.tar.gz`.
 

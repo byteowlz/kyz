@@ -1834,9 +1834,46 @@ impl UnlockedVault {
         Ok((value, credential_revision(&entry.log)?))
     }
 
+    /// List one service's entries with their revisions as a single snapshot
+    /// under one shared lock. Field values are not decrypted. Revisions equal
+    /// what `get_versioned` returns for the same unchanged entry.
+    ///
+    /// # Errors
+    /// Refuses legacy formats and failed verification.
+    pub fn list_versioned(&self, service: &str) -> Result<Vec<(SecretSummary, String)>, CoreError> {
+        let _lock = VaultFileLock::shared(&self.vault_path)?;
+        let store = VaultStore::new(self.vault_path.clone());
+        let dir = store.v5_for_write(&self.dk, false)?;
+        let log = load_log_with(&dir, &self.dk)?;
+        let mut out = Vec::new();
+        for (ck, meta) in log.visible_metas()? {
+            let Some((svc, key)) = OpLog::split_compound_key(&ck) else {
+                continue;
+            };
+            if svc != service {
+                continue;
+            }
+            let revision = credential_revision(&read_entry_log(&dir, &self.dk, &svc, &key)?.log)?;
+            out.push((
+                SecretSummary {
+                    key,
+                    service: svc,
+                    field_names: meta.field_names,
+                    tags: meta.tags,
+                    updated_at: meta.updated_at,
+                },
+                revision,
+            ));
+        }
+        Ok(out)
+    }
+
     /// Conditionally overlay fields under the vault's exclusive mutation lock.
     /// `None` means create only if the key has NEVER existed; deleted keys are
     /// not silently recreated. CLI writes participate in the same lock.
+    ///
+    /// Returns the revision of the entry as written, read back before the lock
+    /// is released, so callers never need a racy follow-up `get_versioned`.
     ///
     /// # Errors
     /// Returns `RevisionConflict` without writing for stale revisions; never migrates.
@@ -1846,7 +1883,7 @@ impl UnlockedVault {
         key: &str,
         entry: &SecretEntry,
         expected: Option<&str>,
-    ) -> Result<(), CoreError> {
+    ) -> Result<String, CoreError> {
         VaultStore::new(self.vault_path.clone()).set_with_dk_guarded(
             &self.dk,
             service,
@@ -2375,6 +2412,7 @@ impl VaultStore {
             migrate,
             RevisionFence::Unchecked,
         )
+        .map(drop)
     }
 
     #[expect(
@@ -2390,7 +2428,7 @@ impl VaultStore {
         recreate: bool,
         migrate: bool,
         expected: RevisionFence<'_>,
-    ) -> Result<(), CoreError> {
+    ) -> Result<String, CoreError> {
         let _lock = VaultFileLock::exclusive(&self.vault_path)?;
         let dir = self.v5_for_write(dk, migrate)?;
         let mut current = read_entry_log(&dir, dk, service, key)?;
@@ -2448,7 +2486,9 @@ impl VaultStore {
         };
 
         Self::append_local_put(vault, &snapshot, parents, dk)?;
-        write_entry_log(&dir, dk, current, service, key)
+        write_entry_log(&dir, dk, current, service, key)?;
+        // Hash what is on disk (the writer may canonicalize), still locked.
+        credential_revision(&read_entry_log(&dir, dk, service, key)?.log)
     }
 
     /// The v5 vault for a write transaction. When explicitly permitted,

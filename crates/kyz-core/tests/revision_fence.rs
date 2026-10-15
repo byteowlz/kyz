@@ -113,7 +113,7 @@ fn revision_fence_child_writer() {
         .open_in_memory(&SecretString::from(PASS.to_owned()))
         .unwrap();
     let outcome = match vault.compare_set("app", "key", &entry("child"), Some(&revision)) {
-        Ok(()) => "won",
+        Ok(_) => "won",
         Err(CoreError::RevisionConflict) => "conflict",
         Err(_) => "error",
     };
@@ -165,4 +165,62 @@ fn concurrent_processes_have_exactly_one_winner() {
     outcomes.sort_unstable();
     assert_eq!(outcomes, ["conflict", "conflict", "conflict", "won"]);
     assert_ne!(vault.get_versioned("app", "key").unwrap().1, revision);
+}
+
+#[test]
+fn compare_set_returns_the_written_revision() {
+    let root = tempfile::tempdir().unwrap();
+    let store = VaultStore::new(root.path().join("vault.json"));
+    store.init(PASS, false).unwrap();
+    let vault = store
+        .open_in_memory(&SecretString::from(PASS.to_owned()))
+        .unwrap();
+    let created = vault
+        .compare_set("app", "key", &entry("one"), None)
+        .unwrap();
+    assert_eq!(vault.get_versioned("app", "key").unwrap().1, created);
+    let rotated = vault
+        .compare_set("app", "key", &entry("two"), Some(&created))
+        .unwrap();
+    assert_ne!(rotated, created);
+    assert_eq!(vault.get_versioned("app", "key").unwrap().1, rotated);
+    // The returned revision is directly usable as the next fence.
+    vault.compare_delete("app", "key", &rotated).unwrap();
+    assert!(vault.get_versioned("app", "key").is_err());
+}
+
+#[test]
+fn list_versioned_is_value_free_and_matches_get_versioned() {
+    let root = tempfile::tempdir().unwrap();
+    let store = VaultStore::new(root.path().join("vault.json"));
+    store.init(PASS, false).unwrap();
+    let vault = store
+        .open_in_memory(&SecretString::from(PASS.to_owned()))
+        .unwrap();
+    for key in ["a", "b", "gone"] {
+        vault.compare_set("app", key, &entry(key), None).unwrap();
+    }
+    vault.compare_set("other", "c", &entry("c"), None).unwrap();
+    let gone = vault.get_versioned("app", "gone").unwrap().1;
+    vault.compare_delete("app", "gone", &gone).unwrap();
+    // An ordinary writer changes `b`; the listing must reflect it.
+    vault.set("app", "b", &entry("b2")).unwrap();
+
+    let listed: Vec<(String, Vec<String>, String)> = vault
+        .list_versioned("app")
+        .unwrap()
+        .into_iter()
+        .map(|(summary, revision)| (summary.key, summary.field_names, revision))
+        .collect();
+    let expected: Vec<(String, Vec<String>, String)> = ["a", "b"]
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_owned(),
+                vec!["token".to_owned()],
+                vault.get_versioned("app", key).unwrap().1,
+            )
+        })
+        .collect();
+    assert_eq!(listed, expected);
 }
