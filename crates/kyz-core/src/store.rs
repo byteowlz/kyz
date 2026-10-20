@@ -1476,7 +1476,6 @@ impl VaultStore {
         let mut manifest = dir.read_verified_manifest(dk)?;
         let mut changed = !manifest.passphrase_policy_checked;
         manifest.passphrase_policy_checked = true;
-        let mut absorbed_manifests = Vec::new();
         for copy in dir.manifest_conflict_copies()? {
             let parsed = fs::read(&copy)
                 .map_err(CoreError::Io)
@@ -1485,7 +1484,6 @@ impl VaultStore {
             match parsed {
                 Ok(other) if other.vault_id == manifest.vault_id => {
                     changed |= manifest.merge_from(&other)?;
-                    absorbed_manifests.push(copy);
                 }
                 Ok(_) => log::warn!(
                     "ignoring manifest copy {} of a different vault",
@@ -1500,14 +1498,10 @@ impl VaultStore {
         if changed {
             dir.write_manifest(&mut manifest, dk)?;
         }
-        for copy in absorbed_manifests {
-            if let Err(e) = fs::remove_file(&copy) {
-                log::warn!(
-                    "could not remove absorbed manifest copy {}: {e}",
-                    copy.display()
-                );
-            }
-        }
+        #[cfg(test)]
+        audit_tests::after_manifest_merge();
+        // Retain manifest copies too: a synchronizer may have replaced a
+        // pathname since verification, and check-then-unlink is not atomic.
         let all = dir.read_all(dk, &manifest.vault_id)?;
         if !all.absorbed.is_empty() {
             vault_v5::write_changed(&dir, &all, &all.log, dk)?;
@@ -1834,9 +1828,11 @@ impl UnlockedVault {
         Ok((value, credential_revision(&entry.log)?))
     }
 
-    /// List one service's entries with their revisions as a single snapshot
-    /// under one shared lock. Field values are not decrypted. Revisions equal
-    /// what `get_versioned` returns for the same unchanged entry.
+    /// List one service's value-free metadata and revisions under one shared
+    /// lock. Each pair comes from the same observed log; this is a snapshot
+    /// against participating writers, not noncooperating external sync.
+    /// Conflict reconciliation may decrypt payloads internally to validate
+    /// duplicate operations. Revisions match `get_versioned` for unchanged logs.
     ///
     /// # Errors
     /// Refuses legacy formats and failed verification.
@@ -1845,6 +1841,8 @@ impl UnlockedVault {
         let store = VaultStore::new(self.vault_path.clone());
         let dir = store.v5_for_write(&self.dk, false)?;
         let log = load_log_with(&dir, &self.dk)?;
+        #[cfg(test)]
+        audit_tests::after_list_load();
         let mut out = Vec::new();
         for (ck, meta) in log.visible_metas()? {
             let Some((svc, key)) = OpLog::split_compound_key(&ck) else {
@@ -1853,7 +1851,15 @@ impl UnlockedVault {
             if svc != service {
                 continue;
             }
-            let revision = credential_revision(&read_entry_log(&dir, &self.dk, &svc, &key)?.log)?;
+            let mut entry_log = OpLog::new(&log.vault_id);
+            entry_log.entries.insert(
+                ck.clone(),
+                log.entries
+                    .get(&ck)
+                    .cloned()
+                    .ok_or_else(|| CoreError::Serialization("listed entry log missing".into()))?,
+            );
+            let revision = credential_revision(&entry_log)?;
             out.push((
                 SecretSummary {
                     key,
@@ -1872,8 +1878,9 @@ impl UnlockedVault {
     /// `None` means create only if the key has NEVER existed; deleted keys are
     /// not silently recreated. CLI writes participate in the same lock.
     ///
-    /// Returns the revision of the entry as written, read back before the lock
-    /// is released, so callers never need a racy follow-up `get_versioned`.
+    /// Returns the revision of the exact canonical log committed, computed
+    /// before the write. No fallible disk reread follows a successful commit.
+    /// Callers never need a racy follow-up `get_versioned`.
     ///
     /// # Errors
     /// Returns `RevisionConflict` without writing for stale revisions; never migrates.
@@ -2113,13 +2120,9 @@ fn read_entry_log(
     })
 }
 
-// Hash only the authenticated ciphertext operation log, never plaintext or a
-// wall-clock timestamp. This detects same-second CLI writes and tombstones.
+// Shared by reads and the canonical prepared write; never hashes plaintext.
 fn credential_revision(log: &OpLog) -> Result<String, CoreError> {
-    use sha2::{Digest, Sha256};
-    let encoded = serde_json::to_vec(log)
-        .map_err(|_| CoreError::Serialization("credential revision".into()))?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    log.credential_revision()
 }
 
 fn write_entry_log(
@@ -2128,7 +2131,7 @@ fn write_entry_log(
     entry: EntryLog,
     service: &str,
     key: &str,
-) -> Result<(), CoreError> {
+) -> Result<String, CoreError> {
     let ck = OpLog::compound_key(service, key);
     let mut log = entry.log;
     let ops = log.entries.remove(&ck).unwrap_or_default();
@@ -2299,7 +2302,7 @@ impl VaultStore {
             )));
         }
         Self::append_local_delete(&mut entry.log, service, key)?;
-        write_entry_log(&dir, dk, entry, service, key)
+        write_entry_log(&dir, dk, entry, service, key).map(drop)
     }
 
     fn list_with_dk(
@@ -2486,9 +2489,7 @@ impl VaultStore {
         };
 
         Self::append_local_put(vault, &snapshot, parents, dk)?;
-        write_entry_log(&dir, dk, current, service, key)?;
-        // Hash what is on disk (the writer may canonicalize), still locked.
-        credential_revision(&read_entry_log(&dir, dk, service, key)?.log)
+        write_entry_log(&dir, dk, current, service, key)
     }
 
     /// The v5 vault for a write transaction. When explicitly permitted,
@@ -2629,7 +2630,7 @@ impl VaultStore {
         let dir = self.v5_for_write(&dk, true)?;
         let mut entry = read_entry_log(&dir, &dk, service, key)?;
         rollback_v4_locked(&mut entry.log, &dk, service, key, target)?;
-        write_entry_log(&dir, &dk, entry, service, key)
+        write_entry_log(&dir, &dk, entry, service, key).map(drop)
     }
 
     /// Roll back an entry to a historical version, dispatched by the
@@ -2668,7 +2669,7 @@ impl VaultStore {
             VaultContents::V5(dir) => {
                 let mut entry = read_entry_log(&dir, &dk, service, key)?;
                 rollback_v4_locked(&mut entry.log, &dk, service, key, target)?;
-                write_entry_log(&dir, &dk, entry, service, key)
+                write_entry_log(&dir, &dk, entry, service, key).map(drop)
             }
         }
     }
@@ -3244,6 +3245,10 @@ pub(crate) fn now_unix() -> u64 {
 fn simple_hash(input: &str) -> String {
     format!("{:016x}", fnv1a_64(input.as_bytes()))
 }
+
+#[cfg(test)]
+#[path = "store_audit_tests.rs"]
+pub(crate) mod audit_tests;
 
 #[cfg(test)]
 mod tests {

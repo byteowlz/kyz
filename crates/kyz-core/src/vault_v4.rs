@@ -596,6 +596,15 @@ pub(crate) fn validate_hex_id(label: &str, id: &str, len: usize) -> Result<(), C
 }
 
 impl OpLog {
+    /// Hash the authenticated ciphertext log as an opaque change detector.
+    /// Callers must verify loaded logs before using their revisions.
+    pub(crate) fn credential_revision(&self) -> Result<String, CoreError> {
+        use sha2::{Digest, Sha256};
+        let encoded = serde_json::to_vec(self)
+            .map_err(|_| CoreError::Serialization("credential revision".into()))?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    }
+
     /// Create an empty log for `vault_id`.
     #[must_use]
     pub fn new(vault_id: &str) -> Self {

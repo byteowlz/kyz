@@ -53,9 +53,16 @@ revision (a hash of its authenticated operation log, not a timestamp).
 lock as the mutation and return `CoreError::RevisionConflict` without writing
 if any writer, including the CLI, changed the entry. `compare_set(..., None)`
 creates only keys that have never existed; it never recreates a deleted entry.
-`compare_set` returns the revision it wrote, read back under the same lock, so
-the next fence never needs a separate (racy) read. `list_versioned` returns one
-service's metadata and revisions as a single snapshot without decrypting values.
+`compare_set` returns the revision of the exact canonical log it commits,
+computed before the write, with no fallible disk reread after commit. The
+next fence needs no separate (racy) read. `list_versioned` pairs metadata and
+revision from the same observed entry log. Its shared lock provides coherence
+against participating local writers, not a global snapshot against external
+synchronizers. Results contain no field values; conflict reconciliation may
+internally decrypt payloads to validate duplicate operations.
+Storage failures or crashes can still leave an uncertain outcome; do not
+blindly retry credential rotations or assume a transaction spans an upstream
+identity provider. There is no distributed CAS or rollback-freshness guarantee.
 Treat revisions as opaque strings; truncating them weakens change detection.
 A revision is change detection, not authorization or rollback-freshness proof.
 Dropping the handle zeroizes its DK; disk-session

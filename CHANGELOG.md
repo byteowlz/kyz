@@ -6,11 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- `UnlockedVault::list_versioned(service)`: entry metadata plus revisions as one snapshot under a single shared lock, without decrypting field values.
+- `UnlockedVault::list_versioned(service)`: value-free metadata and revisions paired from the same observed entry log, under a shared lock against participating local writers. External sync is not a globally atomic snapshot; conflict reconciliation may decrypt payloads internally.
 
 ### Changed
 
-- **Breaking (library):** `UnlockedVault::compare_set` returns the new revision (`Result<String, CoreError>`), read back under the write lock, instead of `()`. Callers no longer need a follow-up `get_versioned`, which could observe another writer's change.
+- **Breaking (library):** `UnlockedVault::compare_set` returns the revision of its exact canonical committed log (`Result<String, CoreError>`) instead of `()`, computed before the write. No fallible reread follows a successful commit; callers no longer need a follow-up `get_versioned` that could observe another writer's change.
+- Verified sync conflict copies are folded but no longer automatically deleted. External synchronizers can replace a pathname after verification; retaining copies avoids deleting unabsorbed replacements. This costs disk space and repeated reconciliation; see `docs/sync.md` for cleanup limits.
 
 - The Windows release asset is `.zip` again (`kyz-vVERSION-x86_64-pc-windows-msvc.zip`), keeping the standard `kyz-vVERSION-TARGET/bin/` layout. v0.11.1 shipped it as `.tar.gz`.
 

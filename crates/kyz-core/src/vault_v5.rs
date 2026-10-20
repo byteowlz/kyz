@@ -28,8 +28,9 @@
 //! **Sync conflict copies.** File synchronizers write concurrent edits as
 //! sibling copies (Syncthing: `<file_id>.sync-conflict-….json`). Every
 //! read unions verified copies of the entry it touches, and the next
-//! write of that entry absorbs and removes them. Unverifiable copies are
-//! ignored with a warning and never deleted.
+//! write of that entry folds in their operations but retains the copies to
+//! avoid deleting replacements installed by external sync. Unverifiable
+//! copies are ignored with a warning and retained too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -600,7 +601,7 @@ impl EntryFile {
 }
 
 /// Result of reading one entry: its unioned ops plus the sync conflict
-/// copies that were folded in (removed by the next write of the entry).
+/// copies that were folded in (retained to avoid sync replacement loss).
 #[derive(Debug, Clone, Default)]
 pub struct EntryRead {
     /// Operations of the entry (empty when it has never been written).
@@ -900,9 +901,11 @@ impl VaultDir {
         })
     }
 
-    /// Canonicalize, MAC and atomically write one entry file, then remove
-    /// the conflict copies whose operations it now contains. Must run
-    /// under the exclusive vault lock.
+    /// Canonicalize, MAC and atomically write one entry file, returning its
+    /// revision computed before commit from the exact canonical log written.
+    /// Conflict copies are retained: external synchronizers do not take the
+    /// vault lock and may replace an absorbed pathname before cleanup.
+    /// Must run under the exclusive vault lock.
     ///
     /// # Errors
     ///
@@ -913,11 +916,12 @@ impl VaultDir {
         vault_id: &str,
         compound_key: &str,
         ops: Vec<Op>,
-        absorbed: &[PathBuf],
-    ) -> Result<(), CoreError> {
+        _absorbed: &[PathBuf],
+    ) -> Result<String, CoreError> {
         let mut log = OpLog::new(vault_id);
         log.entries.insert(compound_key.to_string(), ops);
         log.canonicalize()?;
+        let revision = log.credential_revision()?;
         let ops = log.entries.remove(compound_key).unwrap_or_default();
         let file_id = entry_file_id(dk, compound_key)?;
         let mut file = EntryFile {
@@ -932,15 +936,11 @@ impl VaultDir {
             .map_err(|e| CoreError::Serialization(format!("serializing entry file: {e}")))?;
         self.ensure_entries_dir()?;
         crate::atomic::write_atomic(&self.main_path(&file_id), bytes.as_bytes())?;
-        for copy in absorbed {
-            if let Err(e) = fs::remove_file(copy) {
-                log::warn!(
-                    "could not remove absorbed conflict copy {}: {e}",
-                    copy.display()
-                );
-            }
-        }
-        Ok(())
+        #[cfg(test)]
+        crate::store::audit_tests::after_entry_commit();
+        // Nothing fallible after commit: acknowledging this write must not
+        // depend on a fresh read, which can observe unrelated sync activity.
+        Ok(revision)
     }
 
     /// Read every entry (main files and verified conflict copies).
@@ -1060,8 +1060,8 @@ impl VaultDir {
     }
 }
 
-/// Write every entry of `after` whose ops differ from `before` (plus any
-/// entry with absorbed conflict copies, which are then removed). Must run
+/// Write changed entries and fold verified conflict operations into main
+/// files that do not already contain them. Copies are retained. Must run
 /// under the exclusive vault lock.
 ///
 /// # Errors
@@ -1076,10 +1076,23 @@ pub fn write_changed(
     let mut written = 0;
     for (ck, ops) in &after.entries {
         let absorbed = before.absorbed.get(ck).map_or(&[][..], Vec::as_slice);
-        if before.log.entries.get(ck) != Some(ops) || !absorbed.is_empty() {
-            dir.write_entry(dk, &after.vault_id, ck, ops.clone(), absorbed)?;
-            written += 1;
+        if before.log.entries.get(ck) == Some(ops) && absorbed.is_empty() {
+            continue;
         }
+        if !absorbed.is_empty() {
+            // Retained copies are observed on every read. Once folded, they
+            // must not force repeated writes (and endless sync churn).
+            let file_id = entry_file_id(dk, ck)?;
+            match VaultDir::load_entry_file(&dir.main_path(&file_id), &file_id, &after.vault_id, dk)
+            {
+                Ok((stored_key, stored_ops)) if stored_key == *ck && stored_ops == *ops => continue,
+                Ok(_) => {}
+                Err(CoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        dir.write_entry(dk, &after.vault_id, ck, ops.clone(), absorbed)?;
+        written += 1;
     }
     Ok(written)
 }

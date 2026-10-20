@@ -686,9 +686,12 @@ fn sync_conflict_copies_are_read_and_absorbed() {
     );
     assert!(copy.exists(), "reads never delete");
 
-    // The next write of the entry absorbs and removes the copy.
+    // The next write absorbs operations but retains the mutable sync path.
     set(&a, "svc", "k", "resolved");
-    assert!(!copy.exists(), "write must absorb the conflict copy");
+    assert!(
+        copy.exists(),
+        "absorbed copies must remain safe from replacement loss"
+    );
     assert_eq!(current_value(&a, "svc", "k").as_deref(), Some("resolved"));
 
     // Unlock absorbs copies of entries nobody writes.
@@ -706,7 +709,10 @@ fn sync_conflict_copies_are_read_and_absorbed() {
     std::fs::copy(&other_file, &copy2).expect("plant second copy");
     a.lock().expect("lock");
     a.unlock(PASS, 60).expect("unlock absorbs");
-    assert!(!copy2.exists());
+    assert!(
+        copy2.exists(),
+        "unlock folds operations without deleting sync paths"
+    );
     assert!(
         entries_dir_for(&path_a)
             .join(format!("{other_id}.json"))

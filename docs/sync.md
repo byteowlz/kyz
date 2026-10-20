@@ -30,10 +30,21 @@ drive.
 - **Conflict copies are handled automatically.** When two machines edit
   the same entry, the synchronizer writes a sibling copy
   (`<id>.sync-conflict-….json`). kyz reads verified copies as part of the
-  entry right away, folds them into the entry file on its next write, and
-  removes them. `kyz vault unlock` does the same for every entry and for
-  conflict copies of the manifest. Copies that do not verify (another
-  vault, corrupt, tampered) are ignored and never deleted.
+  entry right away and folds them into the entry file on its next write.
+  `kyz vault unlock` does the same for every entry and for manifest copies.
+  Copies are **retained**, even after folding: synchronizers do not take
+  kyz's lock and can replace a pathname between verification and deletion.
+  Copies that do not verify (another vault, corrupt, tampered) are ignored
+  and retained too. Retention costs disk space and repeated reconciliation.
+  Do not delete copies during active synchronization; coordinate with the
+  synchronizer and preserve backups before any manual cleanup. Retained
+  manifest copies, like backups, may contain older wrapped key slots.
+
+kyz's advisory locks coordinate local CLI and library writers only. They
+cannot make a multi-file read globally atomic against external sync or
+provide distributed compare-and-swap/rollback protection. Versioned listing
+keeps each row's metadata and revision paired from the same observation;
+external sync may still advance the vault independently.
 - **Explicit merge** of another replica, e.g. a copy on a USB stick:
 
   ```bash
